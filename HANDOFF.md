@@ -1,15 +1,17 @@
 # ClaraCore Server — 接手指南
 
-> 最后更新：2026-08-06 15:45
+> 最后更新：2026-08-06 16:45
 > 给下一次接手的人或 agent（Clara / Codex / 其他）
 
 ---
 
 ## 一句话状态
 
-**治理域从领域逻辑到 MySQL 存储已经打通，对着真实库跑通契约测试。下一步是 `internal/mcp` —— 先 `whoami`。**
+**整条链路已打通并在真库上验证：bearer token → 认证 → 身份 → 空间权限 → MCP `whoami`。下一步是 knowledge 域。**
 
-`governance.Store` 的 MySQL 实现已落地（`internal/adapters/mysql/governance.go`），11 个方法全部有对着真实 MySQL 的测试。**但还没有任何东西调用它**：`cmd/server/main.go` 没装配 `governance.Service`，因为目前没有消费者——装一个没人用的服务只会让人以为它在跑。`internal/mcp`、`internal/web` 仍是空目录。
+`make run` 起来就能用真 token 调 `whoami`（`test/mcp_e2e_integration_test.go` 每次 `make itest` 都会真跑一遍）。装配在 `cmd/server/main.go`：MySQL Store → `governance.Service` → MCP Host，挂在 `/mcp`。
+
+`internal/mcp` 目前只有 `whoami` 一个工具——它是 agent 判断「我能写哪个空间」的前提，也是把整条链路端到端跑通的最小切口。`internal/web` 仍是空目录。
 
 ---
 
@@ -20,7 +22,7 @@ cd /Users/zhouwei/Documents/ClaraCore/apps/claracore-server
 
 make check     # 全部检查：fmt + vet + 架构约束 + domain 覆盖率门槛 + 测试。必须全绿才提交
 make migrate   # 应用数据库迁移（幂等，已是最新时 no-op）
-make itest     # 集成测试，需真实 MySQL。改完迁移或 adapters 里的 SQL 必须手跑一次
+make itest     # 集成测试（schema + Store 契约 + MCP 端到端），需真实 MySQL。改完迁移或 SQL 必须手跑
 make run       # 启动服务（需要 .env，已存在）
 curl http://127.0.0.1:51890/healthz
 ```
@@ -67,13 +69,16 @@ internal/adapters/mysql/       连接池（启动即 Ping）+ 迁移执行器（
   └─ governance.go             governance.Store 的 MySQL 实现，11 个方法
   └─ *_integration_test.go     对着真实 MySQL 的契约测试（make itest）
 internal/domain/governance/    身份认证 + SpaceScope 解析 + token 生命周期（90.0% 覆盖，门槛 85）
+internal/mcp/                  MCP Host：bearer 认证 + 身份注入 + 错误映射 + whoami
+  └─ host_test.go              8 个协议层测试，用 fake 治理服务，不碰数据库
+test/mcp_e2e_integration_test.go  完整装配：真库 + 真 token 打通 whoami（make itest）
 migrations/0001_governance.sql 治理域 6 张表，已应用到 192.168.3.200 的库
 cmd/server/main.go             最小入口，装配 + 优雅关闭 + -migrate flag
 Makefile                       make check 是提交前的门槛
 poc/                           丢弃型验证代码，独立 go.mod，不参与主模块构建
 ```
 
-**约束已反向验证过**：造过违规探针，9 + 3 + 8 + 4 条违规全部被捕获（依次是：架构与 schema 规则、`ascii_bin` 规则、Store 实现、`ErrAlreadyExists` 映射与 fake 的唯一性）。新增约束或新写一层适配器后请用同样方式验证一次——**从不失败的检查等于没有检查**。
+**约束已反向验证过**：造过违规探针，9 + 3 + 8 + 4 + 7 条违规全部被捕获（依次是：架构与 schema 规则、`ascii_bin` 规则、Store 实现、`ErrAlreadyExists` 映射与 fake 唯一性、MCP Host 的安全属性）。新增约束或新写一层适配器后请用同样方式验证一次——**从不失败的检查等于没有检查**。
 
 ### 0001 迁移已验证的行为
 
@@ -131,19 +136,26 @@ poc/                           丢弃型验证代码，独立 go.mod，不参与
 
 **这套测试反向验证过**：注入了 8 条违规（INNER JOIN、漏 owner 条件、漏租户隔离、覆盖吊销时间、去掉 upsert、0 行当不存在、不提交、包装错误），全部被捕获。第一轮时「漏租户隔离」曾经漏网——因为 fixture 里只有一个租户，后来补了 foreign tenant 的 team 空间与同名用户才抓住。**新加 SQL 时照做一遍。**
 
-## 下一步：按这个顺序
+## MCP Host 已固化的决定（加新工具之前先读这段）
 
-### 1. `internal/mcp/`
+| 决定 | 为什么 |
+|---|---|
+| `verifyToken` 失败时返回 **`auth.ErrInvalidToken` 本身，一个字都不加** | **SDK 会把这里返回的错误原文写进 401 响应体**（`auth.verify`：`return nil, err.Error(), 401`）。包一层 `%w` 带上原因，就等于把「已吊销」「已过期」直接告诉调用方。这个坑真的踩过一次，被探针抓出来的 |
+| 不给 SDK 填 `Expiration`，改开 `AllowMissingExpiration` | 过期判断只能有一份。它在 `governance.Token.Validate`，用可注入的 `platform.Clock`；交给 SDK 就有了两个判断者、两个时钟源，测试注入假时钟时立刻打架 |
+| 身份走 `TokenInfo.Extra` 整体传递 | 拆成几个字符串字段再重组会丢类型，PoC 里那段 `asString/asStrings` 样板就是这么来的 |
+| context key 用未导出的空结构体类型 | 外部包无法伪造身份键 |
+| 所有请求共用一个 `*sdk.Server` | 工具集与身份无关（agent 继承所有者的全部权限），按请求重建纯属浪费 |
+| 错误映射只在 `errors.go` 的 `toolError` 一处 | 散落的映射表会以两种方式坏掉：新工具忘了映射导致内部错误原文泄露，或两处对同一错误给出不同的码让 agent 分支失效 |
+| 未识别的错误一律吞掉原文 | SQL 错误含表名列名，超时错误含内网地址 |
+| 401 **不带** `WWW-Authenticate` | 已知且接受的偏差。SDK 只在配了 `ResourceMetadataURL`/`Scopes` 时才发，我们不走 OAuth 发现流程。有测试锁住现状，将来接 OAuth 时它会自动出现 |
 
-PoC（`poc/main.go`）可作参考但**不要直接复用**。要点：
+**这套测试反向验证过**：注入 7 条违规（身份从 header 读、认证失败带原因、只对已吊销换措辞、内部错误原文外泄、少返回 `defaultSpaceId`、Host 自行判断权限、关掉 Stateless），全部被捕获。**探针脚本必须先 `go build` 确认能编译**——编译失败也会让 `go test` 非零，那是假阳性，证明不了测试抓住了什么（第一版探针就栽在这上面）。
 
-- `auth.RequireBearerToken` + 自定义 `TokenVerifier`，内部就是 `governance.Service.Authenticate`
-- `Stateless: true`
-- 身份用标准 `context.WithValue` 传递即可——PoC 已验证 HTTP 中间件 context 能贯通到 tool handler，**不需要** `getServer(*http.Request)` 闭包方案
-- 先实现 `whoami`，它是 agent 判断"我能写哪个空间"的前提。返回内容直接来自 `Identity` + `SpaceScope.All()`，Host 层只做编码
-- 错误映射表集中一处：`ErrTokenNotFound` / `ErrTokenRevoked` / `ErrTokenExpired` **必须映射为同一种响应**，区分它们等于告诉攻击者哪些 token 曾经有效
+## 下一步
 
-之后：knowledge 域（memory → card → recall_trigger）→ 两段式检索 → Web Host → 摄取。
+**knowledge 域**：memory → card → recall_trigger → 两段式检索 → Web Host → 摄取。
+
+动手前先看 §已拍板里「权限与内容模型」那张表——Card 的 `status` 按来源分、`recall_triggers` 单态只给 Card、promote 两端都校，这些都会直接落到表结构上。
 
 ---
 

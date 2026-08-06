@@ -18,9 +18,15 @@ import (
 
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
+	"claracore-server/internal/domain/governance"
+	mcphost "claracore-server/internal/mcp"
 	"claracore-server/internal/platform"
 	"claracore-server/migrations"
 )
+
+// version 是服务端在 MCP initialize 里自报的版本。
+// 发布时用 -ldflags "-X main.version=..." 覆盖。
+var version = "0.1.0-dev"
 
 func main() {
 	migrateOnly := flag.Bool("migrate", false, "应用数据库迁移后退出，不启动服务")
@@ -69,7 +75,19 @@ func main() {
 		return
 	}
 
+	// 装配：adapters 实现 domain 定义的接口，Host 只认识 domain。
+	// 依赖方向在这里收口，其他任何地方都不该出现这种跨层组装。
+	govStore := mysql.NewGovernanceStore(db)
+	govService := governance.NewService(govStore, clock, ids)
+	mcpHost := mcphost.NewHost(govService, logger, version)
+
 	mux := http.NewServeMux()
+
+	// MCP 入口。认证在 Host 内部（bearer token），这里不加任何前置判断——
+	// 多一处身份判断就多一处可能与 governance.Authenticate 不一致的地方。
+	mux.Handle("/mcp", mcpHost.Handler())
+	mux.Handle("/mcp/", mcpHost.Handler())
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		status := map[string]any{
 			"ok":      true,

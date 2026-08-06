@@ -29,14 +29,16 @@ migrate:
 test:
 	go test ./... -count=1
 
-# 集成测试：需要真实 MySQL（.env 中配置的库）。两部分——
-#   test/                   迁移在库里的实际结果
-#   adapters/mysql/         Store 实现与领域层 fake 的行为一致性
+# 集成测试：需要真实 MySQL（.env 中配置的库）。三部分——
+#   test/ schema             迁移在库里的实际结果
+#   adapters/mysql/          Store 实现与领域层 fake 的行为一致性
+#   test/ e2e                完整装配：真库 + 真 token 打通 MCP
 # 不进 make check —— CI 未必有库；但改完迁移或 SQL 必须手跑一次。
 # -run 过滤是因为带上 integration tag 后，同包内的普通测试也会被编进来。
 itest:
 	go test ./test/ -tags=integration -run 'TestFixedChar|TestSpaceUniqueness' -count=1 -v
 	go test ./internal/adapters/mysql/ -tags=integration -run 'TestGovernanceStore' -count=1 -v
+	go test ./test/ -tags=integration -run 'TestMCPWhoAmIEndToEnd' -count=1 -v
 
 # 领域层覆盖率门槛。写在文档里的门槛不是门槛——它得能让 CI 红。
 # 可临时提高门槛来验证它真的会失败：make cover COVERAGE_MIN=95
