@@ -1,0 +1,242 @@
+package governance
+
+import (
+	"context"
+	"maps"
+	"time"
+
+	"claracore-server/internal/platform"
+)
+
+// fakeStore 是领域层测试用的内存 Store。
+//
+// 领域单测必须快且无外部依赖（docs/05-code-structure.md §6.4）——
+// 用真实 MySQL 测权限规则，测的就不再是规则本身了。
+type fakeStore struct {
+	tenants map[platform.ID]Tenant
+	users   map[platform.ID]User
+	agents  map[platform.ID]Agent
+	tokens  map[platform.ID]Token
+	spaces  map[platform.ID]Space
+	perms   map[permKey]Permission
+
+	// 故障注入
+	failOnCreateSpace bool
+	failOnTouch       bool
+
+	touchCalls int
+}
+
+type permKey struct {
+	space platform.ID
+	user  platform.ID
+}
+
+func newFakeStore() *fakeStore {
+	return &fakeStore{
+		tenants: map[platform.ID]Tenant{},
+		users:   map[platform.ID]User{},
+		agents:  map[platform.ID]Agent{},
+		tokens:  map[platform.ID]Token{},
+		spaces:  map[platform.ID]Space{},
+		perms:   map[permKey]Permission{},
+	}
+}
+
+func (f *fakeStore) clone() *fakeStore {
+	c := newFakeStore()
+	maps.Copy(c.tenants, f.tenants)
+	maps.Copy(c.users, f.users)
+	maps.Copy(c.agents, f.agents)
+	maps.Copy(c.tokens, f.tokens)
+	maps.Copy(c.spaces, f.spaces)
+	maps.Copy(c.perms, f.perms)
+	c.failOnCreateSpace = f.failOnCreateSpace
+	c.failOnTouch = f.failOnTouch
+	return c
+}
+
+func (f *fakeStore) restore(from *fakeStore) {
+	f.tenants, f.users, f.agents = from.tenants, from.users, from.agents
+	f.tokens, f.spaces, f.perms = from.tokens, from.spaces, from.perms
+}
+
+func (f *fakeStore) FindAuthContext(_ context.Context, tokenHash string) (*AuthContext, error) {
+	for _, t := range f.tokens {
+		if t.Hash != tokenHash {
+			continue
+		}
+		user, ok := f.users[t.UserID]
+		if !ok {
+			return nil, ErrUserNotFound
+		}
+		agent, ok := f.agents[t.AgentID]
+		if !ok {
+			return nil, ErrAgentNotFound
+		}
+		tenant, ok := f.tenants[t.TenantID]
+		if !ok {
+			return nil, ErrTenantInactive
+		}
+		return &AuthContext{Token: t, User: user, Agent: agent, Tenant: tenant}, nil
+	}
+	return nil, ErrTokenNotFound
+}
+
+func (f *fakeStore) TouchToken(_ context.Context, tokenID platform.ID, at time.Time) error {
+	f.touchCalls++
+	if f.failOnTouch {
+		return errFake
+	}
+	t, ok := f.tokens[tokenID]
+	if !ok {
+		return ErrTokenNotFound
+	}
+	t.LastUsedAt = &at
+	f.tokens[tokenID] = t
+	return nil
+}
+
+func (f *fakeStore) ListSpaceMemberships(_ context.Context, tenantID, userID platform.ID) ([]SpaceMembership, error) {
+	var out []SpaceMembership
+	for _, s := range f.spaces {
+		if s.TenantID != tenantID {
+			continue
+		}
+		relevant := s.Type == SpaceTeam || s.IsOwnedBy(userID)
+		var p *Permission
+		if perm, ok := f.perms[permKey{s.ID, userID}]; ok {
+			relevant = true
+			cp := perm
+			p = &cp
+		}
+		if relevant {
+			out = append(out, SpaceMembership{Space: s, Permission: p})
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) CreateTenant(_ context.Context, t Tenant) error {
+	f.tenants[t.ID] = t
+	return nil
+}
+
+// 下面几个 Create 都带唯一性检查。这不是为了模拟得像，是因为**不检查的
+// fake 会让领域测试跑在一个数据库不可能达到的状态上**：真实的 CreateUser
+// 撞上重名会返回 ErrAlreadyExists，而一个用 map 直接赋值的 fake 会静默把
+// 原用户覆盖掉——测试全绿，线上行为完全不同。
+//
+// 约束与 migrations/0001_governance.sql 里的唯一键一一对应。
+
+func (f *fakeStore) CreateUser(_ context.Context, u User) error {
+	for _, existing := range f.users {
+		if existing.TenantID == u.TenantID && existing.Username == u.Username {
+			return ErrAlreadyExists // uk_users_tenant_username
+		}
+	}
+	f.users[u.ID] = u
+	return nil
+}
+
+func (f *fakeStore) CreateAgent(_ context.Context, a Agent) error {
+	for _, existing := range f.agents {
+		if existing.UserID == a.UserID && existing.Slug == a.Slug {
+			return ErrAlreadyExists // uk_agents_user_slug
+		}
+	}
+	f.agents[a.ID] = a
+	return nil
+}
+
+func (f *fakeStore) CreateSpace(_ context.Context, s Space) error {
+	if f.failOnCreateSpace {
+		return errFake
+	}
+	for _, existing := range f.spaces {
+		if existing.TenantID != s.TenantID {
+			continue
+		}
+		switch {
+		case s.Type == SpacePersonal && existing.Type == SpacePersonal &&
+			s.OwnerUserID != nil && existing.IsOwnedBy(*s.OwnerUserID):
+			return ErrAlreadyExists // uk_spaces_personal
+		case s.Type == SpaceTeam && existing.Type == SpaceTeam:
+			return ErrAlreadyExists // uk_spaces_team
+		}
+	}
+	f.spaces[s.ID] = s
+	return nil
+}
+
+func (f *fakeStore) CreateToken(_ context.Context, t Token) error {
+	for _, existing := range f.tokens {
+		if existing.Hash == t.Hash {
+			return ErrAlreadyExists // uk_tokens_hash
+		}
+	}
+	f.tokens[t.ID] = t
+	return nil
+}
+
+func (f *fakeStore) FindUserByUsername(_ context.Context, tenantID platform.ID, username string) (*User, error) {
+	for _, u := range f.users {
+		if u.TenantID == tenantID && u.Username == username {
+			cp := u
+			return &cp, nil
+		}
+	}
+	return nil, ErrUserNotFound
+}
+
+func (f *fakeStore) FindSpace(_ context.Context, tenantID, spaceID platform.ID) (*Space, error) {
+	s, ok := f.spaces[spaceID]
+	if !ok || s.TenantID != tenantID {
+		return nil, ErrSpaceNotFound
+	}
+	cp := s
+	return &cp, nil
+}
+
+func (f *fakeStore) ListTokens(_ context.Context, tenantID, userID platform.ID) ([]Token, error) {
+	var out []Token
+	for _, t := range f.tokens {
+		if t.TenantID == tenantID && t.UserID == userID {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) RevokeToken(_ context.Context, tenantID, tokenID platform.ID, at time.Time) error {
+	t, ok := f.tokens[tokenID]
+	if !ok || t.TenantID != tenantID {
+		return ErrTokenNotFound
+	}
+	if t.RevokedAt == nil { // 幂等：不覆盖原时间
+		t.RevokedAt = &at
+		f.tokens[tokenID] = t
+	}
+	return nil
+}
+
+func (f *fakeStore) GrantPermission(_ context.Context, p Permission) error {
+	f.perms[permKey{p.SpaceID, p.UserID}] = p
+	return nil
+}
+
+func (f *fakeStore) RevokePermission(_ context.Context, spaceID, userID platform.ID) error {
+	delete(f.perms, permKey{spaceID, userID})
+	return nil
+}
+
+// Atomically 用快照实现真回滚——不真回滚的 fake 会让
+// 「失败后不留残缺状态」这条测试变成永远通过的空检查。
+func (f *fakeStore) Atomically(ctx context.Context, fn func(Store) error) error {
+	snapshot := f.clone()
+	if err := fn(f); err != nil {
+		f.restore(snapshot)
+		return err
+	}
+	return nil
+}

@@ -1,0 +1,18 @@
+# 凭据：绝不进仓库
+.env
+.env.local
+*.pem
+*.key
+
+# 构建产物
+/claracore-server
+/bin/
+/dist/
+
+# 本地开发
+*.log
+.DS_Store
+.coverage.out
+
+# PoC（丢弃型验证代码，结论见 docs/06-poc-findings.md）
+/poc/claracore-poc
