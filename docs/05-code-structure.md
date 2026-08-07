@@ -99,19 +99,22 @@ internal/domain/
 
 `knowledge` **不 import** `governance`。
 
-权限判断在应用层（Host）完成后，以**值**的形式传入领域层：
+权限判断在应用层（Host）完成后，以**值**的形式传入领域层。2026-08-07 落地时的实际形态——传的就是一批裸空间 ID，连 `SpaceScope` 这个类型都不跨过边界：
 
 ```go
-// knowledge 层只接受已解析的可读空间集合，不认识 user/permission 概念
-func (s *Service) Search(ctx context.Context, q Query, scope SpaceScope) ([]Result, error)
+// governance 侧：解析出确定的目标
+scope, _ := gov.Scope(ctx, identity)
+space, err := scope.ResolveWriteTarget(req.Space)   // 写：一个确定的空间
+spaces, err := scope.ResolveReadTargets(req.Spaces) // 读：一批确定的空间
 
-type SpaceScope struct {
-    Readable []SpaceID   // 由 governance 解析后传入
-    WriteTo  SpaceID
-}
+// knowledge 侧：只收已解析好的 ID，不认识 user / permission 概念
+know.CreateMemory(ctx, knowledge.CreateMemoryInput{SpaceID: space.ID, ...})
+know.GetMemory(ctx, tenantID, id, spaces)
 ```
 
-**收益**：`knowledge` 可以独立测试，不需要构造整套用户权限；权限逻辑只有一处，不会散落在各个查询里。
+读写各用各的集合是有意的：**写操作用可写集合定位**，而不是"可读定位 + 再判可写"——对一条自己改不了的内容，「不存在」与「无权修改」给调用方的下一步是同一件事，分开返回反而确认了「它存在，只是你够不着」。
+
+**收益**：`knowledge` 可以独立测试，不需要构造整套用户权限；更要紧的是——一旦 knowledge 能看见 `Permission`，「顺手在这儿也判断一下 `can_write`」就会变成第二份权限规则，而两份规则永远只会改对其中一份。
 
 ### 2.3 领域层禁止出现的东西
 
@@ -265,6 +268,9 @@ cmd → mcp/web/ingest → domain → ports
 | 禁止 `TIMESTAMP` 列类型（只允许 `DATETIME(3)`） | 避开时区自动转换与 2038 |
 | `tenant_id` / `space_id` 列禁止带 `DEFAULT` | 缺失即报错，不让 bug 静默 |
 | 新表必须有 `created_at` | 可追溯 |
+| 建表必须声明 `utf8mb4` | 中文与 emoji 需要 4 字节字符集（实现 0001 时补） |
+| 定长 `CHAR` 列必须显式 `ascii_bin` | ID/hash 是纯 ASCII，utf8mb4 让索引膨胀 4 倍并引入无意义的大小写折叠（实现 0001 时补） |
+| `FULLTEXT` 索引必须带 `WITH PARSER ngram` | 默认分词器按空格切词，中文整段被当作一个词。**这条失效时不报错**——索引建得好好的，`MATCH` 也能跑，只是永远返回空（实现 0002 时补） |
 
 ### 5.3 其他必须进 CI 的检查
 

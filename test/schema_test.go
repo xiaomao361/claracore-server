@@ -24,6 +24,8 @@ var (
 	reScopeDefault = regexp.MustCompile(`(?i)` + "`?" + `(tenant_id|space_id)` + "`?" + `[^,\n]*\bDEFAULT\b`)
 	// 定长 CHAR 列（ULID 主键 / SHA-256 hash）。前置的 [^A-Za-z_] 用于排除 VARCHAR。
 	reFixedChar = regexp.MustCompile(`(?i)(^|[^A-Za-z_` + "`" + `])CHAR\(\d+\)`)
+	// FULLTEXT 索引定义（可能跨行，故匹配到右括号为止）
+	reFulltext = regexp.MustCompile(`(?is)FULLTEXT\s+(KEY|INDEX)\s+` + "`?" + `\w+` + "`?" + `\s*\([^)]*\)[^,\n]*`)
 )
 
 func TestMigrationsObeySchemaRules(t *testing.T) {
@@ -97,6 +99,18 @@ func TestMigrationsObeySchemaRules(t *testing.T) {
 			}
 			if !strings.Contains(strings.ToLower(line), "ascii_bin") {
 				t.Errorf("\n[%s] 定长 CHAR 列未声明 ascii_bin\n  行: %s\n  原因: ID/hash 是纯 ASCII，utf8mb4 排序规则让索引膨胀 4 倍并引入无意义的大小写折叠\n  修复: 加 CHARACTER SET ascii COLLATE ascii_bin", name, strings.TrimSpace(line))
+			}
+		}
+
+		// 规则 7：FULLTEXT 索引必须带 WITH PARSER ngram
+		//
+		// 默认分词器按空格切词，对中文等于整段当一个词——
+		// 「MySQL 连接池配置」检索「连接池」会一条都搜不到。
+		// 最坏的地方在于它不报错：索引建得好好的，MATCH 也能跑，只是永远返回空。
+		// 这种静默失效不可能在代码评审里被看出来，只能靠这条检查。
+		for _, m := range reFulltext.FindAllString(sql, -1) {
+			if !strings.Contains(strings.ToLower(m), "with parser ngram") {
+				t.Errorf("\n[%s] FULLTEXT 索引未指定 ngram 分词器\n  定义: %s\n  原因: 默认分词器按空格切词，中文整段被当作一个词——检索不报错，只是永远返回空\n  修复: 索引定义末尾加 WITH PARSER ngram", name, strings.Join(strings.Fields(m), " "))
 			}
 		}
 	}

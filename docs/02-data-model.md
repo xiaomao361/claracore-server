@@ -84,13 +84,29 @@ Card 的固定 section 直接落成列，而非塞进一个 JSON blob——因�
 |---|---|
 | `title` | 标题 |
 | `card_type` | 类型（如「Codex 协作安全」） |
-| `status` | 状态：`draft` / `verifying` / `confirmed` / `deprecated` |
+| `status` | 状态：`draft` / `active` / `deprecated`（2026-08-07 定，见下） |
 | `source` | 来源 |
 | `body_original` | 作者原意 |
 | `body_distilled` | 提炼 |
 | `body_understanding` | **理解**（空 = 只是摘要，非合格卡片） |
 | `body_why_keep` | 为什么值得保留 |
 | `body_unresolved` | 未解决问题 |
+
+**`status` 为什么是三态（2026-08-07 定，实现 0002 迁移时拍板）**
+
+原设计是 `draft / verifying / confirmed / deprecated` 四态。落地时发现它与 0806 已拍板的「能写就能审、无独立审核实体、作者自管」直接冲突：**没有任何机制会推动一张卡从 `draft` 流转到 `verifying` 再到 `confirmed`**。留着这两个值，库里就会多出两个谁也不会去查的枚举——而死枚举比没有枚举更糟，它让后来的人以为存在一套并不存在的审核流程。
+
+砍到三态，每一个都对应一种确定的检索行为：
+
+| 值 | 谁产生 | 检索行为 |
+|---|---|---|
+| `draft` | 摄取 | 不进默认检索，需人过一遍 |
+| `active` | 手写（默认值） | 正常可检索 |
+| `deprecated` | 人工标记 | 不进默认检索，但仍可按 ID 取到 |
+
+`deprecated` 不删除：「这条约定曾经成立过」本身是信息，删掉之后团队会重复踩同一个已被否决的方案。
+
+对照 `memories.status`（`active / archived / superseded / deleted`）——两套枚举**刻意不同**。Memory 记的是生命周期（还要不要它），Card 记的是知识成熟度（可不可信）。强行统一会让其中一套出现语义上无处安放的值。
 
 ### 3.3 召回触发条件：独立成表
 
@@ -319,7 +335,7 @@ CREATE TABLE cards (
   author_agent_id CHAR(26)       NULL,
   title         VARCHAR(255) NOT NULL,
   card_type     VARCHAR(64)  NOT NULL,
-  status        VARCHAR(16)  NOT NULL,       -- draft | verifying | confirmed | deprecated
+  status        VARCHAR(16)  NOT NULL,       -- draft | active | deprecated
   source        TEXT             NULL,
   body_original      MEDIUMTEXT  NULL,       -- 作者原意
   body_distilled     MEDIUMTEXT  NULL,       -- 提炼
@@ -357,9 +373,14 @@ CREATE TABLE labels (
   entity_type   VARCHAR(16)  NOT NULL,
   entity_id     CHAR(26)     NOT NULL,
   label         VARCHAR(64)  NOT NULL,
+  created_at    DATETIME(3)  NOT NULL,       -- 实现 0002 时补：每张表都要有（schema 规则 4）
   PRIMARY KEY (entity_type, entity_id, label),
   KEY idx_labels_lookup (tenant_id, label)   -- 按标签粗筛
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- labels 刻意**不**冗余 space_id，而 card_recall_triggers 冗余了。
+-- 不对称是有理由的：按标签检索无论如何都要回表取标题正文，那次 JOIN 省不掉；
+-- 而 card_recall 的第一段粗筛只需要触发文本和空间权限，冗余一列即可完全避开 JOIN。
 
 CREATE TABLE links (
   id            CHAR(26)     NOT NULL,
@@ -451,4 +472,5 @@ CREATE TABLE audit_logs (
 - [x] **检索排序中空间权重**：**只做 tie-break，不可配**（2026-08-06 定）。相关性优先，分数接近时才按 team > project > personal 决胜。权重系数是典型的「调了也不知道好没好」参数，可配等于把调参责任推给没有评估集的用户。
 - [x] **MySQL 最低版本**：**8.0**（ngram 全文解析器、CTE、JSON 函数、`spaces` 的生成列唯一索引均需要）。实际验证环境 8.0.36。
 - [x] **Card 的 `status` 流转**：**按来源分**（2026-08-06 定）。人手写的默认 `active`，作者自行改 status，无评审动作——他愿意写已经是最稀缺的东西；机器摄取产生的一律落 `draft`，不进默认检索，需要有人确认。两个来源的信噪比差一个量级，用同一套规则必然要么卡死人工输入、要么让摄取垃圾污染检索。不引入新权限概念：**能写就能审**。
+  <br>**2026-08-07 补**：实现 0002 时据此把枚举从四态砍到 `draft / active / deprecated`——`verifying` 与 `confirmed` 没有任何流转机制会写入它们，见 §3.2。
 - [x] **Memory 是否也需要 recall_triggers**：**只给 Card，单态表**（2026-08-06 定）。`recall_triggers` 直接持 `card_id`，不做多态。① Card 的 trigger 是作者显式写下的，而 Memory 就是随手记——要求随手记时还写召回条件，等于取消了「随手」；② 延后代价可控：将来真要改多态，就是加一列 `entity_type`、存量行填 `'card'`、改一个索引，一次在线 DDL（本来就没有外键）。为未知变化不留接口。

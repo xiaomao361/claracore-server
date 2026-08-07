@@ -105,7 +105,7 @@ Web 是 `01-architecture.md` §3 中与 MCP Host 并列的另一个 Host，二�
 | 不做 | 原因 |
 |---|---|
 | 凭空创建 Memory / Card | 内容由 agent 产生，人只审核。见 §3.1 页面 3 的边界 |
-| 自由编辑已 `confirmed` 的内容 | 同上。要修正应由 agent 走 `memoria_update` / `card_update`，留下正常的版本与审计轨迹 |
+| 自由编辑已 `active` 的内容 | 同上。要修正应由 agent 走 `memoria_update` / `card_update`，留下正常的版本与审计轨迹 |
 | 编辑外部源镜像 | 只读镜像，见 `01-architecture.md` §8.1.3 |
 | 他人读取记录的常规展示 | §2.1，避免产品变成监控工具 |
 | 自助注册 / 邮箱验证 / 密码找回 | 管理员分配账号的封闭部署，见 `01-architecture.md` §5.4 |

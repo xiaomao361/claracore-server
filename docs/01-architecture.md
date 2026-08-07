@@ -312,10 +312,10 @@ Card 的价值在于「提炼 + 理解 + 何时该想起」，而现成文档**�
 
 ```
 摄取(ingest) ──▶ agent 提炼(distill) ──▶ 人审核确认 ──▶ Card
-   原文档          生成提炼/理解草稿/召回条件       status: draft → confirmed
+   原文档          生成提炼/理解草稿/召回条件       status: draft → active
 ```
 
-**质量闸门**：沿用 `knowledge/cards/README.md` 的既有标准——「理解」栏为空的卡只是摘要。落到团队版即：**agent 提炼的草稿必须有人确认才能从 `draft` 转 `confirmed`**；无人认领的长期停留在 `draft`，检索时降权。
+**质量闸门**：沿用 `knowledge/cards/README.md` 的既有标准——「理解」栏为空的卡只是摘要。落到团队版即：**agent 提炼的草稿必须有人确认才能从 `draft` 转 `active`**；无人认领的长期停留在 `draft`，不进默认检索。
 
 这样既解决冷启动，又不会让库里灌满没人负责的垃圾。
 
