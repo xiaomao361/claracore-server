@@ -1,0 +1,34 @@
+{{define "content"}}
+<form method="get" class="card row">
+  <label>空间
+    <select name="space" onchange="this.form.submit()">
+      <option value="">全部可写空间</option>
+      {{range .Spaces}}<option value="{{.Space.ID}}" {{if eq $.SpaceID (printf "%s" .Space.ID)}}selected{{end}}>{{.Space.Name}}</option>{{end}}
+    </select>
+  </label>
+  <noscript><button type="submit">筛选</button></noscript>
+</form>
+
+{{if ge .Total 0}}<p class="hint">共 <strong>{{.Total}}</strong> 条待审。它们不进默认检索——在有人过一遍之前，agent 看不到。</p>{{end}}
+
+<table class="grid">
+  <thead><tr><th>标题</th><th>空间</th><th>来源</th><th>摄入时间</th><th></th></tr></thead>
+  <tbody>
+  {{range .Items}}
+    <tr>
+      <td><a href="/review/{{.Ref.ID}}">{{.Title}}</a></td>
+      <td><span class="tag">{{.SpaceID}}</span></td>
+      <td>{{if .IsIngested}}<code>{{.SourcePath}}</code>{{else}}—{{end}}</td>
+      <td>{{stamp .CreatedAt}}</td>
+      <td><a href="/review/{{.Ref.ID}}">审核 →</a></td>
+    </tr>
+  {{else}}
+    <tr><td colspan="5" class="empty">没有待审的卡片。</td></tr>
+  {{end}}
+  </tbody>
+</table>
+
+{{if .NextCursor}}
+<p><a href="/review?space={{.SpaceID}}&cursor={{.NextCursor}}">下一页 →</a></p>
+{{end}}
+{{end}}

@@ -119,6 +119,23 @@ type Store interface {
 	// 同样只返回默认可见状态的卡片。
 	FindCards(ctx context.Context, tenantID platform.ID, ids, spaces []platform.ID) ([]Card, error)
 
+	// ListContents 按条件翻一页内容（治理面的浏览与审核队列）。
+	//
+	// 与检索的三个方法**不是一回事**：这里没有 MATCH 打分、不截断候选、
+	// 也不只返回可见状态——治理面必须能看到 draft 与 deprecated。
+	//
+	// 排序固定 `updated_at DESC, id DESC`，分页走 keyset 而非 OFFSET：
+	// 翻页期间有内容被更新时，OFFSET 会让某些行被跳过、某些行出现两次，
+	// 而审核队列恰恰是一边翻一边改的场景。
+	//
+	// 权限仍然只有一条纪律：把 q.SpaceIDs 下推成 `WHERE space_id IN (...)`。
+	ListContents(ctx context.Context, q ListQuery) ([]ContentItem, error)
+
+	// CountContents 数符合同一批条件的总数，忽略游标与 Limit。
+	// 与 ListContents 必须用同一份 WHERE，否则「共 128 条」
+	// 会和用户真翻出来的对不上。
+	CountContents(ctx context.Context, q ListQuery) (int, error)
+
 	// CountSpaceContents 按空间统计内容量，用于 space_stats。
 	//
 	// 「有多少张卡只是摘要」这个数字必须由 SQL 直接给出：把卡片全捞出来

@@ -1,0 +1,66 @@
+{{define "content"}}
+<form method="get" class="card row">
+  <label>类型
+    <select name="kind" onchange="this.form.submit()">
+      <option value="card" {{if eq .Kind "card"}}selected{{end}}>知识卡片</option>
+      <option value="memory" {{if eq .Kind "memory"}}selected{{end}}>记忆</option>
+    </select>
+  </label>
+  <label>空间
+    <select name="space" onchange="this.form.submit()">
+      <option value="">全部可读空间</option>
+      {{range .Spaces}}<option value="{{.Space.ID}}" {{if eq $.SpaceID (printf "%s" .Space.ID)}}selected{{end}}>{{.Space.Name}}</option>{{end}}
+    </select>
+  </label>
+  <label>状态
+    <select name="status" onchange="this.form.submit()">
+      <option value="">全部</option>
+      {{if eq .Kind "card"}}
+        <option value="draft" {{if eq .Status "draft"}}selected{{end}}>draft 待审</option>
+        <option value="active" {{if eq .Status "active"}}selected{{end}}>active</option>
+        <option value="deprecated" {{if eq .Status "deprecated"}}selected{{end}}>deprecated</option>
+      {{else}}
+        <option value="active" {{if eq .Status "active"}}selected{{end}}>active</option>
+        <option value="archived" {{if eq .Status "archived"}}selected{{end}}>archived</option>
+        <option value="superseded" {{if eq .Status "superseded"}}selected{{end}}>superseded</option>
+        <option value="deleted" {{if eq .Status "deleted"}}selected{{end}}>deleted（软删）</option>
+      {{end}}
+    </select>
+  </label>
+  <noscript><button type="submit">筛选</button></noscript>
+</form>
+
+{{if ge .Total 0}}<p class="hint">共 {{.Total}} 条。</p>{{end}}
+
+<table class="grid">
+  <thead><tr>
+    <th>标题</th><th>状态</th>
+    {{if eq .Kind "card"}}<th>类型</th><th>合格</th>{{end}}
+    <th>来源</th><th>更新</th>
+  </tr></thead>
+  <tbody>
+  {{range .Items}}
+    <tr class="{{if ne .Status "active"}}muted{{end}}">
+      <td><a href="/browse/{{.Ref.ID}}?kind={{.Ref.Type}}">{{.Title}}</a></td>
+      <td>{{.Status}}</td>
+      {{if eq $.Kind "card"}}
+        <td>{{.CardType}}</td>
+        <td>{{if .Qualified}}✓{{else}}<span title="「理解」栏为空，只算摘要">—</span>{{end}}</td>
+      {{end}}
+      <td>
+        {{if .IsIngested}}<span class="tag">摄取</span> <code>{{.SourcePath}}</code>
+        {{else if .CopiedFrom}}<span class="tag">提升自</span> <code>{{.CopiedFrom.ID}}</code>
+        {{else}}<span class="tag">原创</span>{{end}}
+      </td>
+      <td>{{stamp .UpdatedAt}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="6" class="empty">这个范围里还没有内容。</td></tr>
+  {{end}}
+  </tbody>
+</table>
+
+{{if .NextCursor}}
+<p><a href="/browse?kind={{.Kind}}&space={{.SpaceID}}&status={{.Status}}&cursor={{.NextCursor}}">下一页 →</a></p>
+{{end}}
+{{end}}

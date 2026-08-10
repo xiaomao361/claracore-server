@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -42,6 +43,7 @@ const (
 	userMe    = platform.ID("01USERMEAAAAAAAAAAAAAAAAAA")
 	userOther = platform.ID("01USEROTHERAAAAAAAAAAAAAAA")
 	spPers    = platform.ID("01SPACEPERSONALAAAAAAAAAAA")
+	spTeam    = platform.ID("01SPACETEAMAAAAAAAAAAAAAAA")
 	goodToken = "session-token-for-tests"
 )
 
@@ -119,10 +121,16 @@ func (f *fakeGov) CreateUser(_ context.Context, in governance.CreateUserInput) (
 	return governance.User{ID: "01NEWUSERAAAAAAAAAAAAAAAAA", Username: in.Username}, governance.Space{}, nil
 }
 
+// Scope 给两个空间：个人（可读可写）与团队（隐含可读、写需授权而未授权）。
+//
+// 这个不对称是有意的——「可读集合」与「可写集合」在 Web 层是两条
+// 不同的路径（浏览用前者，审核用后者），夹具里若只有一个可读可写的
+// 空间，那两条路径就永远测不出区别。
 func (f *fakeGov) Scope(_ context.Context, _ governance.Identity) (governance.SpaceScope, error) {
 	owner := userMe
 	return governance.ResolveScope(userMe, []governance.SpaceMembership{
 		{Space: governance.Space{ID: spPers, TenantID: tenantA, Type: governance.SpacePersonal, Name: "毛仔", OwnerUserID: &owner}},
+		{Space: governance.Space{ID: spTeam, TenantID: tenantA, Type: governance.SpaceTeam, Name: "团队"}},
 	}), nil
 }
 
@@ -149,9 +157,19 @@ func (f *fakeGov) RevokeToken(_ context.Context, _, tokenID platform.ID) error {
 	return nil
 }
 
-type fakeKnow struct{}
+type fakeKnow struct {
+	items      []knowledge.ContentItem
+	total      int
+	card       knowledge.Card
+	memory     knowledge.Memory
+	lastList   knowledge.ListContentsInput
+	lastUpdate knowledge.UpdateCardInput
+	updateErr  error
+	getErr     error
+	calls      int
+}
 
-func (fakeKnow) SpaceStats(_ context.Context, _ platform.ID, spaces []platform.ID) ([]knowledge.SpaceStats, error) {
+func (*fakeKnow) SpaceStats(_ context.Context, _ platform.ID, spaces []platform.ID) ([]knowledge.SpaceStats, error) {
 	out := make([]knowledge.SpaceStats, 0, len(spaces))
 	for _, id := range spaces {
 		out = append(out, knowledge.SpaceStats{SpaceID: id, Memories: 3, Cards: 2, DraftCards: 1, UnqualifiedCards: 1, RecallTriggers: 4})
@@ -163,11 +181,43 @@ func newTestWeb(t *testing.T, role string, mustChange bool) (*httptest.Server, *
 	t.Helper()
 	gov := newFakeGov(role, mustChange)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, fakeKnow{}, logger, Options{
+	know := &fakeKnow{
+		card: knowledge.Card{
+			ID: "01CARDAAAAAAAAAAAAAAAAAAAA", TenantID: tenantA, SpaceID: spPers,
+			Title: "摄取来的文档", CardType: "摄取原料", Status: knowledge.CardDraft,
+			Source: "docs/x.md", Original: "一段原文。", Version: 1,
+		},
+		memory: knowledge.Memory{
+			ID: "01MEMORYAAAAAAAAAAAAAAAAAA", TenantID: tenantA, SpaceID: spPers,
+			Title: "一条记忆", Body: "正文。", Status: knowledge.MemoryActive, Version: 1,
+		},
+	}
+	srv := httptest.NewServer(NewHost(gov, know, logger, Options{
 		Version: "test", PublicMCPURL: "https://ccs.example.com/mcp",
 	}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, gov
+}
+
+// newContentWeb 额外交出核心域替身，供审核/浏览页的用例断言。
+func newContentWeb(t *testing.T, role string) (*httptest.Server, *fakeGov, *fakeKnow) {
+	t.Helper()
+	gov := newFakeGov(role, false)
+	know := &fakeKnow{
+		card: knowledge.Card{
+			ID: "01CARDAAAAAAAAAAAAAAAAAAAA", TenantID: tenantA, SpaceID: spPers,
+			Title: "摄取来的文档", CardType: "摄取原料", Status: knowledge.CardDraft,
+			Source: "docs/x.md", Original: "一段原文。", Version: 1,
+		},
+		memory: knowledge.Memory{
+			ID: "01MEMORYAAAAAAAAAAAAAAAAAA", TenantID: tenantA, SpaceID: spPers,
+			Title: "一条记忆", Body: "正文。", Status: knowledge.MemoryActive, Version: 1,
+		},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+	return srv, gov, know
 }
 
 // client 返回一个不自动跳转的客户端：重定向本身是被测行为。
@@ -589,4 +639,232 @@ func TestSecurityHeadersArePresent(t *testing.T) {
 	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatal("缺少 nosniff")
 	}
+}
+
+func (f *fakeKnow) ListContents(_ context.Context, in knowledge.ListContentsInput) (knowledge.ListContentsResult, error) {
+	f.lastList = in
+	f.calls++
+	return knowledge.ListContentsResult{Items: f.items, Total: f.total}, nil
+}
+
+func (f *fakeKnow) GetCard(_ context.Context, _, _ platform.ID, spaces []platform.ID) (knowledge.Card, []knowledge.Link, error) {
+	f.calls++
+	if f.getErr != nil {
+		return knowledge.Card{}, nil, f.getErr
+	}
+	f.lastList.Spaces = spaces
+	return f.card, nil, nil
+}
+
+func (f *fakeKnow) GetMemory(_ context.Context, _, _ platform.ID, spaces []platform.ID) (knowledge.Memory, []knowledge.Link, error) {
+	f.calls++
+	if f.getErr != nil {
+		return knowledge.Memory{}, nil, f.getErr
+	}
+	f.lastList.Spaces = spaces
+	return f.memory, nil, nil
+}
+
+func (f *fakeKnow) UpdateCard(_ context.Context, in knowledge.UpdateCardInput) (knowledge.Card, error) {
+	f.lastUpdate = in
+	f.calls++
+	if f.updateErr != nil {
+		return knowledge.Card{}, f.updateErr
+	}
+	return f.card, nil
+}
+
+// ---------------------------------------------------------------------------
+// 卡片审核：Web 上唯一的内容写入场景
+// ---------------------------------------------------------------------------
+
+// TestReviewQueueUsesWritableSpaces 盯住「能写就能审」这条。
+//
+// 用可读集合的话，人会看到一堆自己按不动的按钮；更糟的是，
+// 那意味着权限判断在提交时才发生，而那时他已经填了一屏字。
+func TestReviewQueueUsesWritableSpaces(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+
+	if _, errMsg := getBody(t, srv, "/review"); errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	in := know.lastList
+	if in.Kind != knowledge.EntityCard {
+		t.Fatalf("审核队列只看卡片，实际 %q", in.Kind)
+	}
+	// 只查 draft：队列的全部意义就是「还没人过目的那些」
+	if len(in.Statuses) != 1 || in.Statuses[0] != knowledge.CardDraft {
+		t.Fatalf("审核队列应只查 draft，实际 %v", in.Statuses)
+	}
+	// fakeGov 里这个人只对个人空间可写（team 是隐含可读、写需授权）
+	for _, id := range in.Spaces {
+		if id == spTeam {
+			t.Fatal("团队空间只可读不可写，不该出现在审核队列的空间集合里")
+		}
+	}
+}
+
+func TestReviewPublishGoesThroughUpdateCard(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+
+	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
+		"action": {"publish"}, "title": {"审过之后的标题"}, "cardType": {"协作安全"},
+		"understanding": {"我想明白的那一层"}, "triggers": {"第一条\n\n第二条\n"},
+	}, true, true)
+	defer resp.Body.Close()
+
+	in := know.lastUpdate
+	if in.Status == nil || *in.Status != knowledge.CardActive {
+		t.Fatalf("确认发布应把状态改成 active，实际 %v", in.Status)
+	}
+	// 审核就是一次带写权限校验的更新，没有独立的审核实体
+	if len(in.WritableSpaces) == 0 {
+		t.Fatal("必须用可写集合定位")
+	}
+	// 摄取给的标题是文件名、类型一律「摄取原料」，不让改的话
+	// 审完的卡类型全是一个值，card_search 的过滤就废了
+	if in.Title == nil || *in.Title != "审过之后的标题" {
+		t.Fatal("审核时应能改标题")
+	}
+	if in.CardType == nil || *in.CardType != "协作安全" {
+		t.Fatal("审核时应能改卡片类型")
+	}
+	if in.RecallTriggers == nil || len(*in.RecallTriggers) != 2 {
+		t.Fatalf("召回条件应按行拆分并去掉空行，实际 %v", in.RecallTriggers)
+	}
+}
+
+// TestReviewRejectUsesDeprecated 锁住退回语义。
+//
+// 留在 draft 的话，几千条永远挂着，「还有 N 条待审」那个数字
+// 就失去意义了——而那个数字正是审核队列存在的理由。
+func TestReviewRejectUsesDeprecated(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+
+	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
+		"action": {"reject"}, "title": {"不需要的文档"}, "cardType": {"摄取原料"},
+	}, true, true)
+	defer resp.Body.Close()
+
+	if know.lastUpdate.Status == nil || *know.lastUpdate.Status != knowledge.CardDeprecated {
+		t.Fatalf("标记不需要应落成 deprecated，实际 %v", know.lastUpdate.Status)
+	}
+}
+
+func TestReviewRejectsUnknownAction(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+
+	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
+		"action": {"delete-everything"},
+	}, true, true)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("未知动作应被拒，实际 %d", resp.StatusCode)
+	}
+	if know.lastUpdate.Status != nil {
+		t.Fatal("未知动作不该走到领域层")
+	}
+}
+
+// TestReviewKeepsInputOnValidationError 是一条体验属性，但它有真实后果。
+//
+// 把人填了一屏的字丢掉，他下次就不敢再点那个按钮了——而审核
+// 本来就是最容易被拖延的事。
+func TestReviewKeepsInputOnValidationError(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+	know.updateErr = errors.New("knowledge: 参数非法: 卡片至少要有一个 section 有内容")
+
+	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
+		"action": {"publish"}, "title": {"我刚打的标题"},
+		"understanding": {"我刚打的理解"}, "triggers": {"我刚写的召回条件"},
+	}, true, true)
+	page := body(t, resp)
+
+	for _, typed := range []string{"我刚打的标题", "我刚打的理解", "我刚写的召回条件"} {
+		if !strings.Contains(page, typed) {
+			t.Fatalf("校验失败后必须把人填的内容放回表单，丢了 %q", typed)
+		}
+	}
+}
+
+func TestReviewDetailNotFoundIsNot500(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+	know.getErr = knowledge.ErrNotFound
+
+	resp := get(t, srv, "/review/01NOSUCHCARDAAAAAAAAAAAAAA", true)
+	defer resp.Body.Close()
+	// 不区分「不存在」与「无权访问」：区分等于让任何人用一个 ID
+	// 就能探测出「这条内容存在于某个我看不见的空间」
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("取不到应是 404，实际 %d", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 内容浏览
+// ---------------------------------------------------------------------------
+
+func TestBrowseUsesReadableSpacesAndShowsAllStatuses(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+
+	if _, errMsg := getBody(t, srv, "/browse"); errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	in := know.lastList
+	// 浏览用可读集合——看得见但改不了是完全正常的状态
+	if len(in.Spaces) < 2 {
+		t.Fatalf("应覆盖全部可读空间（含只读的团队空间），实际 %v", in.Spaces)
+	}
+	// 不传状态 = 全部状态。治理面必须看得到 draft 与 deprecated，
+	// 那正是它存在的理由
+	if len(in.Statuses) != 0 {
+		t.Fatalf("默认不该过滤状态，实际 %v", in.Statuses)
+	}
+	if in.Kind != knowledge.EntityCard {
+		t.Fatalf("默认看卡片（核心载体），实际 %q", in.Kind)
+	}
+}
+
+func TestBrowseHonoursFilters(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+
+	if _, errMsg := getBody(t, srv, "/browse?kind=memory&status=archived&space="+string(spPers)); errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	in := know.lastList
+	if in.Kind != knowledge.EntityMemory {
+		t.Fatalf("类型筛选应生效，实际 %q", in.Kind)
+	}
+	if len(in.Statuses) != 1 || in.Statuses[0] != knowledge.MemoryArchived {
+		t.Fatalf("状态筛选应生效，实际 %v", in.Statuses)
+	}
+	// 空间筛选传给领域层，由它确认这个空间在可读集合里——
+	// 页面不能自己拿参数去查
+	if in.SpaceID != spPers {
+		t.Fatalf("空间筛选应传下去，实际 %q", in.SpaceID)
+	}
+}
+
+func TestBrowseDetailWarnsAboutMissingTriggers(t *testing.T) {
+	srv, _, _ := newContentWeb(t, governance.RoleMember)
+
+	page := body(t, get(t, srv, "/browse/01CARDAAAAAAAAAAAAAAAAAAAA?kind=card", true))
+	// 一张没有召回条件的卡永远不会被 card_recall 命中——
+	// 那是这个产品的核心能力，页面必须说出来
+	if !strings.Contains(page, "card_recall 永远命不中") {
+		t.Fatal("没有召回条件的卡应当被显著标出")
+	}
+	if !strings.Contains(page, "docs/x.md") {
+		t.Fatal("应标注来源——原创/提升自/摄取进来的，三者可信度不同")
+	}
+}
+
+func getBody(t *testing.T, srv *httptest.Server, path string) (string, string) {
+	t.Helper()
+	resp := get(t, srv, path, true)
+	if resp.StatusCode >= 400 {
+		defer resp.Body.Close()
+		return "", "HTTP " + resp.Status
+	}
+	return body(t, resp), ""
 }

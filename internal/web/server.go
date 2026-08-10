@@ -57,6 +57,17 @@ type governanceService interface {
 // 会立刻给出两个对不上的数字，而那种不一致查起来极费时间。
 type knowledgeService interface {
 	SpaceStats(ctx context.Context, tenantID platform.ID, spaces []platform.ID) ([]knowledge.SpaceStats, error)
+
+	// ListContents 是浏览页与审核队列共用的列表查询。
+	// **不是检索**——治理面必须看得到 draft 与 deprecated（见 knowledge/list.go）。
+	ListContents(ctx context.Context, in knowledge.ListContentsInput) (knowledge.ListContentsResult, error)
+
+	GetCard(ctx context.Context, tenantID, id platform.ID, spaces []platform.ID) (knowledge.Card, []knowledge.Link, error)
+	GetMemory(ctx context.Context, tenantID, id platform.ID, spaces []platform.ID) (knowledge.Memory, []knowledge.Link, error)
+
+	// UpdateCard 是 Web 上**唯一**的内容写入口（审核页）。
+	// 复用 MCP 那侧同一个领域用例——「Web 专用的写入路径」是设计事故。
+	UpdateCard(ctx context.Context, in knowledge.UpdateCardInput) (knowledge.Card, error)
 }
 
 type Options struct {
@@ -102,7 +113,10 @@ func NewHost(gov governanceService, know knowledgeService, logger *slog.Logger, 
 
 // pages 是全部页面模板。新增页面要加进来——漏加会在启动时 panic，
 // 而不是等有人点开它才 500。
-var pages = []string{"login.html", "password.html", "overview.html", "tokens.html", "members.html"}
+var pages = []string{
+	"login.html", "password.html", "overview.html", "tokens.html", "members.html",
+	"review.html", "review_detail.html", "browse.html", "browse_detail.html",
+}
 
 func parseTemplates() map[string]*template.Template {
 	out := make(map[string]*template.Template, len(pages))
@@ -144,6 +158,16 @@ func (h *Host) Handler() http.Handler {
 	mux.Handle("GET /tokens", h.requirePasswordSet(http.HandlerFunc(h.handleTokensPage)))
 	mux.Handle("POST /tokens", h.requirePasswordSet(http.HandlerFunc(h.handleTokenCreate)))
 	mux.Handle("POST /tokens/revoke", h.requirePasswordSet(http.HandlerFunc(h.handleTokenRevoke)))
+
+	// 审核是 Web 上唯一的内容写入场景（01 §10 的唯一例外）。
+	// 它挂 requirePasswordSet 而不是 requireAdmin——能写就能审，
+	// 不引入新的权限概念（04 §6）。
+	mux.Handle("GET /review", h.requirePasswordSet(http.HandlerFunc(h.handleReviewList)))
+	mux.Handle("GET /review/{id}", h.requirePasswordSet(http.HandlerFunc(h.handleReviewDetail)))
+	mux.Handle("POST /review/{id}", h.requirePasswordSet(http.HandlerFunc(h.handleReviewSubmit)))
+
+	mux.Handle("GET /browse", h.requirePasswordSet(http.HandlerFunc(h.handleBrowse)))
+	mux.Handle("GET /browse/{id}", h.requirePasswordSet(http.HandlerFunc(h.handleBrowseDetail)))
 
 	mux.Handle("GET /admin/members", h.requireAdmin(http.HandlerFunc(h.handleMembersPage)))
 	mux.Handle("POST /admin/members", h.requireAdmin(http.HandlerFunc(h.handleMemberCreate)))

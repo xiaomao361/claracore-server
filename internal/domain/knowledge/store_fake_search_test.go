@@ -424,3 +424,91 @@ func (f *fakeStore) FindCardBySourceKey(_ context.Context, tenantID, spaceID pla
 	}
 	return nil, ErrNotFound
 }
+
+// --- 列表（治理面） ---
+
+// listMatches 是 fake 版的 listSQL：列表与计数必须用同一份条件，
+// 与 MySQL 实现同一条纪律。
+func (f *fakeStore) listMatches(q ListQuery) []ContentItem {
+	var out []ContentItem
+	add := func(it ContentItem) {
+		if !slices.Contains(q.SpaceIDs, it.SpaceID) {
+			return
+		}
+		if len(q.Statuses) > 0 && !slices.Contains(q.Statuses, it.Status) {
+			return
+		}
+		out = append(out, it)
+	}
+
+	if q.Kind == EntityMemory {
+		for _, m := range f.memories {
+			if m.TenantID != q.TenantID {
+				continue
+			}
+			add(ContentItem{
+				Ref: Ref{EntityMemory, m.ID}, SpaceID: m.SpaceID, Title: m.Title,
+				Status: m.Status, AuthorUserID: m.AuthorUserID, AuthorAgentID: m.AuthorAgentID,
+				CopiedFrom: m.CopiedFrom, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
+			})
+		}
+	} else {
+		for _, c := range f.cards {
+			if c.TenantID != q.TenantID {
+				continue
+			}
+			add(ContentItem{
+				Ref: Ref{EntityCard, c.ID}, SpaceID: c.SpaceID, Title: c.Title,
+				Status: c.Status, CardType: c.CardType, Qualified: c.IsQualified(),
+				AuthorUserID: c.AuthorUserID, AuthorAgentID: c.AuthorAgentID,
+				CopiedFrom: c.CopiedFrom, SourcePath: c.Source,
+				CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,
+			})
+		}
+	}
+
+	// 与 SQL 的 ORDER BY updated_at DESC, id DESC 一致。
+	// 排序不一致的话，游标分页会漏行——而那是静默的。
+	slices.SortFunc(out, func(a, b ContentItem) int {
+		if !a.UpdatedAt.Equal(b.UpdatedAt) {
+			if a.UpdatedAt.After(b.UpdatedAt) {
+				return -1
+			}
+			return 1
+		}
+		return compareID(b.Ref.ID, a.Ref.ID)
+	})
+	return out
+}
+
+func (f *fakeStore) ListContents(_ context.Context, q ListQuery) ([]ContentItem, error) {
+	if err := f.check("ListContents"); err != nil {
+		return nil, err
+	}
+	all := f.listMatches(q)
+
+	var out []ContentItem
+	for _, it := range all {
+		// keyset：只要严格排在游标之后的行
+		if !q.AfterUpdatedAt.IsZero() {
+			after := it.UpdatedAt.Before(q.AfterUpdatedAt) ||
+				(it.UpdatedAt.Equal(q.AfterUpdatedAt) && it.Ref.ID < q.AfterID)
+			if !after {
+				continue
+			}
+		}
+		out = append(out, it)
+		if q.Limit > 0 && len(out) == q.Limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeStore) CountContents(_ context.Context, q ListQuery) (int, error) {
+	if err := f.check("CountContents"); err != nil {
+		return 0, err
+	}
+	// 忽略游标与 Limit——与 MySQL 实现一致
+	return len(f.listMatches(q)), nil
+}

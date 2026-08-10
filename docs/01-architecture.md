@@ -411,7 +411,7 @@ location /mcp {
 | 两段式检索 + 索引队列 + Embedder | ✅ 已落地，真模型验证过召回质量 |
 | MCP 工作面 | ✅ 16/20（缺 Continuity 4 个） |
 | Continuity（shared_line） | ❌ `internal/domain/continuity` 是空目录 |
-| Web 管理面 | ⚠️ 第一刀已落地（登录 / 成员 / token / 概览）。可见性页面（内容浏览、卡片审核、活动流）未开工 |
+| Web 管理面 | ⚠️ 登录 / 成员 / token / 概览 / 内容浏览 / 卡片审核已落地。**活动流未开工**——§10 说的「消除黑盒」主要就是那一页 |
 | 摄取 | ⚠️ 本地 Markdown 目录已通（幂等、失败清单、draft 产物），CLI 入口。Web 管理页与删除检测未做 |
 | 外部源连接（odoc 等） | ❌ 第二版 |
 

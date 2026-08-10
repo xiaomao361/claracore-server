@@ -76,3 +76,25 @@ table.grid { width: 100%; border-collapse: collapse; background: var(--card);
 .tag.team { background: #e6efe8; color: var(--ok); }
 .tag.project { background: #e8ecf5; color: #3a4f7a; }
 code { font: 13px ui-monospace, Menlo, monospace; }
+
+/* 审核页：左原文右编辑。没有原文对照的审核只是盲改。 */
+.review { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
+.review-original, .review-edit {
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 20px;
+}
+.review-original { position: sticky; top: 20px; }
+pre.original {
+  white-space: pre-wrap; word-break: break-word; max-height: 60vh; overflow-y: auto;
+  background: #f7f4f0; padding: 14px; border-radius: 6px; font: 13px/1.7 inherit; margin: 0;
+}
+.review textarea {
+  width: 100%; margin-top: 5px; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: 5px; font: inherit; resize: vertical;
+}
+.review .actions { display: flex; gap: 12px; margin-top: 8px; }
+ul.triggers { padding-left: 20px; }
+ul.triggers li { margin-bottom: 4px; }
+@media (max-width: 860px) {
+  .review { grid-template-columns: 1fr; }
+  .review-original { position: static; }
+}

@@ -21,6 +21,17 @@ func newSearchService(t *testing.T, words ...string) (*Service, *fakeStore, *fak
 	return NewService(store, clock, platform.NewIDGenerator(clock), emb), store, emb
 }
 
+// newSearchServiceNoEmbedder 用递增时钟但不接 Embedder。
+//
+// 分页测试需要每条内容有不同的 updated_at——FixedClock 下全部相同，
+// 排序就只剩 ID 一个维度，测不出「时间相同才比 ID」那条分支。
+func newSearchServiceNoEmbedder(t *testing.T) (*Service, *fakeStore) {
+	t.Helper()
+	clock := &platform.OffsetClock{Base: time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC), Step: time.Minute}
+	store := newFakeStore()
+	return NewService(store, clock, platform.NewIDGenerator(clock), nil), store
+}
+
 // readable 把裸空间 ID 变成带权重的可读空间集合。
 // Rank 由治理域决定（team > project > personal），knowledge 只看这个整数。
 func readable(spaces ...platform.ID) []SearchSpace {

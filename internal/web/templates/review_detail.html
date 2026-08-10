@@ -1,0 +1,30 @@
+{{define "content"}}
+<p class="hint"><a href="/review">← 回到待审队列</a>　空间：{{.Space.Name}}　状态：{{.Card.Status}}{{if .Card.Source}}　来源：<code>{{.Card.Source}}</code>{{end}}</p>
+
+<form method="post" action="/review/{{.Card.ID}}" class="review">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+
+  <div class="review-original">
+    <h2>原文</h2>
+    <pre class="original">{{.Card.Original}}</pre>
+  </div>
+
+  <div class="review-edit">
+    <h2>提炼</h2>
+    <label>标题<input name="title" value="{{.Card.Title}}" required></label>
+    <label>类型<input name="cardType" value="{{.Card.CardType}}" required></label>
+    <label>提炼<textarea name="distilled" rows="3" placeholder="这件事到底是什么">{{.Card.Distilled}}</textarea></label>
+    <label>理解<textarea name="understanding" rows="4" placeholder="你自己想明白的那一层。这一栏为空的卡只是摘要">{{.Card.Understanding}}</textarea></label>
+    <label>为什么值得保留<textarea name="whyKeep" rows="2">{{.Card.WhyKeep}}</textarea></label>
+    <label>未解决的问题<textarea name="unresolved" rows="2">{{.Card.Unresolved}}</textarea></label>
+    <label>召回条件（一行一条）
+      <textarea name="triggers" rows="4" placeholder="未来什么情境下该想起这张卡。写具体的场景，不要写关键词">{{.Triggers}}</textarea>
+    </label>
+    <p class="hint">没有召回条件的卡永远不会被 card_recall 命中——那是这个产品的核心能力。</p>
+    <div class="actions">
+      <button type="submit" name="action" value="publish">确认发布</button>
+      <button type="submit" name="action" value="reject" class="danger">标记不需要</button>
+    </div>
+  </div>
+</form>
+{{end}}

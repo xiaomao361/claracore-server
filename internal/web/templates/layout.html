@@ -12,6 +12,8 @@
   <a class="brand" href="/">ClaraCore</a>
   <nav>
     <a href="/" class="{{if eq .Nav "overview"}}on{{end}}">概览</a>
+    <a href="/browse" class="{{if eq .Nav "browse"}}on{{end}}">内容</a>
+    <a href="/review" class="{{if eq .Nav "review"}}on{{end}}">审核</a>
     <a href="/tokens" class="{{if eq .Nav "tokens"}}on{{end}}">我的接入</a>
     {{if .Principal.IsAdmin}}<a href="/admin/members" class="{{if eq .Nav "members"}}on{{end}}">成员管理</a>{{end}}
   </nav>
