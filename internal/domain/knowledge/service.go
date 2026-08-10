@@ -702,7 +702,7 @@ func resolveExpectedVersion(requested *int, current int) (int, error) {
 	if *requested != current {
 		// 提前返回，省掉一次注定失败的写。SQL 上的版本条件仍然保留——
 		// 它才是权威，这里只是让常见冲突少走一次往返。
-		return 0, fmt.Errorf("%w: 期望版本 %d，当前 %d", ErrVersionConflict, *requested, current)
+		return 0, &VersionConflictError{Expected: *requested, Current: current}
 	}
 	return *requested, nil
 }

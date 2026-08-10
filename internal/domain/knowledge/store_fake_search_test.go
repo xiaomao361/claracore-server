@@ -358,3 +358,47 @@ func (e *fakeEmbedder) Embed(_ context.Context, texts []string) ([][]float32, er
 	}
 	return out, nil
 }
+
+// CountSpaceContents 与 MySQL 实现的口径必须一致，尤其是
+// UnqualifiedCards——那边是 `body_understanding IS NULL`，这边是
+// Card.IsQualified()。两者等价是 0002「空 section 写 NULL 而非空串」
+// 换来的，有专门的测试盯着（见 TestSpaceStatsUnqualifiedMatchesIsQualified）。
+func (f *fakeStore) CountSpaceContents(_ context.Context, tenantID platform.ID, spaces []platform.ID) ([]SpaceStats, error) {
+	if err := f.check("CountSpaceContents"); err != nil {
+		return nil, err
+	}
+	byID := map[platform.ID]*SpaceStats{}
+	stat := func(id platform.ID) *SpaceStats {
+		if st, ok := byID[id]; ok {
+			return st
+		}
+		st := &SpaceStats{SpaceID: id}
+		byID[id] = st
+		return st
+	}
+	for _, m := range f.memories {
+		if m.TenantID != tenantID || !slices.Contains(spaces, m.SpaceID) || !m.IsVisible() {
+			continue
+		}
+		stat(m.SpaceID).Memories++
+	}
+	for _, c := range f.cards {
+		if c.TenantID != tenantID || !slices.Contains(spaces, c.SpaceID) {
+			continue
+		}
+		st := stat(c.SpaceID)
+		st.Cards++
+		if c.Status == CardDraft {
+			st.DraftCards++
+		}
+		if !c.IsQualified() {
+			st.UnqualifiedCards++
+		}
+		st.RecallTriggers += len(f.triggers[c.ID])
+	}
+	out := make([]SpaceStats, 0, len(byID))
+	for _, st := range byID {
+		out = append(out, *st)
+	}
+	return out, nil
+}

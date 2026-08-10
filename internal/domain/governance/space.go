@@ -119,27 +119,44 @@ func ResolveScope(userID platform.ID, memberships []SpaceMembership) SpaceScope 
 	return scope
 }
 
+// SearchRank 是空间在检索排序里的 tie-break 权重，**大者优先**。
+//
+// 语义是「相关性接近时，团队空间的结论比个人经验更权威」
+// （docs/01-architecture.md §11.2：空间只做 tie-break，不可配）。
+//
+// 定义放在这里而不是 knowledge 或 Host 层：它是关于「空间类型意味着什么」
+// 的判断，而那是治理域的事。knowledge 只收到一个整数，压根不知道
+// team / project / personal 是什么（见 knowledge.SearchSpace）。
+//
+// 未知类型给 -1：它排在所有已知类型之后。与 ResolveScope 对未知类型
+// 不给任何权限是同一个态度——新增空间类型时必须显式处理这里。
+func (s Space) SearchRank() int {
+	switch s.Type {
+	case SpaceTeam:
+		return 2
+	case SpaceProject:
+		return 1
+	case SpacePersonal:
+		return 0
+	default:
+		return -1
+	}
+}
+
 // sortAccesses 让列表顺序稳定：team > project > personal，同类按 ID。
 //
 // ID 是 ULID（时间有序），所以同类内即按创建时间排。顺序稳定本身是需求：
 // 返回给 agent 的空间列表每次抖动，会让 agent 的选择也跟着抖。
+//
+// 排序键复用 SearchRank 而不是另写一份序：两处对「哪种空间更靠前」
+// 给出不同答案时，没有任何东西会报错——只会让 whoami 列出的顺序
+// 和检索结果的顺序对不上，而那种不一致查起来极其费时。
+// 注意方向：SearchRank 大者优先，所以这里是**降序**。
 func sortAccesses(list []SpaceAccess) {
-	rank := func(t string) int {
-		switch t {
-		case SpaceTeam:
-			return 0
-		case SpaceProject:
-			return 1
-		case SpacePersonal:
-			return 2
-		default:
-			return 3
-		}
-	}
 	sort.SliceStable(list, func(i, j int) bool {
-		ri, rj := rank(list[i].Space.Type), rank(list[j].Space.Type)
+		ri, rj := list[i].Space.SearchRank(), list[j].Space.SearchRank()
 		if ri != rj {
-			return ri < rj
+			return ri > rj
 		}
 		return list[i].Space.ID < list[j].Space.ID
 	})

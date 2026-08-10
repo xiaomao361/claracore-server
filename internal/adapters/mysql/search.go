@@ -394,3 +394,104 @@ func (s *KnowledgeStore) listRecallTriggersBatch(ctx context.Context, cardIDs []
 	}
 	return out, nil
 }
+
+// CountSpaceContents 统计每个空间的内容量（space_stats）。
+//
+// 三条独立的 GROUP BY 而不是一条大 JOIN：JOIN 三张一对多的表会产生笛卡尔积，
+// 「一张有 3 条召回条件的卡」会把卡片数数成 3。要正确就得套子查询，
+// 而三条各走各索引的简单查询比一条难读的查询更便宜也更好改。
+//
+// `body_understanding IS NULL` 是 Card.IsQualified() 在 SQL 里的第二份表达。
+// 两者必须始终等价——0002 迁移「空 section 写 NULL 而非空串」正是为这个
+// 查询留的口径，写入侧的 nullIfEmpty 保证不会产生空串。领域层有测试
+// 盯着这对等价关系。
+func (s *KnowledgeStore) CountSpaceContents(ctx context.Context, tenantID platform.ID, spaces []platform.ID) ([]knowledge.SpaceStats, error) {
+	if len(spaces) == 0 {
+		return nil, nil
+	}
+	byID := make(map[platform.ID]*knowledge.SpaceStats, len(spaces))
+	stat := func(id platform.ID) *knowledge.SpaceStats {
+		if st, ok := byID[id]; ok {
+			return st
+		}
+		st := &knowledge.SpaceStats{SpaceID: id}
+		byID[id] = st
+		return st
+	}
+
+	args := append([]any{string(tenantID)}, idArgs(spaces)...)
+	in := placeholders(len(spaces))
+
+	// 记忆：只数默认可见的（软删除的不算内容量）
+	memArgs := append(append([]any{}, args...), knowledge.MemoryActive)
+	if err := s.scanCounts(ctx,
+		`SELECT space_id, COUNT(*) FROM memories
+		 WHERE tenant_id = ? AND space_id IN (`+in+`) AND status = ?
+		 GROUP BY space_id`, memArgs,
+		func(id platform.ID, n int) { stat(id).Memories = n }); err != nil {
+		return nil, err
+	}
+
+	// 卡片：一次查出总数、草稿数、只是摘要的数量
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT space_id, COUNT(*),
+		        SUM(status = ?),
+		        SUM(body_understanding IS NULL)
+		 FROM cards
+		 WHERE tenant_id = ? AND space_id IN (`+in+`)
+		 GROUP BY space_id`,
+		append([]any{knowledge.CardDraft}, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 统计卡片: %w", err)
+	}
+	if err := func() error {
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				id                        string
+				total, draft, unqualified int
+			)
+			if err := rows.Scan(&id, &total, &draft, &unqualified); err != nil {
+				return fmt.Errorf("mysql: 读取卡片统计行: %w", err)
+			}
+			st := stat(platform.ID(id))
+			st.Cards, st.DraftCards, st.UnqualifiedCards = total, draft, unqualified
+		}
+		return rows.Err()
+	}(); err != nil {
+		return nil, err
+	}
+
+	if err := s.scanCounts(ctx,
+		`SELECT space_id, COUNT(*) FROM card_recall_triggers
+		 WHERE tenant_id = ? AND space_id IN (`+in+`)
+		 GROUP BY space_id`, args,
+		func(id platform.ID, n int) { stat(id).RecallTriggers = n }); err != nil {
+		return nil, err
+	}
+
+	out := make([]knowledge.SpaceStats, 0, len(byID))
+	for _, st := range byID {
+		out = append(out, *st)
+	}
+	return out, nil
+}
+
+func (s *KnowledgeStore) scanCounts(ctx context.Context, query string, args []any, assign func(platform.ID, int)) error {
+	rows, err := s.ex.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("mysql: 统计内容量: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			id string
+			n  int
+		)
+		if err := rows.Scan(&id, &n); err != nil {
+			return fmt.Errorf("mysql: 读取统计行: %w", err)
+		}
+		assign(platform.ID(id), n)
+	}
+	return rows.Err()
+}

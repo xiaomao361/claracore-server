@@ -10,7 +10,10 @@
 // 而两份规则永远只会改对其中一份。
 package knowledge
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // 领域错误一律用哨兵错误，由 Host 层映射为协议错误，映射表集中一处
 // （docs/05-code-structure.md §6.1）。
@@ -40,3 +43,28 @@ var (
 
 	ErrInvalidArgument = errors.New("knowledge: 参数非法")
 )
+
+// VersionConflictError 是带上当前版本号的乐观锁冲突。
+//
+// 存在的理由是 docs/03-mcp-contract.md §3.4：冲突响应要告诉调用方
+// 当前版本是多少。只有一个哨兵错误的话，agent 只知道"撞车了"，
+// 却必须再发一次 get 才能知道撞到了哪个版本——而那次 get 之后
+// 还可能再撞一次。把版本号一起给出来，重试才是收敛的。
+//
+// 实现 errors.Is(err, ErrVersionConflict)：所有既有的判断继续成立，
+// 想要版本号的调用方再用 errors.As 取。
+type VersionConflictError struct {
+	// Expected 是调用方以为的版本。零值表示调用方没传（用的是刚读到的版本），
+	// 那种情况下冲突发生在本次读-改-写之间。
+	Expected int
+	Current  int
+}
+
+func (e *VersionConflictError) Error() string {
+	if e.Expected == 0 {
+		return fmt.Sprintf("%s: 当前版本 %d", ErrVersionConflict.Error(), e.Current)
+	}
+	return fmt.Sprintf("%s: 期望版本 %d，当前 %d", ErrVersionConflict.Error(), e.Expected, e.Current)
+}
+
+func (e *VersionConflictError) Unwrap() error { return ErrVersionConflict }

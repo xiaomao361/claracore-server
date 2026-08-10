@@ -180,6 +180,14 @@ Desktop 的 17 个 `shared_line_*` 中，`compact` / `archive` / `restore` / `re
 
 **工具总数：20 个**（Memory 6 + Card 5 + 空间 3 + Continuity 4 + 系统 2），对比 Desktop 的 80+。
 
+> **2026-08-10 实现状态**：Memory 6 + Card 5 + 空间 3 + 系统 2 = **16 个已落地**并在真库真模型上跑通（`test/mcp_tools_integration_test.go`）。Continuity 那 4 个还没做——它们需要 `internal/domain/continuity`，那个包目前是空的。
+>
+> 落地时确认的两处形态：
+>
+> **① `VERSION_CONFLICT` 不是 JSON 对象。** §3.4 写的是 `{"error": {"code": ..., "currentVersion": 7}}`，但 MCP SDK 的错误通道只能传字符串（tool 返回 error → `isError` + 文本）。实际形态是一句格式稳定的话：`VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后基于最新内容再改`。版本号仍然必须带上——只说「撞车了」的话，agent 得再发一次 get 才能重试，而那次 get 之后可能再撞一次，重试就不收敛。
+>
+> **② `memoria_update` 暂时没有 `supersedes` 字段。** §4.1 说 Desktop 的 `supersede` 并入 update，但那是两次写（旧的置 `superseded` + 建一条 `evolved-from` 关联）且必须原子完成——那是一个领域用例，不是 Host 层能编排的。`archive` / `restore` / `tag` 都已经并进来了（通过 `status` 与 `labels`）。
+
 ---
 
 ## 5. 与 Desktop 的差异对照

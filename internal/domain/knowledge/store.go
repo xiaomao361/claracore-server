@@ -108,6 +108,16 @@ type Store interface {
 	// 同样只返回默认可见状态的卡片。
 	FindCards(ctx context.Context, tenantID platform.ID, ids, spaces []platform.ID) ([]Card, error)
 
+	// CountSpaceContents 按空间统计内容量，用于 space_stats。
+	//
+	// 「有多少张卡只是摘要」这个数字必须由 SQL 直接给出：把卡片全捞出来
+	// 在应用层调 Card.IsQualified() 数一遍，在几千张卡的规模上就已经不能接受。
+	// 代价是 Card.IsQualified() 的判定在 SQL 里有了第二份表达
+	// （`body_understanding IS NULL`），两者必须始终等价——0002 迁移
+	// 「空 section 写 NULL 而非空串」正是为这个查询留的口径，
+	// 而 nullIfEmpty 保证了写入侧不会产生空串。有测试盯着这对等价关系。
+	CountSpaceContents(ctx context.Context, tenantID platform.ID, spaces []platform.ID) ([]SpaceStats, error)
+
 	// --- 检索：第二段精算所需的向量 ---
 
 	// LoadVectors 批量取指定实体在指定模型下**已算好**的向量，

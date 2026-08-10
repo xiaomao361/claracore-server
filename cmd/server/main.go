@@ -82,13 +82,17 @@ func main() {
 	// 依赖方向在这里收口，其他任何地方都不该出现这种跨层组装。
 	govStore := mysql.NewGovernanceStore(db)
 	govService := governance.NewService(govStore, clock, ids)
-	mcpHost := mcphost.NewHost(govService, logger, version)
 
 	// embedder 为 nil 是**降级形态而非异常形态**：不入索引队列，
 	// 检索退化成中文全文匹配，系统功能保持完整（01-architecture.md §6.1）。
 	embedder := newEmbedder(cfg.Embedding)
 	knowStore := mysql.NewKnowledgeStore(db)
 	knowService := knowledge.NewService(knowStore, clock, ids, embedder)
+
+	mcpHost := mcphost.NewHost(govService, knowService, logger, mcphost.HostOptions{
+		Version:        version,
+		SemanticSearch: cfg.Embedding.Enabled(),
+	})
 
 	mux := http.NewServeMux()
 

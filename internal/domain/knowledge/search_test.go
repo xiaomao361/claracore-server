@@ -529,3 +529,112 @@ func TestSearchCardsFindsByContent(t *testing.T) {
 		t.Fatalf("card_search 匹配的是卡片正文，期望命中 1 张，实际 %d 张", len(res.Hits))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// space_stats
+// ---------------------------------------------------------------------------
+
+func TestSpaceStatsCountsEmptySpacesToo(t *testing.T) {
+	svc, _ := newTestService(t)
+	seedMemory(t, svc, spacePriv)
+
+	stats, err := svc.SpaceStats(context.Background(), tenantA, mySpaces())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("每个可读空间都该出现，实际 %d 个", len(stats))
+	}
+	// 空空间缺席的话，「这个空间是空的」和「这个空间我看不见」
+	// 在返回值上长得一模一样
+	if stats[0].SpaceID != spacePriv || stats[0].Memories != 1 {
+		t.Fatalf("个人空间应有 1 条记忆，实际 %+v", stats[0])
+	}
+	if stats[1].SpaceID != spaceTeam || stats[1].Memories != 0 {
+		t.Fatalf("空的团队空间应以 0 出现，实际 %+v", stats[1])
+	}
+}
+
+// TestSpaceStatsUnqualifiedMatchesIsQualified 把统计口径与领域判定钉在一起。
+//
+// SQL 那边数的是 `body_understanding IS NULL`，这里数的是 !IsQualified()。
+// 两者等价靠的是 0002「空 section 写 NULL 而非空串」加上写入侧的 nullIfEmpty；
+// 哪天有人给 Card.IsQualified() 加一条判据（比如"还要求有召回条件"）
+// 而忘了改 SQL，这个测试不会红——但它至少把两份定义写在了一起，
+// 让改的人有机会看见另一份。
+func TestSpaceStatsUnqualifiedMatchesIsQualified(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	qualified := seedCard(t, svc, spacePriv, withCard("合格的卡"))
+	summary, err := svc.CreateCard(context.Background(), CreateCardInput{
+		TenantID: tenantA, SpaceID: spacePriv, AuthorUserID: userA,
+		Title: "摄取来的长文", CardType: "文档", Status: CardDraft,
+		Distilled:      "只有摘要，没有理解。",
+		RecallTriggers: []string{"看到这类文档时"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !qualified.IsQualified() || summary.IsQualified() {
+		t.Fatal("测试前提不成立：一张该合格、一张该不合格")
+	}
+
+	stats, err := svc.SpaceStats(context.Background(), tenantA, mySpaces())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := stats[0]
+	if got.Cards != 2 {
+		t.Fatalf("卡片总数应为 2，实际 %d", got.Cards)
+	}
+	if got.UnqualifiedCards != 1 {
+		t.Fatalf("「还有多少张卡只是摘要」应为 1，实际 %d——这个数字的用途是能被催", got.UnqualifiedCards)
+	}
+	if got.DraftCards != 1 {
+		t.Fatalf("待审草稿应为 1，实际 %d", got.DraftCards)
+	}
+	// draft 的卡也有召回条件，但它不进默认检索——统计要如实反映库里有什么
+	if got.RecallTriggers != 3 {
+		t.Fatalf("召回条件应为 2+1=3 条，实际 %d", got.RecallTriggers)
+	}
+}
+
+func TestSpaceStatsRequiresSpaces(t *testing.T) {
+	svc, _ := newTestService(t)
+	if _, err := svc.SpaceStats(context.Background(), tenantA, nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("空空间集合应报 ErrInvalidArgument，实际: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 版本冲突要带上当前版本
+// ---------------------------------------------------------------------------
+
+func TestVersionConflictCarriesCurrentVersion(t *testing.T) {
+	svc, _ := newTestService(t)
+	m := seedMemory(t, svc, spacePriv)
+
+	title := "改一次"
+	if _, err := svc.UpdateMemory(context.Background(), UpdateMemoryInput{
+		TenantID: tenantA, ID: m.ID, WritableSpaces: mySpaces(), Title: &title,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 拿着过期的版本号再改一次
+	stale := 1
+	_, err := svc.UpdateMemory(context.Background(), UpdateMemoryInput{
+		TenantID: tenantA, ID: m.ID, WritableSpaces: mySpaces(),
+		ExpectedVersion: &stale, Title: &title,
+	})
+	if !errors.Is(err, ErrVersionConflict) {
+		t.Fatalf("应当是版本冲突，实际: %v", err)
+	}
+	var conflict *VersionConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatal("必须能取到当前版本号——只知道「撞车了」的话，agent 还得再发一次 get 才能重试，而那次 get 之后可能再撞一次")
+	}
+	if conflict.Expected != 1 || conflict.Current != 2 {
+		t.Fatalf("期望 expected=1 current=2，实际 %+v", conflict)
+	}
+}

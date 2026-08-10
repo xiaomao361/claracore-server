@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"claracore-server/internal/domain/governance"
+	"claracore-server/internal/domain/knowledge"
 )
 
 // 对外错误码。agent 按码分支，不解析文案——文案会变，码不会。
@@ -13,6 +14,7 @@ const (
 	codeForbidden = "FORBIDDEN"
 	codeNotFound  = "NOT_FOUND"
 	codeInvalid   = "INVALID_ARGUMENT"
+	codeConflict  = "VERSION_CONFLICT"
 	codeDataFault = "DATA_FAULT"
 	codeInternal  = "INTERNAL"
 )
@@ -64,6 +66,44 @@ func toolError(logger *slog.Logger, tool string, err error) error {
 		errors.Is(err, governance.ErrTenantInactive):
 		logger.Error("认证错误出现在工具执行阶段，中间件链路可能被绕过", "tool", tool, "error", err)
 		return protocolError(codeInternal, "服务内部错误")
+
+	// --- 核心域 ---
+	//
+	// knowledge 与 governance 各有一套哨兵，**刻意不合并**：两个域的
+	// ErrNotFound 含义不同（一个是"这条内容你看不到"，一个是"这个用户不存在"），
+	// 合并之后就没法给它们不同的措辞了。
+
+	// 乐观锁冲突要把当前版本号带出去，否则 agent 只知道撞车了，
+	// 还得再发一次 get 才能重试——而那次 get 之后可能再撞一次。
+	//
+	// 契约 §3.4 描述的是一个带 currentVersion 字段的 JSON 对象，
+	// 但 SDK 的错误通道只能传字符串（tool 返回 error → isError 文本）。
+	// 折中成一句格式稳定的话：码在前，版本号在后。
+	case errors.Is(err, knowledge.ErrVersionConflict):
+		var conflict *knowledge.VersionConflictError
+		if errors.As(err, &conflict) {
+			return protocolError(codeConflict,
+				fmt.Sprintf("内容已被他人修改，当前版本 %d。请重新 get 后基于最新内容再改", conflict.Current))
+		}
+		return protocolError(codeConflict, "内容已被他人修改，请重新 get 后再改")
+
+	// 与 governance 一样合并「不存在」与「无权访问」：区分二者等于让任何人
+	// 都能用一个 ID 探测出「这条内容存在于某个我看不见的空间」。
+	case errors.Is(err, knowledge.ErrNotFound):
+		return protocolError(codeNotFound, "内容不存在或无权访问")
+
+	case errors.Is(err, knowledge.ErrAlreadyExists):
+		return protocolError(codeInvalid, "这条关联已经存在")
+
+	case errors.Is(err, knowledge.ErrInvalidArgument):
+		// 带原文：它描述的是调用方自己传的东西，不涉及他人数据。
+		return protocolError(codeInvalid, err.Error())
+
+	// 与 governance.checkAuthConsistency 同一性质：正常情况下永不触发，
+	// 触发了就是数据损坏导致的跨租户越权。必须留下日志。
+	case errors.Is(err, knowledge.ErrTenantMismatch):
+		logger.Error("数据异常：取到的内容不属于当前租户", "tool", tool, "error", err)
+		return protocolError(codeDataFault, "数据异常，请联系管理员")
 
 	case errors.Is(err, errNoIdentity):
 		logger.Error("装配错误：tool handler 拿不到身份", "tool", tool)

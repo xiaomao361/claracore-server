@@ -102,7 +102,7 @@ func (s *KnowledgeStore) UpdateMemory(ctx context.Context, m knowledge.Memory, e
 	if err != nil {
 		return fmt.Errorf("mysql: 更新记忆: %w", err)
 	}
-	return s.classifyUpdateResult(ctx, res, "memories", m.ID, m.TenantID)
+	return s.classifyUpdateResult(ctx, res, "memories", m.ID, m.TenantID, expectedVersion)
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ func (s *KnowledgeStore) UpdateCard(ctx context.Context, c knowledge.Card, expec
 	if err != nil {
 		return fmt.Errorf("mysql: 更新卡片: %w", err)
 	}
-	return s.classifyUpdateResult(ctx, res, "cards", c.ID, c.TenantID)
+	return s.classifyUpdateResult(ctx, res, "cards", c.ID, c.TenantID, expectedVersion)
 }
 
 // classifyUpdateResult 把「影响 0 行」翻译成正确的领域错误。
@@ -201,22 +201,26 @@ func (s *KnowledgeStore) UpdateCard(ctx context.Context, c knowledge.Card, expec
 // 所以这里不会遇到 GovernanceStore.TouchToken 那种「写同值也算 0 行」的情况：
 // 0 行只可能是 WHERE 没匹配上。但"没匹配上"仍有两种原因，
 // 而它们给调用方的下一步完全不同——冲突该重试，不存在该放弃。
-func (s *KnowledgeStore) classifyUpdateResult(ctx context.Context, res sql.Result, table string, id, tenantID platform.ID) error {
+// 这次查询顺带取回当前版本号：契约要求冲突响应告诉调用方现在是第几版
+// （docs/03-mcp-contract.md §3.4），否则 agent 只知道撞车了，还得再发一次
+// get 才能重试——而那次 get 之后可能再撞一次，重试就不收敛。
+// 反正这一行本来就要查，多带一列是白给的。
+func (s *KnowledgeStore) classifyUpdateResult(ctx context.Context, res sql.Result, table string, id, tenantID platform.ID, expectedVersion int) error {
 	if n, err := res.RowsAffected(); err == nil && n > 0 {
 		return nil
 	}
-	var exists int
+	var current int
 	// 表名来自本文件的字面量，不是外部输入
 	err := s.ex.QueryRowContext(ctx,
-		`SELECT 1 FROM `+table+` WHERE id = ? AND tenant_id = ?`,
-		string(id), string(tenantID)).Scan(&exists)
+		`SELECT version FROM `+table+` WHERE id = ? AND tenant_id = ?`,
+		string(id), string(tenantID)).Scan(&current)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return knowledge.ErrNotFound
 	case err != nil:
 		return fmt.Errorf("mysql: 确认 %s 是否存在: %w", table, err)
 	}
-	return knowledge.ErrVersionConflict
+	return &knowledge.VersionConflictError{Expected: expectedVersion, Current: current}
 }
 
 // ---------------------------------------------------------------------------

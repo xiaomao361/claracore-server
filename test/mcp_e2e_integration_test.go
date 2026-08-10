@@ -25,6 +25,7 @@ import (
 
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/domain/governance"
+	"claracore-server/internal/domain/knowledge"
 	mcphost "claracore-server/internal/mcp"
 	"claracore-server/internal/platform"
 )
@@ -82,7 +83,7 @@ func TestMCPWhoAmIEndToEnd(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(mcphost.NewHost(svc, logger, "e2e").Handler())
+	srv := httptest.NewServer(mcphost.NewHost(svc, knowledge.NewService(mysql.NewKnowledgeStore(db), clock, ids, nil), logger, mcphost.HostOptions{Version: "e2e"}).Handler())
 	t.Cleanup(srv.Close)
 
 	t.Run("真实 token 换到真实身份与空间", func(t *testing.T) {

@@ -54,6 +54,8 @@ const (
 	spTeam   = "01SPACETEAMAAAAAAAAAAAAAAA"
 	spPers   = "01SPACEPERSONALAAAAAAAAAAA"
 	spProj   = "01SPACEPROJECTAAAAAAAAAAAA"
+
+	agentClara = "01AGENTCLARAAAAAAAAAAAAAAA"
 )
 
 func newTestHost(t *testing.T) (*httptest.Server, *fakeGov) {
@@ -63,7 +65,7 @@ func newTestHost(t *testing.T) (*httptest.Server, *fakeGov) {
 	gov := &fakeGov{
 		byToken: map[string]governance.Identity{
 			"ccs_valid_clara": {
-				TenantID: tenantA, UserID: userClar, AgentID: "01AGENTCLARAAAAAAAAAAAAAAA",
+				TenantID: tenantA, UserID: userClar, AgentID: agentClara,
 				TokenID:  "01TOKENAAAAAAAAAAAAAAAAAAA",
 				Username: "zhouwei", DisplayName: "毛仔", Role: governance.RoleAdmin,
 				AgentSlug: "clara", AgentName: "Clara",
@@ -96,9 +98,48 @@ func newTestHost(t *testing.T) (*httptest.Server, *fakeGov) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, logger, "test").Handler())
+	srv := httptest.NewServer(NewHost(gov, newFakeKnow(), logger, HostOptions{Version: "test"}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, gov
+}
+
+// newToolHost 与 newTestHost 同一套夹具，但把核心域的替身也交出来，
+// 让工具层的测试能断言「Host 到底往领域层传了什么」——那才是这一层
+// 唯一该被测的东西。
+func newToolHost(t *testing.T) (*httptest.Server, *fakeKnow) {
+	t.Helper()
+	owner := platform.ID(userClar)
+	gov := &fakeGov{
+		byToken: map[string]governance.Identity{
+			"ccs_valid_clara": {
+				TenantID: tenantA, UserID: userClar, AgentID: agentClara,
+				TokenID:  "01TOKENAAAAAAAAAAAAAAAAAAA",
+				Username: "zhouwei", DisplayName: "毛仔", Role: governance.RoleAdmin,
+				AgentSlug: "clara", AgentName: "Clara",
+			},
+			// 只对团队空间有读权限、没有写权限，也没有个人空间
+			"ccs_readonly": {
+				TenantID: tenantA, UserID: userMate, AgentID: "01AGENTOTHERAAAAAAAAAAAAAA",
+				Username: "tongshi", DisplayName: "同事", Role: governance.RoleMember,
+				AgentSlug: "clara", AgentName: "Clara",
+			},
+		},
+		byUser: map[platform.ID][]governance.SpaceMembership{
+			userClar: {
+				{Space: governance.Space{ID: spTeam, TenantID: tenantA, Type: governance.SpaceTeam, Name: "团队"}},
+				{Space: governance.Space{ID: spPers, TenantID: tenantA, Type: governance.SpacePersonal, Name: "毛仔", OwnerUserID: &owner}},
+				{Space: governance.Space{ID: spProj, TenantID: tenantA, Type: governance.SpaceProject, Name: "项目", OwnerUserID: &owner}},
+			},
+			userMate: {
+				{Space: governance.Space{ID: spTeam, TenantID: tenantA, Type: governance.SpaceTeam, Name: "团队"}},
+			},
+		},
+	}
+	know := newFakeKnow()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, logger, HostOptions{Version: "test", SemanticSearch: true}).Handler())
+	t.Cleanup(srv.Close)
+	return srv, know
 }
 
 // --- JSON-RPC 客户端 ---
@@ -302,7 +343,7 @@ func TestAuthFailuresAreIndistinguishable(t *testing.T) {
 	for _, reason := range reasons {
 		failing := &failingGov{err: reason}
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-		s := httptest.NewServer(NewHost(failing, logger, "test").Handler())
+		s := httptest.NewServer(NewHost(failing, newFakeKnow(), logger, HostOptions{Version: "test"}).Handler())
 
 		resp := call(t, s, "ccs_whatever", "tools/call",
 			map[string]any{"name": "whoami", "arguments": map[string]any{}})

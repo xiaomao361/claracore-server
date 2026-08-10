@@ -550,3 +550,56 @@ func spaceIDs(spaces []SearchSpace) []platform.ID {
 	}
 	return out
 }
+
+// ---------------------------------------------------------------------------
+// space_stats
+// ---------------------------------------------------------------------------
+
+// SpaceStats 是一个空间里的内容量。
+//
+// UnqualifiedCards 是这组数字里唯一有态度的一个：它数的是「理解」栏为空的卡
+// （docs/02-data-model.md §3.2 的质量分界线）。这个字段的用途是让
+// **「还有多少张卡只是摘要」成为一个可以催的数字**——Card.IsQualified()
+// 是度量不是门槛，不合格照样能写进去，所以必须有地方能把它数出来。
+type SpaceStats struct {
+	SpaceID platform.ID
+
+	Memories int
+	Cards    int
+	// DraftCards 是摄取产生、还没人过目的卡。它们不进默认检索，
+	// 所以这个数字直接等于「积压了多少待审内容」。
+	DraftCards       int
+	UnqualifiedCards int
+	RecallTriggers   int
+}
+
+// SpaceStats 统计给定空间集合里的内容量。
+//
+// spaces 是调用者的**可读**空间集合。不做「你只能看自己的空间」这类判断——
+// 那是权限，而权限在 governance.ResolveScope 里已经解析完了。
+func (s *Service) SpaceStats(ctx context.Context, tenantID platform.ID, spaces []platform.ID) ([]SpaceStats, error) {
+	if err := requireSpaces(spaces); err != nil {
+		return nil, err
+	}
+	stats, err := s.store.CountSpaceContents(ctx, tenantID, spaces)
+	if err != nil {
+		return nil, err
+	}
+
+	// 一条内容都没有的空间也要出现在结果里，计数为 0。
+	// 让它缺席的话，「这个空间是空的」和「这个空间我看不见」在返回值上
+	// 长得一模一样——又是一次「检索为空 ≠ 无权检索」。
+	byID := make(map[platform.ID]SpaceStats, len(stats))
+	for _, st := range stats {
+		byID[st.SpaceID] = st
+	}
+	out := make([]SpaceStats, 0, len(spaces))
+	for _, id := range spaces {
+		st, ok := byID[id]
+		if !ok {
+			st = SpaceStats{SpaceID: id}
+		}
+		out = append(out, st)
+	}
+	return out, nil
+}

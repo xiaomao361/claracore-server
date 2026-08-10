@@ -1,19 +1,22 @@
 # ClaraCore Server — 接手指南
 
-> 最后更新：2026-08-10 14:30
+> 最后更新：2026-08-10 15:00
 > 给下一次接手的人或 agent（Clara / Codex / 其他）
 
 ---
 
 ## 一句话状态
 
-**检索已经在真库 + 真模型上跑通：写入入队 → 后台 worker 算向量 → 两段式检索（SQL 粗筛 + 余弦精算）→ `card_recall` 按情境召回整卡。治理域的 token → 身份 → 空间权限 → MCP `whoami` 仍然全绿。下一步是把 MCP 工具接上去。**
+**MCP 工作面已经全部接通：16 个工具在真 token + 真库 + 真模型上跑通了完整工作流——记一条经验、提炼成卡片、后台补向量、在对的情境下被召回。这就是这个产品的一句话价值，现在它是可执行的了。**
 
-端到端的证据是 `test/recall_e2e_integration_test.go`（`make itest` 每次真跑，需要 Ollama 在线，不在线则 skip）：一张召回条件与情境**没有字面重叠**的卡，加一张有字面重叠的干扰卡——纯全文路径把干扰卡排第一，两段式检索把正确的那张纠正回第一位（bge-m3 实测 0.6195 vs 0.6051）。这是这套检索唯一能证明「确实在起作用」而不只是「跑通了」的地方，别让它烂掉。
+两条端到端证据（`make itest` 每次真跑，Ollama 不在线则 skip）：
 
-`make run` 起来就能用真 token 调 `whoami`。装配在 `cmd/server/main.go`：MySQL Store → `governance.Service` → MCP Host 挂在 `/mcp`，另加 `knowledge.Service` 与后台索引 worker。
+- `test/mcp_tools_integration_test.go` —— 走 MCP 协议的完整工作流：`memoria_create` 默认落个人空间 → 写不可写空间被 `FORBIDDEN` 拦下 → `card_create` 带召回条件 → 索引 worker 补上 3 条向量 → `card_recall` 命中并给出召回理由 → 乐观锁冲突带回当前版本 → 软删除后仍可按 ID 取到但不进检索。
+- `test/recall_e2e_integration_test.go` —— 检索质量本身：一张召回条件与情境**没有字面重叠**的卡，加一张有字面重叠的干扰卡。纯全文路径把干扰卡排第一，两段式检索把正确的那张纠正回第一位（bge-m3 实测 0.6195 vs 0.6051）。**这条是唯一能证明检索「确实在起作用」而不只是「跑通了」的测试，别让它烂掉。**
 
-**核心域仍然没有任何 MCP 工具接上去**——`knowledge.Service` 目前唯一的消费者是索引 worker。写入侧与检索侧都已就绪，缺的只是 Host 层的编排与结果编码。`internal/web` 仍是空目录。
+`make run` 起来就是一个可用的团队版 MCP 服务。装配在 `cmd/server/main.go`：MySQL Store → `governance.Service` + `knowledge.Service` → MCP Host 挂在 `/mcp`，外加后台索引 worker。
+
+**还缺的是 Continuity 与 Web**：`shared_line_*` 那 4 个工具要先有 `internal/domain/continuity`（空目录）；`internal/web` 也仍是空的，而摄取、审 draft、发 token 都在那一侧。
 
 ---
 
@@ -86,9 +89,14 @@ internal/ports/embedder.go     Model() + Embed()。纯基础设施接口，不�
 internal/adapters/embedding/   Ollama（/api/embed 批量）+ OpenAI-compatible（按 index 归位）
   └─ embedding_test.go         用 httptest 造真服务不会给你的坏响应：数量对不上、
                                维度不一致、空向量、404、错误信息泄露内网地址
-internal/mcp/                  MCP Host：bearer 认证 + 身份注入 + 错误映射 + whoami
+internal/mcp/                  MCP Host：bearer 认证 + 身份注入 + 错误映射 + 16 个工具
+  └─ knowledge.go              编排骨架：begin() 是唯一的权限解析入口 + 结果编码
+  └─ memory.go / card.go / space.go   Memory 6 + Card 5 + 空间 3 + 系统 2
   └─ host_test.go              8 个协议层测试，用 fake 治理服务，不碰数据库
+  └─ tools_test.go             21 个工具层测试，用只记录入参的 fake 核心域——
+                               这一层唯一该测的是「Host 往领域层传了什么」
 test/mcp_e2e_integration_test.go  完整装配：真库 + 真 token 打通 whoami（make itest）
+test/mcp_tools_integration_test.go 全栈工作流：真 token → MCP → 真库 → 真 Ollama
 migrations/0001_governance.sql 治理域 6 张表，已应用到 192.168.3.200 的库
 migrations/0002_knowledge.sql  核心域 5 张表，已应用
 migrations/0003_embeddings.sql 运行时域 embeddings 表 + 给 card_recall_triggers 补 ngram 全文索引
@@ -97,9 +105,11 @@ Makefile                       make check 是提交前的门槛
 poc/                           丢弃型验证代码，独立 go.mod，不参与主模块构建
 ```
 
-**约束已反向验证过**：造过违规探针，9 + 3 + 8 + 4 + 7 + 21 + 14 条违规全部被捕获（依次是：架构与 schema 规则、`ascii_bin` 规则、governance Store、`ErrAlreadyExists` 映射与 fake 唯一性、MCP Host 的安全属性、knowledge 领域层与 Store、检索与索引队列）。新增约束或新写一层适配器后请用同样方式验证一次——**从不失败的检查等于没有检查**。
+**约束已反向验证过**：造过违规探针，9 + 3 + 8 + 4 + 7 + 21 + 14 + 14 条违规全部被捕获（依次是：架构与 schema 规则、`ascii_bin` 规则、governance Store、`ErrAlreadyExists` 映射与 fake 唯一性、MCP Host 的安全属性、knowledge 领域层与 Store、检索与索引队列）。新增约束或新写一层适配器后请用同样方式验证一次——**从不失败的检查等于没有检查**。
 
-0810 那 14 条的清单（漏网 0）：领域层 6 条（检索空间过滤失效、语义与全文命中混排、查询向量算不出时报错而不降级、错位向量按下标硬配、替换召回条件不清旧向量、入队不与内容同事务）；Embedder 适配器 2 条（按数组顺序取向量而非 index、错误信息带上底层 error 泄露内网地址）；MySQL 5 条（粗筛漏租户隔离、召回权限信冗余列、upsert 里 content_hash 提前赋值、MATCH 进 WHERE 丢掉字面没命中的候选、标签过滤退化成并集）；schema 1 条（造一张没有 ngram 的 FULLTEXT 探针表，确认那条检查真的会红）。
+0810 检索那 14 条的清单（漏网 0）：领域层 6 条（检索空间过滤失效、语义与全文命中混排、查询向量算不出时报错而不降级、错位向量按下标硬配、替换召回条件不清旧向量、入队不与内容同事务）；Embedder 适配器 2 条（按数组顺序取向量而非 index、错误信息带上底层 error 泄露内网地址）；MySQL 5 条（粗筛漏租户隔离、召回权限信冗余列、upsert 里 content_hash 提前赋值、MATCH 进 WHERE 丢掉字面没命中的候选、标签过滤退化成并集）；schema 1 条（造一张没有 ngram 的 FULLTEXT 探针表，确认那条检查真的会红）。
+
+0810 MCP 工具那 14 条（漏网 0）：**全部打在 Host 层**，因为这一层最容易写出"看起来对但没防住"的代码——权限解析漏一步，领域层还会兜住，测试照样全绿，而线上真正拦住越权的那一步已经没了。清单：写入用可读集合定位、写目标不校权限、检索对不可读空间静默跳过、空间排序权重在 Host 里另写一份、promote 只校目标不校源、检索结果不标注来源空间、丢掉 semantic 标记、召回不回传触发条件、版本冲突不带当前版本、未映射错误原文外泄、ErrNotFound 说成"无权限"、空标签编码成 null、新工具带上身份参数、Host 替领域层补卡片默认状态。
 
 探针的两条纪律（都是踩出来的）：**先 `go build` 确认注入后能编译**（编译失败的 `go test` 非零是假阳性）；**确认 perl 表达式真的匹配到了东西**（没改动的文件当然测试全绿，那也是假阳性）。第 21 条探针还顺带发现：单独去掉 `resolveExpectedVersion` 的提前检查**不构成缺陷**——存储层的版本条件仍会拦下来，行为完全等价。真正的静默覆盖形态是「忽略调用方传来的版本号」，探针要照着那个形态造。
 
@@ -181,7 +191,7 @@ poc/                           丢弃型验证代码，独立 go.mod，不参与
 
 **这套测试反向验证过**：注入了 8 条违规（INNER JOIN、漏 owner 条件、漏租户隔离、覆盖吊销时间、去掉 upsert、0 行当不存在、不提交、包装错误），全部被捕获。第一轮时「漏租户隔离」曾经漏网——因为 fixture 里只有一个租户，后来补了 foreign tenant 的 team 空间与同名用户才抓住。**新加 SQL 时照做一遍。**
 
-## MCP Host 已固化的决定（加新工具之前先读这段）
+## MCP Host 协议层已固化的决定（认证、传输、错误映射）
 
 | 决定 | 为什么 |
 |---|---|
@@ -283,7 +293,69 @@ mem, err := know.CreateMemory(ctx, knowledge.CreateMemoryInput{
 
 真撞上时该做的是把粗筛拆成「全文索引命中集 ∪ 最近内容」两条索引路径求并，**不是调 `candidateCap`**。MySQL 8.0 没有 ANN 索引——「向量相关但字面不沾边、又不新近」的内容进不了候选集是结构性的。
 
+---
+
+## MCP 工具层已固化的决定（2026-08-10，加新工具之前先读这段）
+
+### 每个 handler 的形状必须一样
+
+```go
+r, err := h.begin(ctx)                 // 身份 + 权限，唯一入口
+space, err := r.writeTarget(in.Space)  // 写：解析成一个确定的空间
+spaces, err := r.readTargets(in.Spaces) // 读：解析成带权重的空间集合
+result, err := h.know.Xxx(ctx, ...)    // 领域层做事
+return nil, r.encodeXxx(result), nil   // 编码
+```
+
+中间**不出现任何 if 业务判断**。`begin` 抽成一个函数不只是省几行——它保证每个工具都走了同一条权限解析路径。少写一次 `Scope` 调用不会有编译错误，只会有一个不带权限判断的工具。
+
+| 决定 | 为什么 |
+|---|---|
+| 写操作用**可写**集合定位（`writableSpaces`） | 不是「可读定位 + 再判可写」。对一条自己改不了的内容，「不存在」与「无权修改」给调用方的下一步是同一件事，分开返回等于确认「它存在，只是你够不着」 |
+| 关联与 promote 的源用**可读**集合 | 建关联不修改任何一端，promote 也只是复制。但两端必须看得见——否则可以用猜来的 ID 反推内容是否存在 |
+| 空间排序权重来自 `governance.Space.SearchRank()` | 定义只有那一份，`sortAccesses` 也用它。在 Host 里写 `if type == "team"` 就是第二份，而两份规则永远只会改对其中一份。注意方向：SearchRank **大者优先**，而排序里是降序 |
+| Host **不补**领域层的默认值 | `card_create` 的 `status` 留空传下去，由 `CreateCard` 填 `active`。「手写默认 active、摄取显式 draft」是业务规则，在 Host 补一次就是复制了它 |
+| 结果里每条内容都带 `space{id,type,name}` | agent 据此判断权威性：team = 已达成共识，personal = 个人经验。`knowledge` 只返回 `space_id`，映射成三元组是 Host 用治理域信息做的 |
+| `semantic`（每条）与 `semanticAvailable`（整次）必须回传 | 语义命中与全文命中不通约；而「没搜到」和「语义那一半根本没跑」下一步完全不同 |
+| 关联**不解析对端标题** | 对端可能落在调用方无权访问的空间里。只给 ID 和 kind，想看内容就拿 ID 去 get——那里会撞上正常的权限检查 |
+| 空标签编码成 `[]` 不是 `null` | agent 侧 `for x in labels` 撞上 null 会炸，而「没有标签」是完全正常的状态 |
+| 更新类工具的字段全用指针 | `nil` = 不改，`""` = 清空。用值类型就没法表达「把正文清空」这个合法意图 |
+
+### 契约的一处偏差：VERSION_CONFLICT 的形态
+
+`03-mcp-contract.md` §3.4 描述的是一个带 `currentVersion` 字段的 JSON 对象。SDK 的错误通道只能传字符串（tool 返回 `error` → `isError` + 文本），所以实际形态是一句格式稳定的话：
+
+```
+VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后基于最新内容再改
+```
+
+版本号是真的要带上的，不是装饰：只说「撞车了」的话，agent 还得再发一次 get 才能重试，而那次 get 之后可能再撞一次——重试就不收敛。为此在领域层加了 `knowledge.VersionConflictError`（`errors.Is(err, ErrVersionConflict)` 仍然成立），MySQL 那边把本来就要发的存在性查询顺手多取了一列 `version`。
+
+### 身份参数：由 SDK 的 schema 校验兜底
+
+塞 `authorUserId` / `tenantId` 进 arguments 会被 SDK 直接拒掉（`additionalProperties`），连 handler 都进不去。`TestToolSchemasHaveNoIdentityParams` 扫全部工具的 inputSchema，盯的是**未来新增的工具**——谁哪天顺手加一个 `userId` 参数，那条会红。
+
+### 工具清单（16 个，上限 20）
+
+| 组 | 工具 |
+|---|---|
+| Memory 6 | `memoria_create` / `search` / `get` / `update` / `delete` / `link` |
+| Card 5 | `card_create` / `recall` / `search` / `get` / `update` |
+| 空间 3 | `space_list` / `promote` / `space_stats` |
+| 系统 2 | `whoami` / `server_status` |
+
+契约里的 Continuity 4 个（`shared_line_*`）**还没做**——它们要 `internal/domain/continuity`，那个包目前是空的。工具总数因此是 16 而不是 20。
+
+**维护类操作一律不进 MCP**（导入导出、合并建议、休眠归档、标签别名管理）：它们是人的运维动作，归 Web 治理面。有测试盯着工具总数不超过 20。
+
 ### 这一层缺的东西
+
+- **`memoria_update` 没有 `supersedes` 字段**。契约 §4.1 说 Desktop 的 `supersede` 并入 update，但那是两次写（旧的置 `superseded` + 建一条 `evolved-from` 关联），必须原子完成——那是一个领域用例，不是 Host 层能编排的。要做就在 `knowledge` 里加 `SupersedeMemory`。
+- **`space_stats` 的合格判定有两份表达**。SQL 是 `body_understanding IS NULL`，领域是 `Card.IsQualified()`。等价靠的是 0002「空 section 写 NULL 而非空串」加写入侧的 `nullIfEmpty`。`TestSpaceStatsUnqualifiedMatchesIsQualified` 把两者写在了一起，但它挡不住「给 IsQualified 加一条判据却忘了改 SQL」。
+
+---
+
+## 检索层缺的东西
 
 - **没有 backfill**。未配 Embedder 时不入队（没有模型名可写），所以**后来才打开 embedding 的存量内容不会被自动补索引**，换模型灰度重建同理。要补的形态大致是 `ListUnindexed(model, limit)` 把没有当前模型向量行的实体捞出来、由领域层拼文本再入队——放在 Web 治理面或一个 `-reindex` flag 后面。
 - **没有向量缓存**。`ports.Cache` 还不存在，查询向量每次都真算一次。`hash(text+model)` 的 Redis 缓存是 `01-architecture.md` §6.2 里价值最高的一项，等 Cache 端口落地时一起做。
@@ -294,13 +366,16 @@ mem, err := know.CreateMemory(ctx, knowledge.CreateMemoryInput{
 
 ## 下一步
 
-**按这个顺序：**
+工作面（agent 用的 MCP 工具）已经完整。剩下的都在治理面与冷启动这一侧：
 
-1. **MCP 工具**（现在是大头）：`memoria_create/search/get/update/delete/link` + `card_create/recall/search/get/update` + `promote` + `space_list`。领域层全部就绪，缺的只是 Host 层编排（模式见上）与结果编码。三件事要注意：
-   - 检索结果**必须标注来源空间**（`03-mcp-contract.md` §3.2），而 `knowledge` 只返回 `space_id`——把它映射成 `{id, type, name}` 是 Host 用 governance 那侧的信息做的。
-   - 空间 Rank 由 Host 从空间类型算出来（team > project > personal），knowledge 只收整数。
-   - `SemanticAvailable=false` 要在返回里体现，别让 agent 以为语义那一半跑过了。
-2. **Web Host** → **摄取**。摄取一定要复用同一条入队路径，别自己写第二份 embedding 逻辑。
+1. **Web Host**（现在是大头）。它是第一版真正缺的东西——没有它，一个新团队连账号和 token 都发不出来，服务再完整也用不起来。先读 `04-web-scope.md`。第一刀的最小闭环：登录 → 成员与 token 管理 → 审 draft 卡片。
+   - **登录会逼出一个欠账**：领域层不做密码哈希（argon2id 的参数属于配置，而领域层不读配置）。要在 `ports/` 定义 `PasswordHasher`，Host 层调用后把 hash 传进 `CreateUserInput`。在那之前没有任何地方能真正创建用户密码。
+2. **摄取**。冷启动是生死问题（`01-architecture.md` §8.1），团队已有的 odoc / Atlas / 各类 md 接不进来，产品就启动不了。两条纪律：摄取产物一律落 `draft`（不进默认检索）；**必须复用同一条入队路径**，别写第二份 embedding 逻辑。
+3. **Continuity**（`shared_line_*` 4 个工具）。`internal/domain/continuity` 还是空目录。它不阻塞前两项，工具契约从 Desktop 平移。
+
+零散但值得顺手做的：
+- `knowledge.SupersedeMemory` 用例（见 §MCP 工具层缺的东西），补上契约里的 `supersedes`。
+- embedding 的 backfill 与失败计数（见 §检索层缺的东西），做 Web 治理面时一起。
 
 ---
 
