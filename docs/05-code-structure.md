@@ -41,8 +41,8 @@ claracore-server/
 ├── internal/                   # Go 编译期强制封装，外部无法 import
 │   ├── config/                 # 唯一读环境变量的地方
 │   ├── domain/                 # 领域层：不依赖任何基础设施
-│   │   ├── governance/         # 身份、token、空间权限
-│   │   ├── knowledge/          # memory / card / 召回条件 / 检索 / 索引队列
+│   │   ├── governance/         # 身份、token、空间权限、登录会话
+│   │   ├── knowledge/          # memory / card / 检索 / 索引队列 / 摄取 / 列表
 │   │   └── continuity/         # ← 尚未开工（shared_line）
 │   ├── ports/                  # 纯基础设施接口（embedder / hasher / sessionstore）
 │   ├── adapters/               # mysql/ + embedding/ + crypto/
@@ -50,7 +50,8 @@ claracore-server/
 │   ├── web/                    # Host B：登录 / 成员 / token / 概览
 │   ├── ingest/                 # Markdown 目录源（不提炼）
 │   └── platform/               # 横切：ID / 时钟
-├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时 / 0004 会话 / 0005 摄取
+├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时
+│                               # 0004 会话 / 0005 摄取（0006 审计日志待做）
 ├── docs/                       # 01–05 设计文档
 ├── test/                       # 架构测试、schema 测试、端到端集成测试
 ├── Makefile
@@ -214,9 +215,10 @@ internal/adapters/
 internal/mcp/（已落地）          internal/web/（已落地）
 ├── server.go   ← 工具注册       ├── server.go   ← 路由三层门 + 模板
 ├── auth.go     ← TokenVerifier  ├── session.go  ← cookie / CSRF / 中间件
-│                 + 身份注入 ctx ├── handlers.go ← 各页面
-├── errors.go   ← 唯一的错误映射 ├── templates/  //go:embed
-├── knowledge.go← 编排骨架       └── static/     //go:embed
+│                 + 身份注入 ctx ├── handlers.go ← 登录/概览/token/成员
+├── errors.go   ← 唯一的错误映射 ├── content.go  ← 审核 + 浏览
+├── knowledge.go← 编排骨架       ├── templates/  //go:embed
+│                               └── static/     //go:embed
 ├── whoami.go
 ├── memory.go   ← Memory 6
 ├── card.go     ← Card 5
