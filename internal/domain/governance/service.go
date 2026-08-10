@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"claracore-server/internal/platform"
+	"claracore-server/internal/ports"
 )
 
 // tokenTouchInterval 是 last_used_at 的写入节流窗口。
@@ -24,10 +25,22 @@ type Service struct {
 	store Store
 	clock platform.Clock
 	ids   *platform.IDGenerator
+
+	// hasher 与 sessions 是 Web 登录需要的两件基础设施，都在 ports/。
+	//
+	// 放在治理域而不是 Web Host：「谁是谁」的规则只该有一份。
+	// 密码校验、会话签发、停用即失效——这些都是身份问题，
+	// 让 Host 自己拼一遍的话，MCP 那侧的 token 认证与 Web 这侧的
+	// 会话认证会长出两套「用户还有效吗」的判断。
+	//
+	// 二者可以为 nil：纯 MCP 部署用不到它们。用到时才报错，
+	// 而不是在装配处强制所有部署都配齐（见 requireWebDeps）。
+	hasher   ports.PasswordHasher
+	sessions ports.SessionStore
 }
 
-func NewService(store Store, clock platform.Clock, ids *platform.IDGenerator) *Service {
-	return &Service{store: store, clock: clock, ids: ids}
+func NewService(store Store, clock platform.Clock, ids *platform.IDGenerator, hasher ports.PasswordHasher, sessions ports.SessionStore) *Service {
+	return &Service{store: store, clock: clock, ids: ids, hasher: hasher, sessions: sessions}
 }
 
 // Authenticate 用 bearer token 明文换取调用者身份。
@@ -123,10 +136,13 @@ type ProvisionTenantInput struct {
 	TeamSpaceName string
 	AdminUsername string
 	AdminDisplay  string
-	// PasswordHash 是 argon2id 结果。领域层不做密码哈希：
-	// 参数（memory/time/parallelism）属于配置，而领域层不读配置。
-	// Web 登录实现时在 ports/ 定义 PasswordHasher，由 Host 层调用后传入。
-	PasswordHash string
+	// AdminPassword 是**明文**初始密码，由 Service 通过 ports.PasswordHasher 哈希。
+	//
+	// 2026-08-10 从 PasswordHash 改成明文：原来的设计让调用方自己哈希，
+	// 结果是集成测试里塞了一堆 "$argon2id$e2e$fake" 这种永远验不过的假值，
+	// 而没有任何地方能真正创建一个能登录的账号。哈希本身仍然不在领域层——
+	// 它在 ports.PasswordHasher 的实现里，参数属于配置这条没有变。
+	AdminPassword string
 }
 
 type ProvisionTenantResult struct {
@@ -144,8 +160,12 @@ func (s *Service) ProvisionTenant(ctx context.Context, in ProvisionTenantInput) 
 	if err := requireAll(map[string]string{
 		"租户名":   in.TenantName,
 		"管理员账号": in.AdminUsername,
-		"密码哈希":  in.PasswordHash,
+		"初始密码":  in.AdminPassword,
 	}); err != nil {
+		return ProvisionTenantResult{}, err
+	}
+	hash, err := s.hashPassword(in.AdminPassword)
+	if err != nil {
 		return ProvisionTenantResult{}, err
 	}
 
@@ -160,7 +180,7 @@ func (s *Service) ProvisionTenant(ctx context.Context, in ProvisionTenantInput) 
 		ID:           s.ids.New(),
 		TenantID:     tenant.ID,
 		Username:     in.AdminUsername,
-		PasswordHash: in.PasswordHash,
+		PasswordHash: hash,
 		DisplayName:  defaultIfEmpty(in.AdminDisplay, in.AdminUsername),
 		Role:         RoleAdmin,
 		MustChangePw: true, // 首次登录强制改密
@@ -176,7 +196,7 @@ func (s *Service) ProvisionTenant(ctx context.Context, in ProvisionTenantInput) 
 	}
 	personal := personalSpaceFor(s.ids.New(), admin, now)
 
-	err := s.store.Atomically(ctx, func(st Store) error {
+	err = s.store.Atomically(ctx, func(st Store) error {
 		if err := st.CreateTenant(ctx, tenant); err != nil {
 			return err
 		}
@@ -198,11 +218,12 @@ func (s *Service) ProvisionTenant(ctx context.Context, in ProvisionTenantInput) 
 }
 
 type CreateUserInput struct {
-	TenantID     platform.ID
-	Username     string
-	DisplayName  string
-	PasswordHash string
-	Role         string
+	TenantID    platform.ID
+	Username    string
+	DisplayName string
+	// Password 是明文初始密码，由 Service 哈希（见 ProvisionTenantInput.AdminPassword）。
+	Password string
+	Role     string
 }
 
 // CreateUser 建用户并同时建其个人空间。
@@ -213,8 +234,12 @@ type CreateUserInput struct {
 func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (User, Space, error) {
 	if err := requireAll(map[string]string{
 		"账号":   in.Username,
-		"密码哈希": in.PasswordHash,
+		"初始密码": in.Password,
 	}); err != nil {
+		return User{}, Space{}, err
+	}
+	hash, err := s.hashPassword(in.Password)
+	if err != nil {
 		return User{}, Space{}, err
 	}
 	if in.TenantID == "" {
@@ -230,7 +255,7 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (User, Spa
 		ID:           s.ids.New(),
 		TenantID:     in.TenantID,
 		Username:     in.Username,
-		PasswordHash: in.PasswordHash,
+		PasswordHash: hash,
 		DisplayName:  defaultIfEmpty(in.DisplayName, in.Username),
 		Role:         role,
 		MustChangePw: true,
@@ -239,7 +264,7 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (User, Spa
 	}
 	personal := personalSpaceFor(s.ids.New(), user, now)
 
-	err := s.store.Atomically(ctx, func(st Store) error {
+	err = s.store.Atomically(ctx, func(st Store) error {
 		if err := st.CreateUser(ctx, user); err != nil {
 			return err
 		}

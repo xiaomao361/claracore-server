@@ -13,9 +13,21 @@ var errFake = errors.New("fake store: 注入的故障")
 
 func newTestService(t *testing.T, store Store) (*Service, *platform.FixedClock) {
 	t.Helper()
-	clock := &platform.FixedClock{T: time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)}
-	return NewService(store, clock, platform.NewIDGenerator(clock)), clock
+	svc, clock, _, _ := newWebService(t, store)
+	return svc, clock
 }
+
+// newWebService 额外交出密码哈希与会话存储，供登录相关的用例断言。
+func newWebService(t *testing.T, store Store) (*Service, *platform.FixedClock, *fakeHasher, *fakeSessions) {
+	t.Helper()
+	clock := &platform.FixedClock{T: time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)}
+	hasher, sessions := &fakeHasher{}, newFakeSessions()
+	return NewService(store, clock, platform.NewIDGenerator(clock), hasher, sessions), clock, hasher, sessions
+}
+
+// testPassword 满足 MinPasswordLen。夹具里的密码要能真的登录，
+// 否则登录用例就得另建一套账号。
+const testPassword = "correct-horse-battery"
 
 // seed 建一个可用的租户：租户 + 用户 + agent + 个人空间 + 团队空间 + 一个有效 token。
 func seed(t *testing.T, svc *Service) (Identity, string) {
@@ -25,7 +37,7 @@ func seed(t *testing.T, svc *Service) (Identity, string) {
 	res, err := svc.ProvisionTenant(ctx, ProvisionTenantInput{
 		TenantName:    "测试团队",
 		AdminUsername: "maozai",
-		PasswordHash:  "$argon2id$fake",
+		AdminPassword: testPassword,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +238,7 @@ func TestProvisionTenantCreatesEverything(t *testing.T) {
 	res, err := svc.ProvisionTenant(context.Background(), ProvisionTenantInput{
 		TenantName:    "毛仔的团队",
 		AdminUsername: "maozai",
-		PasswordHash:  "$argon2id$fake",
+		AdminPassword: testPassword,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -255,7 +267,7 @@ func TestProvisionTenantRollsBackOnFailure(t *testing.T) {
 	_, err := svc.ProvisionTenant(context.Background(), ProvisionTenantInput{
 		TenantName:    "会失败的团队",
 		AdminUsername: "someone",
-		PasswordHash:  "$argon2id$fake",
+		AdminPassword: testPassword,
 	})
 	if !errors.Is(err, errFake) {
 		t.Fatalf("应当把 store 的错误透出，得到 %v", err)
@@ -274,7 +286,7 @@ func TestProvisionTenantValidatesInput(t *testing.T) {
 		t.Fatalf("缺少必填项应当报 ErrInvalidArgument，得到 %v", err)
 	}
 	// 错误信息必须稳定：map 遍历顺序随机，未排序时这条会随机失败
-	if got := err.Error(); got != "governance: 参数非法: 缺少 密码哈希、管理员账号" {
+	if got := err.Error(); got != "governance: 参数非法: 缺少 初始密码、管理员账号" {
 		t.Errorf("错误信息不稳定或措辞变了: %q", got)
 	}
 }
@@ -286,7 +298,7 @@ func TestCreateUserAlsoCreatesPersonalSpace(t *testing.T) {
 	admin, _ := seed(t, svc)
 
 	user, personal, err := svc.CreateUser(ctx, CreateUserInput{
-		TenantID: admin.TenantID, Username: "tongshi", PasswordHash: "$argon2id$fake",
+		TenantID: admin.TenantID, Username: "tongshi", Password: testPassword,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -324,14 +336,14 @@ func TestCreateUserRejectsDuplicateUsername(t *testing.T) {
 	admin, _ := seed(t, svc)
 
 	first, _, err := svc.CreateUser(ctx, CreateUserInput{
-		TenantID: admin.TenantID, Username: "tongshi", PasswordHash: "$argon2id$first",
+		TenantID: admin.TenantID, Username: "tongshi", Password: testPassword,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	_, _, err = svc.CreateUser(ctx, CreateUserInput{
-		TenantID: admin.TenantID, Username: "tongshi", PasswordHash: "$argon2id$second",
+		TenantID: admin.TenantID, Username: "tongshi", Password: testPassword + "2",
 	})
 	if !errors.Is(err, ErrAlreadyExists) {
 		t.Fatalf("同租户重名应返回 ErrAlreadyExists，得到 %v", err)
@@ -341,13 +353,13 @@ func TestCreateUserRejectsDuplicateUsername(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != first.ID || got.PasswordHash != "$argon2id$first" {
+	if got.ID != first.ID || got.PasswordHash != fakeHashPrefix+testPassword {
 		t.Error("失败的创建把原用户覆盖了——密码被换掉等于一次账号劫持")
 	}
 
 	// 同名但不同租户必须放行：唯一键是 (tenant_id, username)，不是 username
 	if _, _, err := svc.CreateUser(ctx, CreateUserInput{
-		TenantID: "01OTHERTENANTAAAAAAAAAAAAA", Username: "tongshi", PasswordHash: "h",
+		TenantID: "01OTHERTENANTAAAAAAAAAAAAA", Username: "tongshi", Password: testPassword,
 	}); err != nil {
 		t.Errorf("另一个租户下的同名账号被误杀: %v", err)
 	}
@@ -357,7 +369,7 @@ func TestCreateUserRejectsBadRole(t *testing.T) {
 	store := newFakeStore()
 	svc, _ := newTestService(t, store)
 	_, _, err := svc.CreateUser(context.Background(), CreateUserInput{
-		TenantID: "01TENANTAAAAAAAAAAAAAAAAAA", Username: "x", PasswordHash: "h", Role: "superadmin",
+		TenantID: "01TENANTAAAAAAAAAAAAAAAAAA", Username: "x", Password: testPassword, Role: "superadmin",
 	})
 	if !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("非法角色应被拒绝，得到 %v", err)

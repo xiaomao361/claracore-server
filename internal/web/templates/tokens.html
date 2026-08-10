@@ -1,0 +1,42 @@
+{{define "content"}}
+{{if .NewToken}}
+<div class="card reveal">
+  <h2>新 token</h2>
+  <pre class="token">{{.NewToken}}</pre>
+  <h3>直接粘进 agent 配置</h3>
+  <pre class="snippet">{{.MCPSnippet}}</pre>
+</div>
+{{end}}
+
+<form method="post" action="/tokens" class="card row">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>agent 标识<input name="agent" placeholder="clara" required pattern="[a-z0-9-]+"></label>
+  <label>设备名<input name="name" placeholder="MacBook" required></label>
+  <button type="submit">签发 token</button>
+</form>
+
+<table class="grid">
+  <thead><tr><th>设备</th><th>前缀</th><th>创建</th><th>最后使用</th><th>状态</th><th></th></tr></thead>
+  <tbody>
+  {{range .Tokens}}
+    <tr class="{{if .RevokedAt}}muted{{end}}">
+      <td>{{.Name}}</td>
+      <td><code>{{.Prefix}}…</code></td>
+      <td>{{stamp .CreatedAt}}</td>
+      <td>{{stampPtr .LastUsedAt}}</td>
+      <td>{{if .RevokedAt}}已吊销{{else}}有效{{end}}</td>
+      <td>{{if not .RevokedAt}}
+        <form method="post" action="/tokens/revoke">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <button class="danger">吊销</button>
+        </form>
+      {{end}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="6" class="empty">还没有 token。签发一个，把配置粘进你的 agent。</td></tr>
+  {{end}}
+  </tbody>
+</table>
+<p class="hint">轮换的做法：先签发新 token，各设备逐个换上，观察旧 token 的「最后使用」不再变化，再吊销它。</p>
+{{end}}

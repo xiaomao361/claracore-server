@@ -1,8 +1,12 @@
 package governance
 
 import (
+	"claracore-server/internal/ports"
 	"context"
+	"fmt"
 	"maps"
+	"slices"
+	"strings"
 	"time"
 
 	"claracore-server/internal/platform"
@@ -239,4 +243,141 @@ func (f *fakeStore) Atomically(ctx context.Context, fn func(Store) error) error 
 		return err
 	}
 	return nil
+}
+
+// --- 治理面：账号管理（Web 用） ---
+
+func (f *fakeStore) FindUserByID(_ context.Context, tenantID, userID platform.ID) (*User, error) {
+	u, ok := f.users[userID]
+	if !ok || u.TenantID != tenantID {
+		return nil, ErrUserNotFound
+	}
+	return &u, nil
+}
+
+// ListTenants 返回全部租户，**不过滤状态**——与 MySQL 实现一致。
+// 领域层要能看见「库里有两个活跃租户」这件事并报错。
+func (f *fakeStore) ListTenants(_ context.Context) ([]Tenant, error) {
+	out := make([]Tenant, 0, len(f.tenants))
+	for _, t := range f.tenants {
+		out = append(out, t)
+	}
+	slices.SortFunc(out, func(a, b Tenant) int { return strings.Compare(string(a.ID), string(b.ID)) })
+	return out, nil
+}
+
+func (f *fakeStore) ListUsers(_ context.Context, tenantID platform.ID) ([]User, error) {
+	var out []User
+	for _, u := range f.users {
+		if u.TenantID == tenantID {
+			out = append(out, u)
+		}
+	}
+	slices.SortFunc(out, func(a, b User) int { return strings.Compare(string(a.ID), string(b.ID)) })
+	return out, nil
+}
+
+func (f *fakeStore) UpdateUserPassword(_ context.Context, tenantID, userID platform.ID, hash string, mustChange bool, _ time.Time) error {
+	u, ok := f.users[userID]
+	if !ok || u.TenantID != tenantID {
+		return ErrUserNotFound
+	}
+	u.PasswordHash, u.MustChangePw = hash, mustChange
+	f.users[userID] = u
+	return nil
+}
+
+func (f *fakeStore) UpdateUserStatus(_ context.Context, tenantID, userID platform.ID, status string, _ time.Time) error {
+	u, ok := f.users[userID]
+	if !ok || u.TenantID != tenantID {
+		return ErrUserNotFound
+	}
+	u.Status = status
+	f.users[userID] = u
+	return nil
+}
+
+// --- 测试用的密码哈希与会话存储 ---
+
+// fakeHasher 用一个可逆的前缀冒充哈希。
+//
+// 不用真的 argon2：领域测试关心的是「验过了没有」「改密之后旧会话还在不在」，
+// 而真实哈希每次跑要花几十毫秒 × 每个用例。真实实现有自己的测试
+// （internal/adapters/crypto），那里才是验哈希正确性的地方。
+type fakeHasher struct {
+	failVerify error
+}
+
+const fakeHashPrefix = "fakehash:"
+
+func (h *fakeHasher) Hash(plaintext string) (string, error) {
+	return fakeHashPrefix + plaintext, nil
+}
+
+func (h *fakeHasher) Verify(plaintext, hash string) (bool, error) {
+	if h.failVerify != nil {
+		return false, h.failVerify
+	}
+	if !strings.HasPrefix(hash, fakeHashPrefix) {
+		// 与真实实现同一个行为：畸形 hash 是数据问题，不是「密码错了」
+		return false, fmt.Errorf("fake: 无法识别的哈希格式")
+	}
+	return strings.TrimPrefix(hash, fakeHashPrefix) == plaintext, nil
+}
+
+// fakeSessions 是内存会话存储。
+//
+// 它必须模拟真库的一件事：**DeleteByUser 真的会删掉那个人的全部会话**。
+// 写成空操作的话，「改密之后别处的浏览器要掉线」这条会永远绿。
+type fakeSessions struct {
+	byHash map[string]ports.Session
+}
+
+func newFakeSessions() *fakeSessions {
+	return &fakeSessions{byHash: map[string]ports.Session{}}
+}
+
+func (s *fakeSessions) Create(_ context.Context, sess ports.Session) error {
+	s.byHash[sess.TokenHash] = sess
+	return nil
+}
+
+func (s *fakeSessions) Find(_ context.Context, hash string) (ports.Session, bool, error) {
+	sess, ok := s.byHash[hash]
+	return sess, ok, nil
+}
+
+func (s *fakeSessions) Touch(_ context.Context, hash string, seenAt, expiresAt time.Time) error {
+	sess, ok := s.byHash[hash]
+	if !ok {
+		return nil
+	}
+	sess.LastSeenAt, sess.ExpiresAt = seenAt, expiresAt
+	s.byHash[hash] = sess
+	return nil
+}
+
+func (s *fakeSessions) Delete(_ context.Context, hash string) error {
+	delete(s.byHash, hash)
+	return nil
+}
+
+func (s *fakeSessions) DeleteByUser(_ context.Context, userID string) error {
+	for hash, sess := range s.byHash {
+		if sess.UserID == userID {
+			delete(s.byHash, hash)
+		}
+	}
+	return nil
+}
+
+func (s *fakeSessions) DeleteExpired(_ context.Context, before time.Time) (int, error) {
+	n := 0
+	for hash, sess := range s.byHash {
+		if sess.ExpiresAt.Before(before) {
+			delete(s.byHash, hash)
+			n++
+		}
+	}
+	return n, nil
 }

@@ -1,22 +1,26 @@
 # ClaraCore Server — 接手指南
 
-> 最后更新：2026-08-10 15:00
+> 最后更新：2026-08-10 16:30
 > 给下一次接手的人或 agent（Clara / Codex / 其他）
 
 ---
 
 ## 一句话状态
 
-**MCP 工作面已经全部接通：16 个工具在真 token + 真库 + 真模型上跑通了完整工作流——记一条经验、提炼成卡片、后台补向量、在对的情境下被召回。这就是这个产品的一句话价值，现在它是可执行的了。**
+**现在是一个能交付给团队的东西了**：管理员能在浏览器里开账号、发 token、复制配置片段；agent 拿着那个 token 通过 MCP 记经验、提炼卡片、在对的情境下被召回。工作面（16 个 MCP 工具）与治理面（Web 登录/成员/token）都通了。
+
+第一版还差两块：**摄取**（冷启动，`01` §8.1 的生死问题）与 **Web 的可见性页面**（内容浏览、卡片审核、活动流——消除黑盒那一半）。
 
 两条端到端证据（`make itest` 每次真跑，Ollama 不在线则 skip）：
 
 - `test/mcp_tools_integration_test.go` —— 走 MCP 协议的完整工作流：`memoria_create` 默认落个人空间 → 写不可写空间被 `FORBIDDEN` 拦下 → `card_create` 带召回条件 → 索引 worker 补上 3 条向量 → `card_recall` 命中并给出召回理由 → 乐观锁冲突带回当前版本 → 软删除后仍可按 ID 取到但不进检索。
 - `test/recall_e2e_integration_test.go` —— 检索质量本身：一张召回条件与情境**没有字面重叠**的卡，加一张有字面重叠的干扰卡。纯全文路径把干扰卡排第一，两段式检索把正确的那张纠正回第一位（bge-m3 实测 0.6195 vs 0.6051）。**这条是唯一能证明检索「确实在起作用」而不只是「跑通了」的测试，别让它烂掉。**
 
-`make run` 起来就是一个可用的团队版 MCP 服务。装配在 `cmd/server/main.go`：MySQL Store → `governance.Service` + `knowledge.Service` → MCP Host 挂在 `/mcp`，外加后台索引 worker。
+`make run` 起来就是完整的服务：`/mcp` 是 MCP Host，`/` 是 Web 治理面，后台跑索引 worker。装配全在 `cmd/server/main.go`。
 
-**还缺的是 Continuity 与 Web**：`shared_line_*` 那 4 个工具要先有 `internal/domain/continuity`（空目录）；`internal/web` 也仍是空的，而摄取、审 draft、发 token 都在那一侧。
+Web 那条链路 0810 在真浏览器会话里手跑过一遍：未登录访问首页 303 → 登录 → 被强制赶去改密页 → 改密后进概览（看到空间与权限）→ 签发 token 拿到明文与可直接粘贴的 MCP 配置块 → 建同事账号拿到生成的初始密码 → 不带 CSRF 的 POST 得到 403。
+
+**还缺的是 Continuity**：`shared_line_*` 那 4 个工具要先有 `internal/domain/continuity`（仍是空目录）。
 
 ---
 
@@ -95,6 +99,14 @@ internal/mcp/                  MCP Host：bearer 认证 + 身份注入 + 错误�
   └─ host_test.go              8 个协议层测试，用 fake 治理服务，不碰数据库
   └─ tools_test.go             21 个工具层测试，用只记录入参的 fake 核心域——
                                这一层唯一该测的是「Host 往领域层传了什么」
+internal/web/                  Host B：治理面（SSR + htmx 的位置，第一版还没用上 htmx）
+  └─ server.go                 路由三层门 + 每页一套模板 + 安全响应头
+  └─ session.go                会话 cookie、CSRF、requireUser/PasswordSet/Admin
+  └─ handlers.go               登录 / 改密 / 概览 / 我的接入 / 成员管理
+  └─ templates|static/         //go:embed，CSS 编进二进制
+  └─ web_test.go               24 个测试，全是安全属性：越权、CSRF、cookie、转义
+internal/adapters/crypto/      argon2id，参数编码进 PHC 串（调参不锁死存量用户）
+migrations/0004_sessions.sql   Web 会话表，与 MCP token 彻底分开
 test/mcp_e2e_integration_test.go  完整装配：真库 + 真 token 打通 whoami（make itest）
 test/mcp_tools_integration_test.go 全栈工作流：真 token → MCP → 真库 → 真 Ollama
 migrations/0001_governance.sql 治理域 6 张表，已应用到 192.168.3.200 的库
@@ -105,9 +117,13 @@ Makefile                       make check 是提交前的门槛
 poc/                           丢弃型验证代码，独立 go.mod，不参与主模块构建
 ```
 
-**约束已反向验证过**：造过违规探针，9 + 3 + 8 + 4 + 7 + 21 + 14 + 14 条违规全部被捕获（依次是：架构与 schema 规则、`ascii_bin` 规则、governance Store、`ErrAlreadyExists` 映射与 fake 唯一性、MCP Host 的安全属性、knowledge 领域层与 Store、检索与索引队列）。新增约束或新写一层适配器后请用同样方式验证一次——**从不失败的检查等于没有检查**。
+**约束已反向验证过**：造过违规探针，9 + 3 + 8 + 4 + 7 + 21 + 14 + 14 + 24 条违规全部被捕获（依次是：架构与 schema 规则、`ascii_bin` 规则、governance Store、`ErrAlreadyExists` 映射与 fake 唯一性、MCP Host 的安全属性、knowledge 领域层与 Store、检索与索引队列）。新增约束或新写一层适配器后请用同样方式验证一次——**从不失败的检查等于没有检查**。
 
 0810 检索那 14 条的清单（漏网 0）：领域层 6 条（检索空间过滤失效、语义与全文命中混排、查询向量算不出时报错而不降级、错位向量按下标硬配、替换召回条件不清旧向量、入队不与内容同事务）；Embedder 适配器 2 条（按数组顺序取向量而非 index、错误信息带上底层 error 泄露内网地址）；MySQL 5 条（粗筛漏租户隔离、召回权限信冗余列、upsert 里 content_hash 提前赋值、MATCH 进 WHERE 丢掉字面没命中的候选、标签过滤退化成并集）；schema 1 条（造一张没有 ngram 的 FULLTEXT 探针表，确认那条检查真的会红）。
+
+0810 Web 治理面那 24 条（**第一轮有 1 条漏网，已补测**）：认证与授权 4 条（管理页忘挂中间件、requireAdmin 退化成 requireUser、强制改密形同虚设、会话无效时放行）；CSRF 与凭据 4 条（写操作不校 CSRF、CSRF 用 == 比较、cookie 丢掉 HttpOnly、登录失败页说清具体原因）；越权 4 条（吊销别人的 token、管理员停用自己、token 明文每次都展示、初始密码用可预测随机源）；模板与响应头 2 条（换成 text/template、CSP 放开 unsafe-inline）；领域层 7 条；密码哈希 3 条。
+
+**那条漏网值得记**：探针把 `ResumeSession` 里的 `!user.IsActive()` 检查删掉，`TestResumeSessionRereadsUser` 照样绿——因为那条测试是用 `SetUserStatus` 停用的，而它顺手删掉了会话，于是失败发生在「找不到会话」那一步，回查用户行那道检查根本没被走到。**测试通过是靠另一条路径**。补了 `TestResumeSessionRereadsUserEvenIfSessionSurvives`：直接改库里的行、绕过 `SetUserStatus`，模拟「会话还在但人已停用」。这正是探针存在的意义——它验的不是「功能对不对」，是「测试到底在测什么」。
 
 0810 MCP 工具那 14 条（漏网 0）：**全部打在 Host 层**，因为这一层最容易写出"看起来对但没防住"的代码——权限解析漏一步，领域层还会兜住，测试照样全绿，而线上真正拦住越权的那一步已经没了。清单：写入用可读集合定位、写目标不校权限、检索对不可读空间静默跳过、空间排序权重在 Host 里另写一份、promote 只校目标不校源、检索结果不标注来源空间、丢掉 semantic 标记、召回不回传触发条件、版本冲突不带当前版本、未映射错误原文外泄、ErrNotFound 说成"无权限"、空标签编码成 null、新工具带上身份参数、Host 替领域层补卡片默认状态。
 
@@ -355,6 +371,58 @@ VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后�
 
 ---
 
+## Web 治理面已固化的决定（2026-08-10，动 internal/web 之前先读这段）
+
+### 路由是三层门，不是三个 if
+
+```
+public              登录页、静态资源
+requireUser         有效会话（写操作顺带校 CSRF）
+requirePasswordSet  ↑ 且初始密码已改过
+requireAdmin        ↑ 且角色是 admin
+```
+
+在每个 handler 里各判一次的话，**少判一次不会有编译错误，只会有一扇安静打开的门**。`TestUnauthenticatedIsRedirectedEverywhere` 与 `TestWritesRequireCSRF` 遍历全部路径，盯的正是「新加的路由忘了挂中间件」。
+
+改密页只挂 `requireUser`，**不能**挂 `requirePasswordSet`——否则被强制改密的人会被自己的中间件挡在改密页外面，那是一个谁也解不开的死锁。
+
+| 决定 | 为什么 |
+|---|---|
+| 会话**存库**，不用签名 cookie | 停用一个员工时，他浏览器里那张已签发的票必须当场失效。JWT 那一路做不到，除非再加一张吊销名单——那时它已经是一个更复杂的会话存储了 |
+| `ResumeSession` **每次回查用户行** | 角色和状态不缓存进会话。冻在票里等于「停用/降级要等他下次登录才生效」，那是治理面最不能接受的延迟 |
+| 会话表存令牌的 **SHA-256** | 与 tokens 表同一条纪律：数据库被读走时拿到的是一堆无法用于登录的哈希 |
+| CSRF token 由会话令牌 **HMAC 派生**，不额外存储 | 无状态：不必为每个表单在库里多写一行，也没有「token 过期了但会话还在」的中间态。攻击者要伪造就得先拿到 HttpOnly 的 cookie |
+| 登录表单**不**校 CSRF | 那时还没有会话，也就没有可派生的 token。「登录 CSRF」由 SameSite=Lax 挡住 |
+| 登出**要**校 CSRF | 被跨站强制登出不致命，但是实打实的骚扰，而校验成本是一行 |
+| 登录失败只有一句话 | 区分「账号不存在 / 密码错 / 已停用」等于提供账号枚举接口。详细原因进日志 |
+| 普通成员访问管理页得到 **404 不是 403** | 不确认「这个管理页存在」。与领域层「不存在与无权访问返回同一个错误」同一条哲学 |
+| 初始密码由**服务端生成** | 管理员自己想的那个大概率是 `Team2026!`，而它会被同一批人共用。字母表去掉了 0/O、1/l/I——这串密码要被人从屏幕上读出来再手输一次 |
+| 管理员**不能停用自己** | 无自助注册、没有第二个入口，把自己关在门外之后没有恢复路径。这不是业务规则，是一道操作护栏 |
+| 吊销 token 前先查归属 | `RevokeToken` 只按 tenant 过滤，所以「这个 token 是不是我的」必须由 Host 检查——否则拿到一个 ID 就能把同事的 agent 停掉 |
+| `SecureCookie` 是配置不是常量 | 本地开发走 http 时置真会让 cookie 根本存不下来，症状是「登录成功但立刻跳回登录页」，没人第一次能猜对。默认值跟着 `CCS_ENV` 走 |
+| `PublicMCPURL` 必须可配 | 服务监听 `127.0.0.1:51890`，用户要填的是 nginx 后面那个地址。拿监听地址拼一个出来，等于给每个人发一份连不上的配置 |
+
+### 密码：哈希在 adapter，参数在 config
+
+`ports.PasswordHasher` 的 `Verify` **和 `Hash` 在同一个接口里**，不是让调用方自己比对：① 常数时间比较只该有一处实现；② 哈希串里编码着当时的参数，「用 hash 里记的参数去验」与「用当前配置去算」必须写在一起，否则某次调参就会把所有存量用户静默锁在门外（`TestVerifyUsesEmbeddedParams` 盯着这条）。
+
+`CreateUserInput` 从 `PasswordHash` 改成了明文 `Password`（Service 内部哈希）。原设计让调用方自己哈希，结果是集成测试里塞了一堆 `$argon2id$e2e$fake` 这种永远验不过的假值，而**没有任何地方能真正创建一个能登录的账号**。哈希本身仍然不在领域层。
+
+### 模板：每个页面一套，不是一个大集合
+
+全部文件 `ParseFS` 进同一个 `Template` 时，各页面的 `{{define "content"}}` 会互相覆盖——最后解析的那个赢。**这个坑不报错**：解析成功、页面 200，只是六个页面渲染出的都是同一份内容（0810 落地时踩到，全渲染成了成员管理页）。
+
+`render` 先渲染到内存再写出去：模板执行到一半才出错时，前半页已经进了 ResponseWriter，那时既发不了 500 也回不了头。
+
+### 这一层缺的东西
+
+- **可见性页面全部没做**：内容浏览、卡片审核、活动流。而 04 §1.1 说得很清楚——Web 的第一职责是消除黑盒，不是管理。这一版做的是「人能进得来」，下一版才是「人能看见 agent 做了什么」。
+- **没有审计日志**。`audit_logs` 表在 `02` §7.3 设计过但还没建（没有 0005 迁移）。治理动作（建号、发 token、改权限）目前只进 slog，不进库。活动流页面要用它。
+- **会话过期靠 `CleanupSessions` 手动调**，没有定时任务。行会一直堆着——不影响正确性（过期判断在领域层），但表会长。
+- **项目空间与权限管理页没做**，只能靠代码调 `CreateProjectSpace` / `GrantSpaceAccess`。团队真用起来会立刻需要它。
+
+---
+
 ## 检索层缺的东西
 
 - **没有 backfill**。未配 Embedder 时不入队（没有模型名可写），所以**后来才打开 embedding 的存量内容不会被自动补索引**，换模型灰度重建同理。要补的形态大致是 `ListUnindexed(model, limit)` 把没有当前模型向量行的实体捞出来、由领域层拼文本再入队——放在 Web 治理面或一个 `-reindex` flag 后面。
@@ -366,16 +434,19 @@ VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后�
 
 ## 下一步
 
-工作面（agent 用的 MCP 工具）已经完整。剩下的都在治理面与冷启动这一侧：
+**1. 摄取（现在是大头）。** 冷启动是生死问题（`01` §8.1）：团队已有的 odoc / Atlas / 各类 md 接不进来，产品就启动不了。三条纪律：
+- 摄取产物一律落 `draft`，不进默认检索；
+- **必须复用同一条入队路径**（`Service.CreateCard` → `enqueueEmbedding`），别写第二份 embedding 逻辑；
+- **摄取必须幂等**（同一源产生同一张卡 → upsert），这样「重试失败项」才能退化成「整批再跑一次」，不需要任务项状态表（`04` §6 已拍板）。
 
-1. **Web Host**（现在是大头）。它是第一版真正缺的东西——没有它，一个新团队连账号和 token 都发不出来，服务再完整也用不起来。先读 `04-web-scope.md`。第一刀的最小闭环：登录 → 成员与 token 管理 → 审 draft 卡片。
-   - **登录会逼出一个欠账**：领域层不做密码哈希（argon2id 的参数属于配置，而领域层不读配置）。要在 `ports/` 定义 `PasswordHasher`，Host 层调用后把 hash 传进 `CreateUserInput`。在那之前没有任何地方能真正创建用户密码。
-2. **摄取**。冷启动是生死问题（`01-architecture.md` §8.1），团队已有的 odoc / Atlas / 各类 md 接不进来，产品就启动不了。两条纪律：摄取产物一律落 `draft`（不进默认检索）；**必须复用同一条入队路径**，别写第二份 embedding 逻辑。
-3. **Continuity**（`shared_line_*` 4 个工具）。`internal/domain/continuity` 还是空目录。它不阻塞前两项，工具契约从 Desktop 平移。
+**2. Web 的可见性页面。** 04 §1.1 说得很清楚：Web 的第一职责是消除黑盒。这一版只做到「人能进得来」，下一版才是「人能看见 agent 做了什么」——卡片审核（唯一的 Web 写入场景）、内容浏览、活动流。活动流要先建 `audit_logs`（0005 迁移），并且**按 §2.1 的可见性规则把过滤下推到 SQL，不在模板层过滤**：写入是协作行为可见，读取是私人行为不可见。
+
+**3. Continuity**（`shared_line_*` 4 个工具）。`internal/domain/continuity` 还是空目录，不阻塞前两项。
 
 零散但值得顺手做的：
-- `knowledge.SupersedeMemory` 用例（见 §MCP 工具层缺的东西），补上契约里的 `supersedes`。
-- embedding 的 backfill 与失败计数（见 §检索层缺的东西），做 Web 治理面时一起。
+- 项目空间与权限管理页（现在只能靠代码调 `CreateProjectSpace` / `GrantSpaceAccess`）。
+- `knowledge.SupersedeMemory` 用例，补上契约里的 `supersedes`。
+- embedding 的 backfill 与失败计数、会话过期的定时清理。
 
 ---
 

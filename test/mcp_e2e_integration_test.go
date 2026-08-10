@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"claracore-server/internal/adapters/crypto"
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
@@ -37,7 +38,7 @@ func TestMCPWhoAmIEndToEnd(t *testing.T) {
 	clock := platform.SystemClock{}
 	ids := platform.NewIDGenerator(clock)
 	store := mysql.NewGovernanceStore(db)
-	svc := governance.NewService(store, clock, ids)
+	svc := governance.NewService(store, clock, ids, crypto.NewArgon2id(crypto.Argon2idParams{}), mysql.NewSessionStore(db))
 
 	// 开一个租户：租户 + 团队空间 + 管理员 + 管理员的个人空间，四件事原子完成
 	provisioned, err := svc.ProvisionTenant(ctx, governance.ProvisionTenantInput{
@@ -45,7 +46,7 @@ func TestMCPWhoAmIEndToEnd(t *testing.T) {
 		TeamSpaceName: "端到端团队",
 		AdminUsername: "e2e-admin",
 		AdminDisplay:  "端到端管理员",
-		PasswordHash:  "$argon2id$e2e$fake", // 领域层不做哈希，Web 登录实现时才有真实值
+		AdminPassword: "e2e-admin-password",
 	})
 	if err != nil {
 		t.Fatalf("开租户失败: %v", err)

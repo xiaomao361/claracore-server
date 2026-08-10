@@ -20,6 +20,39 @@ type Config struct {
 	MySQL     MySQL
 	Redis     Redis
 	Embedding Embedding
+	Password  Password
+	Web       Web
+}
+
+// Web 是治理面的配置。
+type Web struct {
+	// PublicMCPURL 是发给用户复制的 MCP 连接地址。
+	//
+	// 必须可配：服务监听 127.0.0.1:51890，而用户要填进 agent 配置的是
+	// nginx 后面那个对外地址。拿监听地址拼一个出来，等于给每个人
+	// 发一份连不上的配置。
+	PublicMCPURL string
+
+	// SecureCookie 决定会话 cookie 带不带 Secure 标记。
+	//
+	// 生产必须为真。本地开发走 http 时为真会让 cookie 根本存不下来，
+	// 症状是「登录成功但立刻又跳回登录页」——一个没人第一次就能猜对的
+	// 现象，所以默认值跟着 CCS_ENV 走，而不是让人自己想起来配。
+	SecureCookie bool
+}
+
+// Password 是 argon2id 的哈希参数。
+//
+// 它在这里而不是在领域层，正是「领域层不读配置」这条铁律的直接后果：
+// 参数该配多大取决于这台机器有多少内存、能容忍多长的登录延迟，
+// 那是部署决定，不是业务规则（见 ports.PasswordHasher 的注释）。
+//
+// 默认值取 OWASP 对 argon2id 的推荐档之一。调高之后**存量用户仍能登录**——
+// 参数编码在每个 hash 串里，验的时候用它自己记的那份。
+type Password struct {
+	MemoryKiB   int
+	Iterations  int
+	Parallelism int
 }
 
 type MySQL struct {
@@ -113,6 +146,15 @@ func Load() (*Config, error) {
 			Password: getStr("CCS_REDIS_PASSWORD", ""),
 			Prefix:   getStr("CCS_REDIS_PREFIX", "ccs:"),
 		},
+		Password: Password{
+			MemoryKiB:   getInt("CCS_ARGON2_MEMORY_KIB", 19*1024),
+			Iterations:  getInt("CCS_ARGON2_ITERATIONS", 2),
+			Parallelism: getInt("CCS_ARGON2_PARALLELISM", 1),
+		},
+		Web: Web{
+			PublicMCPURL: getStr("CCS_PUBLIC_MCP_URL", ""),
+			SecureCookie: getBool("CCS_WEB_SECURE_COOKIE", getStr("CCS_ENV", "development") == "production"),
+		},
 		Embedding: Embedding{
 			Provider:      getStr("CCS_EMBEDDING_PROVIDER", ProviderDisabled),
 			BaseURL:       getStr("CCS_EMBEDDING_BASE_URL", ""),
@@ -143,6 +185,12 @@ func (c *Config) validate() error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("缺少必需配置: %s（参考 .env.example）", strings.Join(missing, ", "))
+	}
+
+	// 没配对外地址时退回监听地址：本地开发正好能用，
+	// 而生产上 nginx 后面的部署必须显式配置（否则发出去的配置片段连不上）。
+	if c.Web.PublicMCPURL == "" {
+		c.Web.PublicMCPURL = "http://" + c.Addr + "/mcp"
 	}
 
 	switch c.Embedding.Provider {
@@ -191,6 +239,15 @@ func loadDotEnv(path string) {
 func getStr(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
+	}
+	return def
+}
+
+func getBool(key string, def bool) bool {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
 	}
 	return def
 }

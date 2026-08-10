@@ -57,7 +57,25 @@ type Store interface {
 	CreateToken(ctx context.Context, t Token) error
 
 	FindUserByUsername(ctx context.Context, tenantID platform.ID, username string) (*User, error)
+	FindUserByID(ctx context.Context, tenantID, userID platform.ID) (*User, error)
 	FindSpace(ctx context.Context, tenantID, spaceID platform.ID) (*Space, error)
+
+	// ListTenants 返回全部租户。
+	//
+	// 唯一的调用点是 Web 登录：「一个团队一套部署单元」（02 §2.1），
+	// 登录页只问账号密码，租户由部署自己解析。返回全部而不是
+	// 「返回那个唯一的租户」——多于一个是运维事故，领域层要能看见
+	// 这件事并报错，而不是拿到一个被 SQL 悄悄选中的结果。
+	ListTenants(ctx context.Context) ([]Tenant, error)
+
+	// ListUsers 返回租户下的全部账号（成员管理页）。
+	ListUsers(ctx context.Context, tenantID platform.ID) ([]User, error)
+
+	// UpdateUserPassword 写新哈希并设置 must_change_pw。
+	// mustChange 为真表示这是管理员重置的临时密码，本人登录后必须改掉。
+	UpdateUserPassword(ctx context.Context, tenantID, userID platform.ID, hash string, mustChange bool, at time.Time) error
+
+	UpdateUserStatus(ctx context.Context, tenantID, userID platform.ID, status string, at time.Time) error
 
 	// ListTokens 返回该用户的全部 token（含已吊销的，用于审计展示）。
 	// 明文无从取回，返回值中只有 prefix。

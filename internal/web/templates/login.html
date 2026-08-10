@@ -1,0 +1,8 @@
+{{define "content"}}
+<form method="post" action="/login" class="card narrow">
+  <label>账号<input name="username" autocomplete="username" autofocus required></label>
+  <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+  <button type="submit">登录</button>
+  <p class="hint">账号由管理员分配，没有自助注册。</p>
+</form>
+{{end}}

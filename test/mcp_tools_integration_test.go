@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"claracore-server/internal/adapters/crypto"
 	"claracore-server/internal/adapters/embedding"
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
@@ -62,14 +63,14 @@ func newToolEnv(t *testing.T) toolEnv {
 	clock := platform.SystemClock{}
 	ids := platform.NewIDGenerator(clock)
 	govStore := mysql.NewGovernanceStore(db)
-	gov := governance.NewService(govStore, clock, ids)
+	gov := governance.NewService(govStore, clock, ids, crypto.NewArgon2id(crypto.Argon2idParams{}), mysql.NewSessionStore(db))
 
 	provisioned, err := gov.ProvisionTenant(ctx, governance.ProvisionTenantInput{
 		TenantName:    "工具端到端租户",
 		TeamSpaceName: "工具端到端团队",
 		AdminUsername: "tools-e2e-admin",
 		AdminDisplay:  "工具端到端管理员",
-		PasswordHash:  "$argon2id$e2e$fake",
+		AdminPassword: "e2e-admin-password",
 	})
 	if err != nil {
 		t.Fatalf("开租户失败: %v", err)

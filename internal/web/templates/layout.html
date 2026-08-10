@@ -1,0 +1,32 @@
+{{define "layout"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{.Title}} · ClaraCore</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+{{if .Principal.UserID}}
+<header class="topbar">
+  <a class="brand" href="/">ClaraCore</a>
+  <nav>
+    <a href="/" class="{{if eq .Nav "overview"}}on{{end}}">概览</a>
+    <a href="/tokens" class="{{if eq .Nav "tokens"}}on{{end}}">我的接入</a>
+    {{if .Principal.IsAdmin}}<a href="/admin/members" class="{{if eq .Nav "members"}}on{{end}}">成员管理</a>{{end}}
+  </nav>
+  <div class="who">
+    <a href="/password" class="{{if eq .Nav "password"}}on{{end}}">{{.Principal.DisplayName}}</a>
+    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="linkish">登出</button></form>
+  </div>
+</header>
+{{end}}
+<main>
+  <h1>{{.Title}}</h1>
+  {{if .Error}}<p class="alert error">{{.Error}}</p>{{end}}
+  {{if .Notice}}<p class="alert notice">{{.Notice}}</p>{{end}}
+  {{block "content" .}}{{end}}
+</main>
+<footer>ClaraCore Server {{.Version}}</footer>
+</body>
+</html>{{end}}

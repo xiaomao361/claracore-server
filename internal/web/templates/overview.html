@@ -1,0 +1,25 @@
+{{define "content"}}
+{{if gt .Drafts 0}}
+<p class="alert notice">你可读的空间里还有 <strong>{{.Drafts}}</strong> 条待审草稿。它们不进默认检索，需要人过一遍。</p>
+{{end}}
+<table class="grid">
+  <thead><tr><th>空间</th><th>类型</th><th>权限</th><th>记忆</th><th>卡片</th><th>待审</th><th>只是摘要</th><th>召回条件</th></tr></thead>
+  <tbody>
+  {{range .Spaces}}
+    <tr>
+      <td>{{.Space.Name}}</td>
+      <td><span class="tag {{.Space.Type}}">{{.Space.Type}}</span></td>
+      <td>{{if .Write}}读写{{else}}只读{{end}}</td>
+      <td class="num">{{.Stats.Memories}}</td>
+      <td class="num">{{.Stats.Cards}}</td>
+      <td class="num">{{if gt .Stats.DraftCards 0}}<strong>{{.Stats.DraftCards}}</strong>{{else}}0{{end}}</td>
+      <td class="num">{{.Stats.UnqualifiedCards}}</td>
+      <td class="num">{{.Stats.RecallTriggers}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="8" class="empty">你还没有任何可访问的空间。</td></tr>
+  {{end}}
+  </tbody>
+</table>
+<p class="hint">「只是摘要」指没写「理解」那一栏的卡片——它们还不算合格的知识卡片。</p>
+{{end}}

@@ -314,27 +314,50 @@ func (s *GovernanceStore) CreateToken(ctx context.Context, t governance.Token) e
 
 // --- 治理面查询 ---
 
-func (s *GovernanceStore) FindUserByUsername(ctx context.Context, tenantID platform.ID, username string) (*governance.User, error) {
+// userColumns 只写一遍。列顺序散在两处 Scan 里，迟早有一处跟不上改动。
+const userColumns = `id, tenant_id, username, password_hash, display_name, role, must_change_pw, status, created_at`
+
+// scanRow 抹平 *sql.Row 与 *sql.Rows 的差异，让单行查询与列表查询共用一个 scan。
+type scanRow interface{ Scan(dest ...any) error }
+
+func scanUserFrom(row scanRow) (governance.User, error) {
 	var (
 		u       governance.User
 		id, tid string
 		created time.Time
 	)
-	err := s.ex.QueryRowContext(ctx,
-		`SELECT id, tenant_id, username, password_hash, display_name, role, must_change_pw, status, created_at
-		 FROM users WHERE tenant_id = ? AND username = ?`,
-		string(tenantID), username,
-	).Scan(&id, &tid, &u.Username, &u.PasswordHash, &u.DisplayName, &u.Role, &u.MustChangePw, &u.Status, &created)
+	err := row.Scan(&id, &tid, &u.Username, &u.PasswordHash, &u.DisplayName,
+		&u.Role, &u.MustChangePw, &u.Status, &created)
+	if err != nil {
+		return governance.User{}, err
+	}
+	u.ID, u.TenantID, u.CreatedAt = platform.ID(id), platform.ID(tid), created.UTC()
+	return u, nil
+}
+
+func scanUser(rows *sql.Rows) (governance.User, error) {
+	u, err := scanUserFrom(rows)
+	if err != nil {
+		return governance.User{}, fmt.Errorf("mysql: 读取用户行: %w", err)
+	}
+	return u, nil
+}
+
+func (s *GovernanceStore) findUser(ctx context.Context, query string, args ...any) (*governance.User, error) {
+	u, err := scanUserFrom(s.ex.QueryRowContext(ctx, query, args...))
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, governance.ErrUserNotFound
 	case err != nil:
-		return nil, fmt.Errorf("mysql: 按账号查询用户: %w", err)
+		return nil, fmt.Errorf("mysql: 查询用户: %w", err)
 	}
-	u.ID = platform.ID(id)
-	u.TenantID = platform.ID(tid)
-	u.CreatedAt = created.UTC()
 	return &u, nil
+}
+
+func (s *GovernanceStore) FindUserByUsername(ctx context.Context, tenantID platform.ID, username string) (*governance.User, error) {
+	return s.findUser(ctx,
+		`SELECT `+userColumns+` FROM users WHERE tenant_id = ? AND username = ?`,
+		string(tenantID), username)
 }
 
 // FindSpace 按 ID 取空间，带租户过滤。
@@ -538,4 +561,112 @@ func idPtrArg(id *platform.ID) any {
 		return nil
 	}
 	return string(*id)
+}
+
+// ---------------------------------------------------------------------------
+// 治理面：账号管理（Web 用，低频）
+// ---------------------------------------------------------------------------
+
+func (s *GovernanceStore) FindUserByID(ctx context.Context, tenantID, userID platform.ID) (*governance.User, error) {
+	return s.findUser(ctx,
+		`SELECT `+userColumns+` FROM users WHERE tenant_id = ? AND id = ?`,
+		string(tenantID), string(userID))
+}
+
+// ListTenants 返回全部租户。
+//
+// 不加 `WHERE status = 'active'`：领域层要能看见「库里有两个活跃租户」
+// 这件事并报错。在 SQL 里过滤掉就等于让一次运维事故被悄悄消化掉，
+// 而它的后果是某个人登进了别人的团队。
+func (s *GovernanceStore) ListTenants(ctx context.Context) ([]governance.Tenant, error) {
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT id, name, status, created_at FROM tenants ORDER BY created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询租户: %w", err)
+	}
+	defer rows.Close()
+
+	var out []governance.Tenant
+	for rows.Next() {
+		var (
+			t       governance.Tenant
+			id      string
+			created time.Time
+		)
+		if err := rows.Scan(&id, &t.Name, &t.Status, &created); err != nil {
+			return nil, fmt.Errorf("mysql: 读取租户行: %w", err)
+		}
+		t.ID, t.CreatedAt = platform.ID(id), created.UTC()
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: 遍历租户行: %w", err)
+	}
+	return out, nil
+}
+
+func (s *GovernanceStore) ListUsers(ctx context.Context, tenantID platform.ID) ([]governance.User, error) {
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT `+userColumns+` FROM users WHERE tenant_id = ? ORDER BY created_at`,
+		string(tenantID))
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询用户列表: %w", err)
+	}
+	defer rows.Close()
+
+	var out []governance.User
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: 遍历用户行: %w", err)
+	}
+	return out, nil
+}
+
+func (s *GovernanceStore) UpdateUserPassword(ctx context.Context, tenantID, userID platform.ID, hash string, mustChange bool, _ time.Time) error {
+	res, err := s.ex.ExecContext(ctx,
+		`UPDATE users SET password_hash = ?, must_change_pw = ? WHERE tenant_id = ? AND id = ?`,
+		hash, mustChange, string(tenantID), string(userID))
+	if err != nil {
+		return fmt.Errorf("mysql: 更新密码: %w", err)
+	}
+	return s.confirmUserTouched(ctx, res, tenantID, userID)
+}
+
+func (s *GovernanceStore) UpdateUserStatus(ctx context.Context, tenantID, userID platform.ID, status string, _ time.Time) error {
+	res, err := s.ex.ExecContext(ctx,
+		`UPDATE users SET status = ? WHERE tenant_id = ? AND id = ?`,
+		status, string(tenantID), string(userID))
+	if err != nil {
+		return fmt.Errorf("mysql: 更新账号状态: %w", err)
+	}
+	return s.confirmUserTouched(ctx, res, tenantID, userID)
+}
+
+// confirmUserTouched 把「影响 0 行」翻译成正确的领域错误。
+//
+// 驱动未开 clientFoundRows，**写同值时 affected rows 是 0**——
+// 把一个已停用的账号再停用一次，或者重置成同一个密码（哈希带盐所以
+// 这不会发生，但状态更新会），都会走到这里。直接判成「不存在」
+// 会造出一个假的 ErrUserNotFound（0001 那一轮在 TouchToken 上踩过同样的坑）。
+func (s *GovernanceStore) confirmUserTouched(ctx context.Context, res sql.Result, tenantID, userID platform.ID) error {
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		return nil
+	}
+	var exists int
+	err := s.ex.QueryRowContext(ctx,
+		`SELECT 1 FROM users WHERE tenant_id = ? AND id = ?`,
+		string(tenantID), string(userID)).Scan(&exists)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return governance.ErrUserNotFound
+	case err != nil:
+		return fmt.Errorf("mysql: 确认用户是否存在: %w", err)
+	}
+	return nil
 }

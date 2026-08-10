@@ -48,4 +48,18 @@ var (
 	ErrAlreadyExists = errors.New("governance: 目标已存在")
 
 	ErrInvalidArgument = errors.New("governance: 参数非法")
+
+	// ErrInvalidCredentials 是 Web 登录失败的**唯一**出口。
+	//
+	// 账号不存在、密码不对、账号已停用、租户已停用——全部收敛到这一个。
+	// 区分它们等于提供一个账号枚举接口：用不同的用户名试一遍就能
+	// 得到一份有效账号清单。「已停用」尤其不能说，那等于告诉对方
+	// 「这个人存在，只是被关了」。
+	//
+	// 与 MCP 那侧三个 token 错误收敛成同一个 401 是同一条纪律。
+	ErrInvalidCredentials = errors.New("governance: 账号或密码不正确")
+
+	// ErrSessionInvalid 表示会话不存在、已过期，或它背后的账号已停用。
+	// 同样不区分——对浏览器来说下一步都是「回登录页」。
+	ErrSessionInvalid = errors.New("governance: 会话无效或已过期")
 )

@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"claracore-server/internal/adapters/crypto"
 	"claracore-server/internal/adapters/embedding"
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
@@ -24,6 +25,7 @@ import (
 	mcphost "claracore-server/internal/mcp"
 	"claracore-server/internal/platform"
 	"claracore-server/internal/ports"
+	"claracore-server/internal/web"
 	"claracore-server/migrations"
 )
 
@@ -55,6 +57,8 @@ func main() {
 		"mysql_db", cfg.MySQL.Database,
 		"redis_enabled", cfg.Redis.Enabled(),
 		"embedding_provider", cfg.Embedding.Provider,
+		"public_mcp_url", cfg.Web.PublicMCPURL,
+		"secure_cookie", cfg.Web.SecureCookie,
 	)
 
 	db, err := mysql.Open(context.Background(), cfg.MySQL.DSN(), mysql.PoolConfig{
@@ -80,8 +84,19 @@ func main() {
 
 	// 装配：adapters 实现 domain 定义的接口，Host 只认识 domain。
 	// 依赖方向在这里收口，其他任何地方都不该出现这种跨层组装。
+	// 密码哈希与会话存储是 Web 治理面的两件基础设施，都在 ports/ 后面。
+	// 领域层不读配置，所以 argon2id 的参数在这里注入（config.Password）。
+	hasher := crypto.NewArgon2id(crypto.Argon2idParams{
+		Memory:      uint32(cfg.Password.MemoryKiB),
+		Iterations:  uint32(cfg.Password.Iterations),
+		Parallelism: uint8(cfg.Password.Parallelism),
+		SaltLength:  16,
+		KeyLength:   32,
+	})
+	sessions := mysql.NewSessionStore(db)
+
 	govStore := mysql.NewGovernanceStore(db)
-	govService := governance.NewService(govStore, clock, ids)
+	govService := governance.NewService(govStore, clock, ids, hasher, sessions)
 
 	// embedder 为 nil 是**降级形态而非异常形态**：不入索引队列，
 	// 检索退化成中文全文匹配，系统功能保持完整（01-architecture.md §6.1）。
@@ -92,6 +107,14 @@ func main() {
 	mcpHost := mcphost.NewHost(govService, knowService, logger, mcphost.HostOptions{
 		Version:        version,
 		SemanticSearch: cfg.Embedding.Enabled(),
+	})
+
+	// Host B：治理面。与 MCP Host 并列，共用同一套领域服务——
+	// 「Web 专用的写入路径」是设计事故（docs/04-web-scope.md §1.4）。
+	webHost := web.NewHost(govService, knowService, logger, web.Options{
+		Version:      version,
+		PublicMCPURL: cfg.Web.PublicMCPURL,
+		SecureCookie: cfg.Web.SecureCookie,
 	})
 
 	mux := http.NewServeMux()
@@ -116,6 +139,10 @@ func main() {
 		}
 		json.NewEncoder(w).Encode(status)
 	})
+
+	// Web 挂在根路径，放在最后：ServeMux 的最长前缀匹配保证
+	// /mcp 与 /healthz 仍然各归各的。
+	mux.Handle("/", webHost.Handler())
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

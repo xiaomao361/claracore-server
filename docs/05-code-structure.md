@@ -44,13 +44,13 @@ claracore-server/
 │   │   ├── governance/         # 身份、token、空间权限
 │   │   ├── knowledge/          # memory / card / 召回条件 / 检索 / 索引队列
 │   │   └── continuity/         # ← 尚未开工（shared_line）
-│   ├── ports/                  # 纯基础设施接口（embedder.go）
-│   ├── adapters/               # mysql/ + embedding/
+│   ├── ports/                  # 纯基础设施接口（embedder / hasher / sessionstore）
+│   ├── adapters/               # mysql/ + embedding/ + crypto/
 │   ├── mcp/                    # Host A：16 个工具
-│   ├── web/                    # Host B：← 尚未开工
+│   ├── web/                    # Host B：登录 / 成员 / token / 概览
 │   ├── ingest/                 # ← 尚未开工
 │   └── platform/               # 横切：ID / 时钟
-├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时
+├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时 / 0004 会话
 ├── docs/                       # 01–05 设计文档
 ├── test/                       # 架构测试、schema 测试、端到端集成测试
 ├── Makefile
@@ -150,10 +150,11 @@ know.GetMemory(ctx, tenantID, id, spaces)
 
 ```
 internal/ports/
-├── embedder.go       # ✅ 已落地：Model() + Embed([]string) [][]float32
+├── embedder.go       # ✅ Model() + Embed([]string) [][]float32
+├── hasher.go         # ✅ Hash / Verify（Verify 必须同在，见文件注释）
+├── sessionstore.go   # ✅ Web 会话，签名里只有 string/time
 ├── cache.go          # 待做，做向量缓存时（01 §6.2 里价值最高的一项）
 ├── locker.go         # 待做，多实例部署时必须
-├── sessionstore.go   # 待做，Web 登录要用
 ├── ratelimiter.go    # 待做
 └── eventstore.go     # MCP resumability，第一版不实现
 ```
@@ -210,20 +211,23 @@ internal/adapters/
 ## 4. 两个 Host
 
 ```
-internal/mcp/（已落地）          internal/web/（未开工）
-├── server.go   ← 工具注册       ├── server.go
-├── auth.go     ← TokenVerifier  ├── middleware/
-│                 + 身份注入 ctx ├── handlers/
-├── errors.go   ← 唯一的错误映射 ├── templates/   //go:embed
-├── knowledge.go← 编排骨架       └── static/      //go:embed
+internal/mcp/（已落地）          internal/web/（已落地）
+├── server.go   ← 工具注册       ├── server.go   ← 路由三层门 + 模板
+├── auth.go     ← TokenVerifier  ├── session.go  ← cookie / CSRF / 中间件
+│                 + 身份注入 ctx ├── handlers.go ← 各页面
+├── errors.go   ← 唯一的错误映射 ├── templates/  //go:embed
+├── knowledge.go← 编排骨架       └── static/     //go:embed
 ├── whoami.go
 ├── memory.go   ← Memory 6
 ├── card.go     ← Card 5
 └── space.go    ← 空间 3 + 系统 2
 ```
 
-工具处理器同包不建子包的理由见 §1 的偏差说明。`continuity.go` 等 `domain/continuity`
-先落地。
+两边都没有拆 `handlers/` 子包，理由相同：身份的 context key 是**未导出的空结构体
+类型**（`mcp.identityKey` / `web.principalKey`），外部包无法伪造——拆子包就得导出它。
+目录分层的收益远小于这条安全属性。
+
+`continuity.go` 等 `domain/continuity` 先落地。
 
 **铁律（`04-web-scope.md` §1.4）：两个 Host 都只调用 `domain/`，不允许任何一方持有对方的业务逻辑，也不允许 Host 直接触碰 `adapters/`。**
 
