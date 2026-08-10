@@ -319,20 +319,23 @@ func (s *KnowledgeStore) FindCards(ctx context.Context, tenantID platform.ID, id
 // 列顺序只写一遍——两份 Scan 迟早会有一份忘了跟着 cardColumns 改。
 func scanCard(rows *sql.Rows, c *knowledge.Card, score *float64) error {
 	var (
-		cID, tID, sID, aID                             string
-		agentID                                        sql.NullString
-		source, orig, dist, under, whyKeep, unresolved sql.NullString
-		fromType, fromID                               sql.NullString
-		created, updated                               time.Time
+		cID, tID, sID, aID                     string
+		agentID                                sql.NullString
+		source, srcKey, srcHash                sql.NullString
+		orig, dist, under, whyKeep, unresolved sql.NullString
+		fromType, fromID                       sql.NullString
+		created, updated                       time.Time
 	)
-	if err := rows.Scan(&cID, &tID, &sID, &aID, &agentID, &c.Title, &c.CardType, &c.Status, &source,
+	if err := rows.Scan(&cID, &tID, &sID, &aID, &agentID, &c.Title, &c.CardType, &c.Status,
+		&source, &srcKey, &srcHash,
 		&orig, &dist, &under, &whyKeep, &unresolved,
 		&fromType, &fromID, &c.Version, &created, &updated, score); err != nil {
 		return fmt.Errorf("mysql: 读取卡片行: %w", err)
 	}
 	c.ID, c.TenantID, c.SpaceID, c.AuthorUserID = platform.ID(cID), platform.ID(tID), platform.ID(sID), platform.ID(aID)
 	c.AuthorAgentID = idFromNull(agentID)
-	c.Source, c.Original, c.Distilled = source.String, orig.String, dist.String
+	c.Source, c.SourceKey, c.SourceHash = source.String, srcKey.String, srcHash.String
+	c.Original, c.Distilled = orig.String, dist.String
 	c.Understanding, c.WhyKeep, c.Unresolved = under.String, whyKeep.String, unresolved.String
 	c.CopiedFrom = originFromNull(fromType, fromID)
 	c.CreatedAt, c.UpdatedAt = created.UTC(), updated.UTC()

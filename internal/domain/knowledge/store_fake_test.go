@@ -110,6 +110,16 @@ func (f *fakeStore) CreateCard(_ context.Context, c Card) error {
 	if _, dup := f.cards[c.ID]; dup {
 		return ErrAlreadyExists
 	}
+	// uk_cards_source (space_id, source_key)：同一空间同一源只能有一张卡。
+	// source_key 为空在真库里是 NULL，唯一键允许多行 NULL——
+	// 所以手写卡片完全不受这条约束（这正是 0005 选 NULL 而非空串的理由）。
+	if c.SourceKey != "" {
+		for _, existing := range f.cards {
+			if existing.SpaceID == c.SpaceID && existing.SourceKey == c.SourceKey {
+				return ErrAlreadyExists
+			}
+		}
+	}
 	c.Labels, c.RecallTriggers = nil, nil // 真库的 cards 表没有这两列
 	f.cards[c.ID] = c
 	return nil

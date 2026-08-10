@@ -49,6 +49,17 @@ type Store interface {
 	// FindCard 在 spaces 范围内按 ID 取一张，并填充 Labels 与 RecallTriggers。
 	FindCard(ctx context.Context, tenantID, id platform.ID, spaces []platform.ID) (*Card, error)
 
+	// FindCardBySourceKey 按摄取源的稳定标识取卡，是幂等摄取的读侧。
+	//
+	// 只在**一个确定空间**里找，不收 spaces 集合：摄取是往一个明确的
+	// 目标空间里灌，而 uk_cards_source 的唯一性也只在空间内成立。
+	// 找不到返回 ErrNotFound（调用方据此走「新建」分支）。
+	//
+	// 注意它**不做状态过滤**：一张被人改成 deprecated 的摄取卡，
+	// 下次重扫仍然要认出它是同一份源——否则会新建一张，
+	// 而那个「已经判过这份文档没用」的决定就被悄悄推翻了。
+	FindCardBySourceKey(ctx context.Context, tenantID, spaceID platform.ID, sourceKey string) (*Card, error)
+
 	UpdateCard(ctx context.Context, c Card, expectedVersion int) error
 
 	// --- 多态附属物 ---

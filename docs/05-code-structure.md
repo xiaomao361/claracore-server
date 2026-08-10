@@ -48,9 +48,9 @@ claracore-server/
 │   ├── adapters/               # mysql/ + embedding/ + crypto/
 │   ├── mcp/                    # Host A：16 个工具
 │   ├── web/                    # Host B：登录 / 成员 / token / 概览
-│   ├── ingest/                 # ← 尚未开工
+│   ├── ingest/                 # Markdown 目录源（不提炼）
 │   └── platform/               # 横切：ID / 时钟
-├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时 / 0004 会话
+├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时 / 0004 会话 / 0005 摄取
 ├── docs/                       # 01–05 设计文档
 ├── test/                       # 架构测试、schema 测试、端到端集成测试
 ├── Makefile

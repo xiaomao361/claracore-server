@@ -110,7 +110,7 @@ func (s *KnowledgeStore) UpdateMemory(ctx context.Context, m knowledge.Memory, e
 // ---------------------------------------------------------------------------
 
 const cardColumns = `id, tenant_id, space_id, author_user_id, author_agent_id,
-	title, card_type, status, source,
+	title, card_type, status, source, source_key, source_hash,
 	body_original, body_distilled, body_understanding, body_why_keep, body_unresolved,
 	copied_from_type, copied_from_id, version, created_at, updated_at`
 
@@ -118,9 +118,12 @@ func (s *KnowledgeStore) CreateCard(ctx context.Context, c knowledge.Card) error
 	fromType, fromID := originArgs(c.CopiedFrom)
 	_, err := s.ex.ExecContext(ctx,
 		`INSERT INTO cards (`+cardColumns+`)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(c.ID), string(c.TenantID), string(c.SpaceID), string(c.AuthorUserID), idPtrArg(c.AuthorAgentID),
 		c.Title, c.CardType, c.Status, nullIfEmpty(c.Source),
+		// source_key 必须写 NULL 而不是空串：uk_cards_source 允许多行 NULL，
+		// 而空串会让所有手写卡片在同一个空间里互相冲突。
+		nullIfEmpty(c.SourceKey), nullIfEmpty(c.SourceHash),
 		nullIfEmpty(c.Original), nullIfEmpty(c.Distilled), nullIfEmpty(c.Understanding),
 		nullIfEmpty(c.WhyKeep), nullIfEmpty(c.Unresolved),
 		fromType, fromID, c.Version, c.CreatedAt.UTC(), c.UpdatedAt.UTC())
@@ -133,34 +136,13 @@ func (s *KnowledgeStore) FindCard(ctx context.Context, tenantID, id platform.ID,
 	}
 
 	args := append([]any{string(id), string(tenantID)}, idArgs(spaces)...)
-	var (
-		c                                              knowledge.Card
-		cID, tID, sID, aID                             string
-		agentID                                        sql.NullString
-		source, orig, dist, under, whyKeep, unresolved sql.NullString
-		fromType, fromID                               sql.NullString
-		created, updated                               time.Time
-	)
-	err := s.ex.QueryRowContext(ctx,
+	c, err := s.scanCardRow(s.ex.QueryRowContext(ctx,
 		`SELECT `+cardColumns+` FROM cards
 		 WHERE id = ? AND tenant_id = ? AND space_id IN (`+placeholders(len(spaces))+`)`,
-		args...,
-	).Scan(&cID, &tID, &sID, &aID, &agentID, &c.Title, &c.CardType, &c.Status, &source,
-		&orig, &dist, &under, &whyKeep, &unresolved,
-		&fromType, &fromID, &c.Version, &created, &updated)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, knowledge.ErrNotFound
-	case err != nil:
-		return nil, fmt.Errorf("mysql: 查询卡片: %w", err)
+		args...))
+	if err != nil {
+		return nil, err
 	}
-
-	c.ID, c.TenantID, c.SpaceID, c.AuthorUserID = platform.ID(cID), platform.ID(tID), platform.ID(sID), platform.ID(aID)
-	c.AuthorAgentID = idFromNull(agentID)
-	c.Source, c.Original, c.Distilled = source.String, orig.String, dist.String
-	c.Understanding, c.WhyKeep, c.Unresolved = under.String, whyKeep.String, unresolved.String
-	c.CopiedFrom = originFromNull(fromType, fromID)
-	c.CreatedAt, c.UpdatedAt = created.UTC(), updated.UTC()
 
 	labels, err := s.listLabels(ctx, knowledge.Ref{Type: knowledge.EntityCard, ID: c.ID})
 	if err != nil {
@@ -173,6 +155,62 @@ func (s *KnowledgeStore) FindCard(ctx context.Context, tenantID, id platform.ID,
 		return nil, err
 	}
 	c.RecallTriggers = triggers
+	return c, nil
+}
+
+// FindCardBySourceKey 是幂等摄取的读侧。
+//
+// **不带状态过滤**：一张被人改成 deprecated 的摄取卡，下次重扫仍要
+// 认出它是同一份源——否则会新建一张，而那个「已经判过这份文档没用」
+// 的决定就被悄悄推翻了。走 uk_cards_source (space_id, source_key)。
+func (s *KnowledgeStore) FindCardBySourceKey(ctx context.Context, tenantID, spaceID platform.ID, sourceKey string) (*knowledge.Card, error) {
+	if sourceKey == "" {
+		// 空 source_key 在库里是 NULL，`= ''` 永远匹配不上任何行。
+		// 明确报 ErrNotFound 而不是让一次拼错的调用静默返回空。
+		return nil, knowledge.ErrNotFound
+	}
+	c, err := s.scanCardRow(s.ex.QueryRowContext(ctx,
+		`SELECT `+cardColumns+` FROM cards
+		 WHERE tenant_id = ? AND space_id = ? AND source_key = ?`,
+		string(tenantID), string(spaceID), sourceKey))
+	if err != nil {
+		return nil, err
+	}
+	// 摄取的更新路径只碰标题与原文，不需要标签与召回条件——
+	// 那些是人后来加的，正是要保住不动的东西。
+	return c, nil
+}
+
+// scanCardRow 读一行卡片。FindCard 与 FindCardBySourceKey 共用，
+// 列顺序只写一遍——两份 Scan 迟早有一份忘了跟着 cardColumns 改。
+func (s *KnowledgeStore) scanCardRow(row *sql.Row) (*knowledge.Card, error) {
+	var (
+		c                                      knowledge.Card
+		cID, tID, sID, aID                     string
+		agentID                                sql.NullString
+		source, srcKey, srcHash                sql.NullString
+		orig, dist, under, whyKeep, unresolved sql.NullString
+		fromType, fromID                       sql.NullString
+		created, updated                       time.Time
+	)
+	err := row.Scan(&cID, &tID, &sID, &aID, &agentID, &c.Title, &c.CardType, &c.Status,
+		&source, &srcKey, &srcHash,
+		&orig, &dist, &under, &whyKeep, &unresolved,
+		&fromType, &fromID, &c.Version, &created, &updated)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, knowledge.ErrNotFound
+	case err != nil:
+		return nil, fmt.Errorf("mysql: 查询卡片: %w", err)
+	}
+
+	c.ID, c.TenantID, c.SpaceID, c.AuthorUserID = platform.ID(cID), platform.ID(tID), platform.ID(sID), platform.ID(aID)
+	c.AuthorAgentID = idFromNull(agentID)
+	c.Source, c.SourceKey, c.SourceHash = source.String, srcKey.String, srcHash.String
+	c.Original, c.Distilled = orig.String, dist.String
+	c.Understanding, c.WhyKeep, c.Unresolved = under.String, whyKeep.String, unresolved.String
+	c.CopiedFrom = originFromNull(fromType, fromID)
+	c.CreatedAt, c.UpdatedAt = created.UTC(), updated.UTC()
 	return &c, nil
 }
 
@@ -180,11 +218,13 @@ func (s *KnowledgeStore) UpdateCard(ctx context.Context, c knowledge.Card, expec
 	fromType, fromID := originArgs(c.CopiedFrom)
 	res, err := s.ex.ExecContext(ctx,
 		`UPDATE cards SET space_id = ?, title = ?, card_type = ?, status = ?, source = ?,
+		        source_key = ?, source_hash = ?,
 		        body_original = ?, body_distilled = ?, body_understanding = ?,
 		        body_why_keep = ?, body_unresolved = ?,
 		        copied_from_type = ?, copied_from_id = ?, version = ?, updated_at = ?
 		 WHERE id = ? AND tenant_id = ? AND version = ?`,
 		string(c.SpaceID), c.Title, c.CardType, c.Status, nullIfEmpty(c.Source),
+		nullIfEmpty(c.SourceKey), nullIfEmpty(c.SourceHash),
 		nullIfEmpty(c.Original), nullIfEmpty(c.Distilled), nullIfEmpty(c.Understanding),
 		nullIfEmpty(c.WhyKeep), nullIfEmpty(c.Unresolved),
 		fromType, fromID, c.Version, c.UpdatedAt.UTC(),

@@ -40,6 +40,15 @@ type Card struct {
 	Status        string
 	Source        string
 
+	// SourceKey / SourceHash 只有摄取产物才有（手写卡片为空）。
+	//
+	// SourceKey 是源的稳定标识，落进 uk_cards_source (space_id, source_key)——
+	// 幂等靠数据库保证，不靠应用层先查一次（并发下必然失效）。
+	// SourceHash 是源内容的指纹：没变就整张卡都不动，
+	// 否则每次重扫都会推高全部 version 并作废全部向量。
+	SourceKey  string
+	SourceHash string
+
 	Original      string // 作者原意
 	Distilled     string // 提炼
 	Understanding string // 理解（空 = 只是摘要，非合格卡片）

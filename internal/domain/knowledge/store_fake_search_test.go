@@ -402,3 +402,25 @@ func (f *fakeStore) CountSpaceContents(_ context.Context, tenantID platform.ID, 
 	}
 	return out, nil
 }
+
+// FindCardBySourceKey 与真库同一条纪律：**不做状态过滤**。
+//
+// 一张被人改成 deprecated 的摄取卡，下次重扫仍要认出它是同一份源——
+// 否则会新建一张，而那个「已经判过这份文档没用」的决定就被悄悄推翻了。
+// 这个 fake 若加上 IsVisible() 过滤，领域测试会全绿而线上行为完全不同。
+func (f *fakeStore) FindCardBySourceKey(_ context.Context, tenantID, spaceID platform.ID, sourceKey string) (*Card, error) {
+	if err := f.check("FindCardBySourceKey"); err != nil {
+		return nil, err
+	}
+	if sourceKey == "" {
+		// 真库里空 source_key 存的是 NULL，`= \'\'` 匹配不上任何行
+		return nil, ErrNotFound
+	}
+	for _, c := range f.cards {
+		if c.TenantID == tenantID && c.SpaceID == spaceID && c.SourceKey == sourceKey {
+			found := c
+			return &found, nil
+		}
+	}
+	return nil, ErrNotFound
+}

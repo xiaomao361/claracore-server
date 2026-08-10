@@ -1,6 +1,6 @@
 # ClaraCore Server — 接手指南
 
-> 最后更新：2026-08-10 16:30
+> 最后更新：2026-08-10 16:45
 > 给下一次接手的人或 agent（Clara / Codex / 其他）
 
 ---
@@ -9,7 +9,9 @@
 
 **现在是一个能交付给团队的东西了**：管理员能在浏览器里开账号、发 token、复制配置片段；agent 拿着那个 token 通过 MCP 记经验、提炼卡片、在对的情境下被召回。工作面（16 个 MCP 工具）与治理面（Web 登录/成员/token）都通了。
 
-第一版还差两块：**摄取**（冷启动，`01` §8.1 的生死问题）与 **Web 的可见性页面**（内容浏览、卡片审核、活动流——消除黑盒那一半）。
+**摄取也通了**（0810 第五刀）：`server -ingest ./docs -ingest-space … -ingest-source …` 把一个 Markdown 目录幂等地灌成 draft 卡。拿 ClaraCore 自己的 `docs/` 试过——首次 6 created，原样重跑 6 unchanged（一次写都没有），改一份文件后 1 updated / 5 unchanged。
+
+第一版还差的是 **Web 的可见性页面**（内容浏览、卡片审核、活动流——消除黑盒那一半）。
 
 两条端到端证据（`make itest` 每次真跑，Ollama 不在线则 skip）：
 
@@ -33,6 +35,10 @@ make check     # 全部检查：fmt + vet + 架构约束 + domain 覆盖率门�
 make migrate   # 应用数据库迁移（幂等，已是最新时 no-op）
 make itest     # 集成测试（schema + Store 契约 + MCP 端到端），需真实 MySQL。改完迁移或 SQL 必须手跑
 make run       # 启动服务（需要 .env，已存在）
+
+# 摄取一个 Markdown 目录（幂等，可反复跑）。空间 ID 与用户 ID 从 Web 的概览页取
+go run ./cmd/server -ingest ./docs \
+  -ingest-space <空间ID> -ingest-source clara-docs -ingest-user <用户ID>
 curl http://127.0.0.1:51890/healthz
 ```
 
@@ -107,6 +113,12 @@ internal/web/                  Host B：治理面（SSR + htmx 的位置，第�
   └─ web_test.go               24 个测试，全是安全属性：越权、CSRF、cookie、转义
 internal/adapters/crypto/      argon2id，参数编码进 PHC 串（调参不锁死存量用户）
 migrations/0004_sessions.sql   Web 会话表，与 MCP token 彻底分开
+migrations/0005_ingest.sql     cards 加 source_key / source_hash + uk_cards_source（幂等锚点）
+internal/ingest/markdown.go    第一个知识源：本地 Markdown 目录。**不提炼**
+  └─ markdown_test.go          7 个测试：源身份稳定性、指纹跟内容走、坏文件不中断整批
+internal/domain/knowledge/
+  └─ source.go                 Document + DocumentSource（接口在 domain，实现在 ingest）
+  └─ ingest.go                 幂等三分支 + 失败清单
 test/mcp_e2e_integration_test.go  完整装配：真库 + 真 token 打通 whoami（make itest）
 test/mcp_tools_integration_test.go 全栈工作流：真 token → MCP → 真库 → 真 Ollama
 migrations/0001_governance.sql 治理域 6 张表，已应用到 192.168.3.200 的库
@@ -117,9 +129,13 @@ Makefile                       make check 是提交前的门槛
 poc/                           丢弃型验证代码，独立 go.mod，不参与主模块构建
 ```
 
-**约束已反向验证过**：造过违规探针，9 + 3 + 8 + 4 + 7 + 21 + 14 + 14 + 24 条违规全部被捕获（依次是：架构与 schema 规则、`ascii_bin` 规则、governance Store、`ErrAlreadyExists` 映射与 fake 唯一性、MCP Host 的安全属性、knowledge 领域层与 Store、检索与索引队列）。新增约束或新写一层适配器后请用同样方式验证一次——**从不失败的检查等于没有检查**。
+**约束已反向验证过**：造过违规探针，9 + 3 + 8 + 4 + 7 + 21 + 14 + 14 + 24 + 16 条违规全部被捕获（依次是：架构与 schema 规则、`ascii_bin` 规则、governance Store、`ErrAlreadyExists` 映射与 fake 唯一性、MCP Host 的安全属性、knowledge 领域层与 Store、检索与索引队列）。新增约束或新写一层适配器后请用同样方式验证一次——**从不失败的检查等于没有检查**。
 
 0810 检索那 14 条的清单（漏网 0）：领域层 6 条（检索空间过滤失效、语义与全文命中混排、查询向量算不出时报错而不降级、错位向量按下标硬配、替换召回条件不清旧向量、入队不与内容同事务）；Embedder 适配器 2 条（按数组顺序取向量而非 index、错误信息带上底层 error 泄露内网地址）；MySQL 5 条（粗筛漏租户隔离、召回权限信冗余列、upsert 里 content_hash 提前赋值、MATCH 进 WHERE 丢掉字面没命中的候选、标签过滤退化成并集）；schema 1 条（造一张没有 ngram 的 FULLTEXT 探针表，确认那条检查真的会红）。
+
+0810 摄取那 16 条（漏网 0，另有 1 条探针**打在了非缺陷上**）：幂等 3 条（内容没变也重写、找不到就一律新建、同批重复源标识放行）；保住人的劳动 3 条（源更新覆盖提炼与理解、产物落成 active、摄取把状态改回 draft）；失败清单 2 条；Markdown 源 6 条（SourceKey 掺绝对路径、不同源同名文件撞车、不跳过 .git、标题退回空、超限文件静默跳过、指纹不跟内容走）；MySQL 2 条。
+
+**那条非缺陷值得记，它和 0807 是同一形态**：去掉 `FindCardBySourceKey` 里 `sourceKey == ""` 的提前返回，测试照样绿。查了真库确认原因——`source_key` 存的是 NULL，而 `WHERE source_key = ''` 对 NULL 行**匹配 0 行**，所以数据库给出的答案完全一样。那个提前返回是省一次往返 + 表达意图，不是正确性要求。真正的失效形态是「source_key 写成空串而不是 NULL」，那一条**被捕获了**。与 0807「单独去掉 resolveExpectedVersion 的提前检查不构成缺陷」是同一课：**探针要照着真实的失效形态造，不是照着代码行造**。
 
 0810 Web 治理面那 24 条（**第一轮有 1 条漏网，已补测**）：认证与授权 4 条（管理页忘挂中间件、requireAdmin 退化成 requireUser、强制改密形同虚设、会话无效时放行）；CSRF 与凭据 4 条（写操作不校 CSRF、CSRF 用 == 比较、cookie 丢掉 HttpOnly、登录失败页说清具体原因）；越权 4 条（吊销别人的 token、管理员停用自己、token 明文每次都展示、初始密码用可预测随机源）；模板与响应头 2 条（换成 text/template、CSP 放开 unsafe-inline）；领域层 7 条；密码哈希 3 条。
 
@@ -371,6 +387,66 @@ VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后�
 
 ---
 
+## 摄取已固化的决定（2026-08-10，动 ingest 之前先读这段）
+
+### 服务端不提炼
+
+摄取只把文档变成一张**带 source 的 draft 卡**：标题 + 原文，别的都不填。
+提炼（写「理解」与召回条件）交给 agent 走 `card_update`。
+
+服务端不引入 LLM 依赖，是因为那会带来又一套 baseURL / model / 配额 / 超时 /
+失败重试，而换来的自动提炼质量不可控——一旦跑偏就是批量产出垃圾召回条件，
+而垃圾召回条件比没有召回条件更糟：它会污染 `card_recall` 这个产品的核心能力。
+
+代价必须说清楚：**刚摄完那批卡，`card_recall` 一条都命不中**（没有触发条件）。
+`card_search` 能找到它们（正文进了向量），但那不是这个产品的主路径。
+摄取产出的是原料，不是卡片。
+
+### 幂等靠数据库，不靠应用层先查一次
+
+```
+库里没有这个 source_key   → 新建一张 draft
+有，但 content_hash 变了   → 更新标题与原文，其余不动
+有，且 content_hash 没变   → 什么都不做
+```
+
+| 决定 | 为什么 |
+|---|---|
+| `uk_cards_source (space_id, source_key)` | 应用层 SELECT-then-INSERT 在并发下必然失效（0002 建 spaces 生成列时已记过同一条）。而摄取天生是批量且会被反复触发的 |
+| `source_key` 为 NULL 而非空串 | MySQL 唯一索引允许多行 NULL。于是一个约束同时做到两件事：摄取产物被约束，手写卡片完全不受影响。与 0001 用生成列做「每用户一个 personal」是同一手法 |
+| 第三分支「什么都不做」 | 没有它，重扫一个没改过的目录会把每张卡 version 推高一格、每个向量作废重算——真金白银的外部调用，而且版本历史会被无意义的自增淹掉 |
+| 更新只覆盖标题与原文 | 提炼、理解、召回条件、标签**一律不动**。源文档改个错别字就清空它们，等于每次上游更新都惩罚一次做过功的人。代价是原文与提炼可能不同步——但不同步的提炼还能被看见并修正，被清空的谁也想不起来 |
+| 摄取**不碰 status** | 一张被人改成 deprecated 的卡，重扫时仍被认出是同一份源，且状态保持。`FindCardBySourceKey` 因此**不做状态过滤**——过滤了就会新建一张，而「已经判过这份文档没用」的决定被悄悄推翻 |
+| 一份坏文档不中断整批 | 保留成功项 + 列失败清单（`04` §6）。失败项必须带**源路径与原因**——只说「失败 3 条」等于没说 |
+| 同批重复 SourceKey 直接拒 | 它们会在唯一键上互相覆盖，最终留下哪一份取决于遍历顺序。表现是「每次摄取结果都不一样」，极难排查 |
+
+### 源的身份是**声明的名字**，不是它在磁盘上的位置
+
+`SourceKey = SHA-256("markdown:" + label + "\x00" + 相对路径)`。
+
+第一版我把 `root`（绝对路径）掺了进去，`TestSourceKeyIsStableAcrossRoots`
+**当场抓住**——那意味着一次目录搬迁或换一台服务器，库里的卡会全部重建一遍。
+`label` 同时解决另一件事：两个不同目录摄进同一个空间时，两边的
+`docs/x.md` 不会撞成同一张卡。
+
+改 `-ingest-source` 的值 = 换了一个源，会重新建一整套卡。这不是 bug，
+是定义——但用的人得知道。
+
+### 这一层缺的东西
+
+- **没有删除检测**。源里删掉一份文档，库里那张卡会一直留着。要做的话是
+  「扫描结果与库里该源的全部 source_key 求差集」，然后**标记而不是删除**
+  （人可能已经在那张卡上写了东西）。
+- **只有 CLI 入口，没有 Web 摄取管理页**（`04` 页面 9）。现在是
+  `server -ingest`，参数里的空间 ID / 用户 ID 要人自己从 Web 上抄。
+- **只有 Markdown 目录一个源**。odoc 那类活系统按 `01` §8.1.3 是「连接而非纳入」，
+  属于第二版的索引同步，路径完全不同。
+- **整篇一张卡，不按 `##` 切分**。按章节拆是一种提炼判断，而提炼不归摄取管——
+  但一份 500 行的设计文档变成一张卡，对召回未必是最优粒度。这条要等真实
+  召回数据才能判断。
+
+---
+
 ## Web 治理面已固化的决定（2026-08-10，动 internal/web 之前先读这段）
 
 ### 路由是三层门，不是三个 if
@@ -434,16 +510,12 @@ requireAdmin        ↑ 且角色是 admin
 
 ## 下一步
 
-**1. 摄取（现在是大头）。** 冷启动是生死问题（`01` §8.1）：团队已有的 odoc / Atlas / 各类 md 接不进来，产品就启动不了。三条纪律：
-- 摄取产物一律落 `draft`，不进默认检索；
-- **必须复用同一条入队路径**（`Service.CreateCard` → `enqueueEmbedding`），别写第二份 embedding 逻辑；
-- **摄取必须幂等**（同一源产生同一张卡 → upsert），这样「重试失败项」才能退化成「整批再跑一次」，不需要任务项状态表（`04` §6 已拍板）。
+**1. Web 的可见性页面（现在是大头）。** 04 §1.1 说得很清楚：Web 的第一职责是消除黑盒。这一版只做到「人能进得来」，下一版才是「人能看见 agent 做了什么」——卡片审核（唯一的 Web 写入场景）、内容浏览、活动流。活动流要先建 `audit_logs`（0005 迁移），并且**按 §2.1 的可见性规则把过滤下推到 SQL，不在模板层过滤**：写入是协作行为可见，读取是私人行为不可见。
 
-**2. Web 的可见性页面。** 04 §1.1 说得很清楚：Web 的第一职责是消除黑盒。这一版只做到「人能进得来」，下一版才是「人能看见 agent 做了什么」——卡片审核（唯一的 Web 写入场景）、内容浏览、活动流。活动流要先建 `audit_logs`（0005 迁移），并且**按 §2.1 的可见性规则把过滤下推到 SQL，不在模板层过滤**：写入是协作行为可见，读取是私人行为不可见。
-
-**3. Continuity**（`shared_line_*` 4 个工具）。`internal/domain/continuity` 还是空目录，不阻塞前两项。
+**2. Continuity**（`shared_line_*` 4 个工具）。`internal/domain/continuity` 还是空目录，不阻塞前一项。
 
 零散但值得顺手做的：
+- 摄取的 Web 入口与删除检测（见 §摄取缺的东西）。
 - 项目空间与权限管理页（现在只能靠代码调 `CreateProjectSpace` / `GrantSpaceAccess`）。
 - `knowledge.SupersedeMemory` 用例，补上契约里的 `supersedes`。
 - embedding 的 backfill 与失败计数、会话过期的定时清理。

@@ -412,7 +412,7 @@ location /mcp {
 | MCP 工作面 | ✅ 16/20（缺 Continuity 4 个） |
 | Continuity（shared_line） | ❌ `internal/domain/continuity` 是空目录 |
 | Web 管理面 | ⚠️ 第一刀已落地（登录 / 成员 / token / 概览）。可见性页面（内容浏览、卡片审核、活动流）未开工 |
-| 摄取 | ❌ 未开工。冷启动是生死问题（§8.1），**现在是最大的那块** |
+| 摄取 | ⚠️ 本地 Markdown 目录已通（幂等、失败清单、draft 产物），CLI 入口。Web 管理页与删除检测未做 |
 | 外部源连接（odoc 等） | ❌ 第二版 |
 
 各条决策的落地细节与偏差见 `HANDOFF.md`；本节只回答「做到哪儿了」。

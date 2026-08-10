@@ -149,6 +149,16 @@ func (s *Service) Login(ctx context.Context, username, password string) (Session
 	return s.issueSession(ctx, *user)
 }
 
+// Tenant 返回这个部署对应的租户。
+//
+// 导出它是因为不止登录需要：命令行摄取、健康检查、将来的初始化向导
+// 都要回答「这个部署是给哪个团队的」。规则只有一份，都走 resolveTenant——
+// 让调用方自己去 ListTenants 再挑一个，那条「多于一个就报错」的判断
+// 立刻就会有第二个版本。
+func (s *Service) Tenant(ctx context.Context) (Tenant, error) {
+	return s.resolveTenant(ctx)
+}
+
 // resolveTenant 解析这个部署对应的租户。
 //
 // 多于一个活跃租户时报错：那是一次运维事故（同一个库被两套部署共用），

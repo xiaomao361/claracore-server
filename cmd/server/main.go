@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +25,7 @@ import (
 	"claracore-server/internal/config"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
+	"claracore-server/internal/ingest"
 	mcphost "claracore-server/internal/mcp"
 	"claracore-server/internal/platform"
 	"claracore-server/internal/ports"
@@ -35,6 +39,10 @@ var version = "0.1.0-dev"
 
 func main() {
 	migrateOnly := flag.Bool("migrate", false, "应用数据库迁移后退出，不启动服务")
+	ingestDir := flag.String("ingest", "", "摄取一个 Markdown 目录后退出（需同时给 -ingest-space 与 -ingest-source）")
+	ingestSpace := flag.String("ingest-space", "", "摄取的目标空间 ID")
+	ingestSource := flag.String("ingest-source", "", "源名，跨机器稳定（如 clara-docs）。它参与 source_key，改了等于换了一个源")
+	ingestUser := flag.String("ingest-user", "", "摄取产物记在哪个用户名下（用户 ID）")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -103,6 +111,18 @@ func main() {
 	embedder := newEmbedder(cfg.Embedding)
 	knowStore := mysql.NewKnowledgeStore(db)
 	knowService := knowledge.NewService(knowStore, clock, ids, embedder)
+
+	// 摄取是显式动作，与 -migrate 同一形态：跑完就退，不启动服务。
+	// 它天生幂等，可以反复跑——「源文档更新了要重扫」就是常态。
+	if *ingestDir != "" {
+		if err := runIngest(context.Background(), govService, knowService, logger, ingestArgs{
+			Dir: *ingestDir, Space: *ingestSpace, Source: *ingestSource, User: *ingestUser,
+		}); err != nil {
+			logger.Error("摄取失败", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	mcpHost := mcphost.NewHost(govService, knowService, logger, mcphost.HostOptions{
 		Version:        version,
@@ -193,6 +213,77 @@ func newEmbedder(cfg config.Embedding) ports.Embedder {
 	default:
 		return nil
 	}
+}
+
+type ingestArgs struct {
+	Dir, Space, Source, User string
+}
+
+// runIngest 把一个目录摄进指定空间。
+//
+// **不做权限判断**：这是本机命令行，跑它的人已经有服务器权限了，
+// 再套一层空间授权检查只是仪式。将来 Web 上的摄取管理页要走
+// governance.SpaceScope.ResolveWriteTarget——那时调用方是浏览器里的人，
+// 权限才真的是一道门。
+func runIngest(ctx context.Context, gov *governance.Service, know *knowledge.Service, logger *slog.Logger, args ingestArgs) error {
+	var missing []string
+	for name, v := range map[string]string{
+		"-ingest-space": args.Space, "-ingest-source": args.Source, "-ingest-user": args.User,
+	} {
+		if v == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing) // 错误信息要稳定，map 遍历顺序是随机的
+		return fmt.Errorf("缺少参数: %s", strings.Join(missing, ", "))
+	}
+
+	source := ingest.NewMarkdownDir(args.Source, args.Dir)
+	logger.Info("开始扫描", "source", source.Name(), "dir", args.Dir)
+
+	docs, err := source.Scan(ctx)
+	if err != nil {
+		// 扫描出问题也可能带回了一批好文档——先把问题说出来，再摄那一批。
+		// 直接退出的话，一个坏文件会挡住其余几千份。
+		logger.Warn("扫描时有文件读取失败", "error", err)
+	}
+	if len(docs) == 0 {
+		return fmt.Errorf("没有扫到任何 .md 文档")
+	}
+
+	// 租户由部署解析，不再多加一个 flag：「一个团队一套部署单元」
+	// （02 §2.1），而那条规则只住在 governance.Tenant 里。
+	// 库里有多于一个活跃租户时它会报错而不是猜——那正是想要的。
+	tenant, err := gov.Tenant(ctx)
+	if err != nil {
+		return err
+	}
+
+	report, err := know.Ingest(ctx, knowledge.IngestInput{
+		TenantID:     tenant.ID,
+		SpaceID:      platform.ID(args.Space),
+		AuthorUserID: platform.ID(args.User),
+		Documents:    docs,
+	})
+	if err != nil {
+		return err
+	}
+
+	logger.Info("摄取完成",
+		"scanned", len(docs),
+		"created", report.Created, "updated", report.Updated,
+		"unchanged", report.Unchanged, "failed", len(report.Failed))
+	for _, f := range report.Failed {
+		// 失败清单要逐条打出来：只说「失败 3 条」等于没说，
+		// 人得能照着去修那一份
+		logger.Warn("摄取失败项", "source", f.SourcePath, "reason", f.Reason)
+	}
+	if report.Created+report.Updated > 0 {
+		logger.Info("提醒：摄取产物是 draft 原料，不进默认检索。" +
+			"要让它们能被 card_recall 命中，需要 agent 补上提炼与召回条件，再由人确认")
+	}
+	return nil
 }
 
 // runIndexer 是后台索引 worker：把队列里的 pending 向量补上。
