@@ -16,11 +16,14 @@ import (
 	"syscall"
 	"time"
 
+	"claracore-server/internal/adapters/embedding"
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
 	"claracore-server/internal/domain/governance"
+	"claracore-server/internal/domain/knowledge"
 	mcphost "claracore-server/internal/mcp"
 	"claracore-server/internal/platform"
+	"claracore-server/internal/ports"
 	"claracore-server/migrations"
 )
 
@@ -81,6 +84,12 @@ func main() {
 	govService := governance.NewService(govStore, clock, ids)
 	mcpHost := mcphost.NewHost(govService, logger, version)
 
+	// embedder 为 nil 是**降级形态而非异常形态**：不入索引队列，
+	// 检索退化成中文全文匹配，系统功能保持完整（01-architecture.md §6.1）。
+	embedder := newEmbedder(cfg.Embedding)
+	knowStore := mysql.NewKnowledgeStore(db)
+	knowService := knowledge.NewService(knowStore, clock, ids, embedder)
+
 	mux := http.NewServeMux()
 
 	// MCP 入口。认证在 Host 内部（bearer token），这里不加任何前置判断——
@@ -114,6 +123,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 索引 worker 跟着同一个 ctx 停。它不属于请求路径：
+	// 写入只负责把内容排进队列（同事务落一行 pending），向量在这里补上。
+	indexerDone := make(chan struct{})
+	go runIndexer(ctx, knowService, cfg.Embedding, logger, indexerDone)
+
 	go func() {
 		logger.Info("服务启动", "addr", cfg.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -130,5 +144,67 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("关闭超时", "error", err)
 	}
+	<-indexerDone
 	logger.Info("已退出")
+}
+
+// newEmbedder 按配置构造 Embedder，未启用时返回 nil。
+//
+// 返回 nil 而不是一个「什么都不做的 Embedder」：空实现的 Model() 得编一个
+// 模型名出来，而那个名字会被写进 embeddings.model 列，将来真的接上模型时
+// 没人分得清哪些行是它留下的。领域层只在一处判空，代价比那个小得多。
+func newEmbedder(cfg config.Embedding) ports.Embedder {
+	switch cfg.Provider {
+	case config.ProviderOllama:
+		return embedding.NewOllama(cfg.BaseURL, cfg.Model, cfg.APIKey, cfg.Timeout)
+	case config.ProviderOpenAICompat:
+		return embedding.NewOpenAICompat(cfg.BaseURL, cfg.Model, cfg.APIKey, cfg.Timeout)
+	default:
+		return nil
+	}
+}
+
+// runIndexer 是后台索引 worker：把队列里的 pending 向量补上。
+//
+// 三条纪律：
+//
+//   - **失败不退出**。最常见的失败是 embedding 服务临时不可用，
+//     那一批已经被标记并累加了 attempts，下一轮会重试。worker 退出
+//     只会让积压变成永久积压。
+//   - **一轮里持续抽干**。领到满批说明还有积压，立刻再来一轮而不是
+//     等下一个 tick——否则一次批量摄取要花 (条数/批量) × 间隔 才追得完。
+//   - **随 ctx 停**。正在跑的那一批做完就退，不打断它：中途放弃只会
+//     留下一批已经算好却没写回的向量，那次外部调用就白花了。
+func runIndexer(ctx context.Context, svc *knowledge.Service, cfg config.Embedding, logger *slog.Logger, done chan<- struct{}) {
+	defer close(done)
+	if !cfg.Enabled() {
+		logger.Info("未配置 embedding，索引 worker 不启动；检索降级为全文匹配")
+		return
+	}
+	logger.Info("索引 worker 启动", "interval", cfg.IndexInterval, "batch", cfg.IndexBatch, "model", cfg.Model)
+
+	ticker := time.NewTicker(cfg.IndexInterval)
+	defer ticker.Stop()
+	for {
+		for {
+			report, err := svc.IndexPending(ctx, cfg.IndexBatch)
+			if err != nil {
+				logger.Warn("索引失败，将在下一轮重试",
+					"picked", report.Picked, "failed", report.Failed, "error", err)
+				break
+			}
+			if report.Indexed > 0 {
+				logger.Info("索引完成", "indexed", report.Indexed, "failed", report.Failed)
+			}
+			if report.Picked < cfg.IndexBatch {
+				break // 没领满，说明队列空了
+			}
+		}
+		select {
+		case <-ctx.Done():
+			logger.Info("索引 worker 退出")
+			return
+		case <-ticker.C:
+		}
+	}
 }

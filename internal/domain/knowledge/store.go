@@ -65,6 +65,87 @@ type Store interface {
 	// 整体替换让「作者重排了顺序」和「作者删了中间一条」变成同一件事。
 	ReplaceRecallTriggers(ctx context.Context, tenantID, cardID platform.ID, triggers []RecallTrigger) error
 
+	// --- 检索：第一段粗筛 ---
+	//
+	// 三个方法的实现纪律相同，也是这一层最要紧的一条：
+	// **把 q.SpaceIDs 下推成 SQL 的 `WHERE space_id IN (...)`，绝不后置**
+	// （docs/02-data-model.md §5.1）。查全量再在应用层筛，既是性能问题，
+	// 更是「筛之前那些行已经进过内存」的泄露风险。
+	//
+	// 只返回默认可见状态的内容（memory 的 active、card 的 active）。
+	// 审核用的 draft 列表是 Web 治理面的列表查询，不是检索——
+	// 让检索接口长出一个 includeStatuses 参数，等于让每个调用点
+	// 都有机会把摄取产生的未审草稿混进 agent 的上下文里。
+
+	// SearchMemories 粗筛记忆。q.Query 非空时按 ngram 全文相关性排序，
+	// 为空时按时间新近度；两种都截断到 q.Limit。
+	//
+	// 返回的 TextScore 只在同一次查询内部可比——它是 MySQL 的 MATCH 相关性，
+	// 没有跨查询的绝对含义。领域层只拿它排序，不拿它当阈值。
+	SearchMemories(ctx context.Context, q CandidateQuery) ([]MemoryCandidate, error)
+
+	SearchCards(ctx context.Context, q CandidateQuery) ([]CardCandidate, error)
+
+	// SearchRecallTriggers 粗筛召回条件（card_recall 的第一段）。
+	//
+	// 必须只返回**所属卡片当前可见**的触发条件。card_recall_triggers 表上
+	// 没有 status 列，所以这里躲不掉一次 JOIN cards——0002 迁移里
+	// 「冗余 space_id 使粗筛无需 JOIN」那句话只对权限过滤成立，
+	// 当时没想到状态过滤（实现检索时发现，2026-08-10）。
+	SearchRecallTriggers(ctx context.Context, q CandidateQuery) ([]TriggerCandidate, error)
+
+	// CountCardMatches 数一数同样的条件下有多少张卡命中。
+	//
+	// 只用于 memoria_search 返回的「另有 N 条卡片命中」提示，不返回内容。
+	// 与 SearchCards 用同一份 WHERE 条件，否则那个数字会和用户
+	// 真去 card_search 时看到的对不上，比不给这个数字更糟。
+	CountCardMatches(ctx context.Context, q CandidateQuery) (int, error)
+
+	// FindCards 在 spaces 范围内批量取卡片，用于 card_recall 的回表。
+	//
+	// 找不到的 ID 直接不出现在结果里，不报 ErrNotFound：召回本来就是
+	// 「有什么给什么」，一条悬空的触发条件不该让整次召回失败。
+	// 同样只返回默认可见状态的卡片。
+	FindCards(ctx context.Context, tenantID platform.ID, ids, spaces []platform.ID) ([]Card, error)
+
+	// --- 检索：第二段精算所需的向量 ---
+
+	// LoadVectors 批量取指定实体在指定模型下**已算好**的向量，
+	// 返回值以 Ref.String() 为键。没有向量的实体不出现在结果里。
+	//
+	// 不带空间过滤：refs 全部来自第一段粗筛，已经过过权限了。
+	// 在这里再过滤一次意味着权限规则有了第二个可以走的入口。
+	LoadVectors(ctx context.Context, tenantID platform.ID, model string, refs []Ref) (map[string][]float32, error)
+
+	// --- 索引队列 ---
+
+	// EnqueueEmbedding 把一条内容排进索引队列，**内容未变时不得重置已有向量**。
+	//
+	// 实现要按 content_hash 判断：hash 相同说明这次写入没碰到被 embedding 的
+	// 那几栏（比如只改了标签），已算好的向量继续有效。粗暴地每次都置回 pending，
+	// 等于每改一次标签就重算一次向量——那是真金白银的外部调用。
+	EnqueueEmbedding(ctx context.Context, e Embedding) error
+
+	// DeleteCardTriggerEmbeddings 删掉一张卡全部召回条件的向量行。
+	//
+	// 必须在 ReplaceRecallTriggers **之前**调用：那个方法先删后插，
+	// 旧触发条件的行一旦没了，就再也没有办法定位它们留下的向量，
+	// 那些行会永远躺在库里，既不会被查到也不会被清掉。
+	DeleteCardTriggerEmbeddings(ctx context.Context, tenantID, cardID platform.ID) error
+
+	// ListPendingEmbeddings 领一批待算的向量（pending 与重试次数未超上限的 failed）。
+	//
+	// 按最久没动的排在前面：失败的行每失败一次就更新时间戳，于是自然排到队尾，
+	// 不会霸着队头把整批活卡死。
+	ListPendingEmbeddings(ctx context.Context, model string, maxAttempts, limit int) ([]Embedding, error)
+
+	// SaveEmbeddingVector 写回算好的向量，置 ready 并清空失败计数。
+	SaveEmbeddingVector(ctx context.Context, id platform.ID, vector []float32, at time.Time) error
+
+	// MarkEmbeddingsFailed 批量标记失败：累加 attempts、记下原因。
+	// 行不删——「这条内容算不出向量」本身是要给运维看的信息。
+	MarkEmbeddingsFailed(ctx context.Context, ids []platform.ID, reason string, at time.Time) error
+
 	// --- Link ---
 
 	// CreateLink 在同 (from, to, kind) 已存在时返回 ErrAlreadyExists。

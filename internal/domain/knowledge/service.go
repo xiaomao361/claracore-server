@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"claracore-server/internal/platform"
+	"claracore-server/internal/ports"
 )
 
 // Service 编排核心域的用例。
@@ -16,10 +17,19 @@ type Service struct {
 	store Store
 	clock platform.Clock
 	ids   *platform.IDGenerator
+
+	// embedder 可以为 nil，那是**降级形态而非异常形态**
+	// （docs/01-architecture.md §6.1）：不入索引队列，检索退化成
+	// 中文全文匹配，系统功能保持完整。
+	//
+	// 用 nil 而不是塞一个「什么都不做的 Embedder」：空实现的 Model()
+	// 得编一个模型名出来，而那个名字会被写进 embeddings.model 列，
+	// 将来真的接上模型时没人分得清哪些行是它留下的。
+	embedder ports.Embedder
 }
 
-func NewService(store Store, clock platform.Clock, ids *platform.IDGenerator) *Service {
-	return &Service{store: store, clock: clock, ids: ids}
+func NewService(store Store, clock platform.Clock, ids *platform.IDGenerator, embedder ports.Embedder) *Service {
+	return &Service{store: store, clock: clock, ids: ids, embedder: embedder}
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +72,12 @@ func (s *Service) CreateMemory(ctx context.Context, in CreateMemoryInput) (Memor
 		if err := st.CreateMemory(ctx, m); err != nil {
 			return err
 		}
-		return st.ReplaceLabels(ctx, m.TenantID, Ref{EntityMemory, m.ID}, m.Labels, now)
+		if err := st.ReplaceLabels(ctx, m.TenantID, Ref{EntityMemory, m.ID}, m.Labels, now); err != nil {
+			return err
+		}
+		// 入队与内容同事务提交：分两步的话，中间崩一次这条内容就永远
+		// 搜不到，而且没有任何地方会报错（见 enqueueEmbedding 的注释）。
+		return s.enqueueEmbedding(ctx, st, m.TenantID, Ref{EntityMemory, m.ID}, memoryEmbedText(m), now)
 	})
 	if err != nil {
 		return Memory{}, err
@@ -153,10 +168,15 @@ func (s *Service) UpdateMemory(ctx context.Context, in UpdateMemoryInput) (Memor
 		if err := st.UpdateMemory(ctx, next, expected); err != nil {
 			return err
 		}
-		if !labelsChanged {
-			return nil
+		if labelsChanged {
+			if err := st.ReplaceLabels(ctx, next.TenantID, Ref{EntityMemory, next.ID}, next.Labels, next.UpdatedAt); err != nil {
+				return err
+			}
 		}
-		return st.ReplaceLabels(ctx, next.TenantID, Ref{EntityMemory, next.ID}, next.Labels, next.UpdatedAt)
+		// 无条件入队，不在这里判断「正文有没有变」：判断的依据是
+		// content_hash，而它由 EnqueueEmbedding 的 upsert 比对——
+		// 在领域层再算一次「变了没有」，就有了两处会给出不同答案的判断。
+		return s.enqueueEmbedding(ctx, st, next.TenantID, Ref{EntityMemory, next.ID}, memoryEmbedText(next), next.UpdatedAt)
 	})
 	if err != nil {
 		return Memory{}, err
@@ -259,7 +279,16 @@ func (s *Service) persistNewCard(ctx context.Context, c Card, at time.Time) erro
 		if err := st.ReplaceLabels(ctx, c.TenantID, Ref{EntityCard, c.ID}, c.Labels, at); err != nil {
 			return err
 		}
-		return st.ReplaceRecallTriggers(ctx, c.TenantID, c.ID, c.RecallTriggers)
+		if err := st.ReplaceRecallTriggers(ctx, c.TenantID, c.ID, c.RecallTriggers); err != nil {
+			return err
+		}
+		// 卡片正文与每条召回条件各自入队。两者匹配的是不同的东西：
+		// 正文回答「这张卡在讲什么」（card_search），召回条件回答
+		// 「什么情境下该想起它」（card_recall）——后者才是这个产品的核心优势。
+		if err := s.enqueueEmbedding(ctx, st, c.TenantID, Ref{EntityCard, c.ID}, cardEmbedText(c), at); err != nil {
+			return err
+		}
+		return s.enqueueCardTriggers(ctx, st, c, at)
 	})
 }
 
@@ -378,10 +407,21 @@ func (s *Service) UpdateCard(ctx context.Context, in UpdateCardInput) (Card, err
 				return err
 			}
 		}
-		if triggersChanged {
-			return st.ReplaceRecallTriggers(ctx, next.TenantID, next.ID, next.RecallTriggers)
+		if err := s.enqueueEmbedding(ctx, st, next.TenantID, Ref{EntityCard, next.ID}, cardEmbedText(next), next.UpdatedAt); err != nil {
+			return err
 		}
-		return nil
+		if !triggersChanged {
+			return nil
+		}
+		// 顺序不能换：ReplaceRecallTriggers 是先删后插，旧触发条件的行
+		// 一旦没了，它们留下的向量就再也定位不到，会永远躺在库里。
+		if err := st.DeleteCardTriggerEmbeddings(ctx, next.TenantID, next.ID); err != nil {
+			return err
+		}
+		if err := st.ReplaceRecallTriggers(ctx, next.TenantID, next.ID, next.RecallTriggers); err != nil {
+			return err
+		}
+		return s.enqueueCardTriggers(ctx, st, next, next.UpdatedAt)
 	})
 	if err != nil {
 		return Card{}, err
@@ -578,7 +618,12 @@ func (s *Service) promoteMemory(ctx context.Context, in PromoteInput) (Ref, erro
 		if err := st.CreateMemory(ctx, copied); err != nil {
 			return err
 		}
-		return st.ReplaceLabels(ctx, copied.TenantID, Ref{EntityMemory, copied.ID}, copied.Labels, now)
+		if err := st.ReplaceLabels(ctx, copied.TenantID, Ref{EntityMemory, copied.ID}, copied.Labels, now); err != nil {
+			return err
+		}
+		// 副本要自己的向量行：它是另一个空间里的另一条内容，
+		// 检索时按各自空间的权限被取到，不能共用原件那一行。
+		return s.enqueueEmbedding(ctx, st, copied.TenantID, Ref{EntityMemory, copied.ID}, memoryEmbedText(copied), now)
 	})
 	if err != nil {
 		return Ref{}, err

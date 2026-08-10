@@ -29,6 +29,9 @@ type fakeStore struct {
 	triggers map[platform.ID][]RecallTrigger // key: cardID
 	links    map[platform.ID]Link
 
+	// embeddings 的键模拟 uk_emb (entity_type, entity_id, model)。
+	embeddings map[string]Embedding
+
 	// failOn 让测试注入一次存储故障，用于验证 Atomically 真的回滚。
 	// 值是方法名，如 "ReplaceLabels"。
 	failOn string
@@ -37,11 +40,12 @@ type fakeStore struct {
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		memories: map[platform.ID]Memory{},
-		cards:    map[platform.ID]Card{},
-		labels:   map[string][]string{},
-		triggers: map[platform.ID][]RecallTrigger{},
-		links:    map[platform.ID]Link{},
+		memories:   map[platform.ID]Memory{},
+		cards:      map[platform.ID]Card{},
+		labels:     map[string][]string{},
+		triggers:   map[platform.ID][]RecallTrigger{},
+		links:      map[platform.ID]Link{},
+		embeddings: map[string]Embedding{},
 	}
 }
 
@@ -243,6 +247,7 @@ func (f *fakeStore) clone() *fakeStore {
 	maps.Copy(c.memories, f.memories)
 	maps.Copy(c.cards, f.cards)
 	maps.Copy(c.links, f.links)
+	maps.Copy(c.embeddings, f.embeddings)
 	// slice 值必须逐个 Clone：直接 maps.Copy 会让快照与原件共享底层数组，
 	// 回滚就成了空操作——而这个 fake 存在的意义正是让回滚能被测到。
 	for k, v := range f.labels {
@@ -256,4 +261,5 @@ func (f *fakeStore) clone() *fakeStore {
 
 func (f *fakeStore) restore(s *fakeStore) {
 	f.memories, f.cards, f.labels, f.triggers, f.links = s.memories, s.cards, s.labels, s.triggers, s.links
+	f.embeddings = s.embeddings
 }

@@ -64,7 +64,32 @@ type Embedding struct {
 	BaseURL  string
 	Model    string
 	APIKey   string
+
+	// Timeout 是单次批量调用的上限，同时也是索引 worker 卡住的上限。
+	Timeout time.Duration
+
+	// IndexInterval 是后台索引 worker 两轮之间的间隔。
+	//
+	// 它决定了「刚写完的内容多久之后能被语义检索到」。做成可配是因为
+	// 这个取舍真的因部署而异：单人试用希望它小到几乎无感，
+	// 大批量摄取时希望它大一点、让每一批攒满再发。
+	IndexInterval time.Duration
+
+	// IndexBatch 是一轮处理多少条。
+	IndexBatch int
 }
+
+// Enabled 表示是否配了真正的 embedding 服务。
+//
+// 未启用时不入索引队列、检索退化成中文全文匹配，系统功能保持完整
+// ——降级是默认路径不是异常路径（docs/01-architecture.md §6.1）。
+func (e Embedding) Enabled() bool { return e.Provider != "" && e.Provider != ProviderDisabled }
+
+const (
+	ProviderOllama       = "ollama"
+	ProviderOpenAICompat = "openai-compatible"
+	ProviderDisabled     = "disabled"
+)
 
 // Load 从环境变量加载配置。若存在 .env 文件则先载入（不覆盖已有环境变量）。
 func Load() (*Config, error) {
@@ -89,10 +114,13 @@ func Load() (*Config, error) {
 			Prefix:   getStr("CCS_REDIS_PREFIX", "ccs:"),
 		},
 		Embedding: Embedding{
-			Provider: getStr("CCS_EMBEDDING_PROVIDER", "disabled"),
-			BaseURL:  getStr("CCS_EMBEDDING_BASE_URL", ""),
-			Model:    getStr("CCS_EMBEDDING_MODEL", ""),
-			APIKey:   getStr("CCS_EMBEDDING_API_KEY", ""),
+			Provider:      getStr("CCS_EMBEDDING_PROVIDER", ProviderDisabled),
+			BaseURL:       getStr("CCS_EMBEDDING_BASE_URL", ""),
+			Model:         getStr("CCS_EMBEDDING_MODEL", ""),
+			APIKey:        getStr("CCS_EMBEDDING_API_KEY", ""),
+			Timeout:       time.Duration(getInt("CCS_EMBEDDING_TIMEOUT_SEC", 30)) * time.Second,
+			IndexInterval: time.Duration(getInt("CCS_EMBEDDING_INDEX_INTERVAL_SEC", 5)) * time.Second,
+			IndexBatch:    getInt("CCS_EMBEDDING_INDEX_BATCH", 32),
 		},
 	}
 
@@ -118,11 +146,16 @@ func (c *Config) validate() error {
 	}
 
 	switch c.Embedding.Provider {
-	case "ollama", "openai-compatible":
+	case ProviderOllama, ProviderOpenAICompat:
 		if c.Embedding.BaseURL == "" {
 			return fmt.Errorf("CCS_EMBEDDING_PROVIDER=%s 时必须设置 CCS_EMBEDDING_BASE_URL", c.Embedding.Provider)
 		}
-	case "disabled":
+		// 模型名会原样写进 embeddings.model 列，是「这个向量是谁算的」
+		// 的唯一记录，也是换模型灰度重建的依据。空着的话整张表都无法区分。
+		if c.Embedding.Model == "" {
+			return fmt.Errorf("CCS_EMBEDDING_PROVIDER=%s 时必须设置 CCS_EMBEDDING_MODEL", c.Embedding.Provider)
+		}
+	case ProviderDisabled:
 	default:
 		return fmt.Errorf("CCS_EMBEDDING_PROVIDER 取值非法: %q（可选 ollama | openai-compatible | disabled）", c.Embedding.Provider)
 	}

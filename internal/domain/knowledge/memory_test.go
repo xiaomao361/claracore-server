@@ -22,11 +22,14 @@ const (
 	agentA    = "01TESTAGENTAAAAAAAAAAAAAAA"
 )
 
+// newTestService 构造一个**没有 Embedder** 的服务：那是降级形态，
+// 也是绝大多数领域用例不关心向量时该跑的形态。
+// 需要语义检索的用例用 newSearchService（见 search_test.go）。
 func newTestService(t *testing.T) (*Service, *fakeStore) {
 	t.Helper()
 	clock := &platform.FixedClock{T: time.Date(2026, 8, 7, 9, 0, 0, 0, time.UTC)}
 	store := newFakeStore()
-	return NewService(store, clock, platform.NewIDGenerator(clock)), store
+	return NewService(store, clock, platform.NewIDGenerator(clock), nil), store
 }
 
 func ptr[T any](v T) *T { return &v }

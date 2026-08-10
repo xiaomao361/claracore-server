@@ -139,3 +139,70 @@ func TestSpaceUniquenessConstraints(t *testing.T) {
 func isDuplicateKey(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
 }
+
+// TestFullTextIndexesUseNgram 验证库里**实际生效的**全文索引都带 ngram 分词器。
+//
+// test/schema_test.go 的规则 7 是对迁移文件的文本检查，挡得住新写的迁移，
+// 挡不住「这个环境的库是从别处恢复的」或「有人手工改过索引」。而这条失效时
+// 不报错——索引建得好好的，MATCH 也能跑，只是中文永远返回空。
+//
+// 0003 给 card_recall_triggers 补的那个索引尤其要盯：它是 card_recall
+// 在没有 embedding 时唯一的降级路径。
+func TestFullTextIndexesUseNgram(t *testing.T) {
+	db := openDB(t)
+
+	// 读 SHOW CREATE TABLE 而不是 information_schema.STATISTICS.COMMENT：
+	// 后者在 8.0.36 上是空串（第一版这条检查就写错在这里，跑出来三张表
+	// 全报"没用 ngram"，而库里其实是对的）。解析器名只出现在建表语句的
+	// /*!50100 WITH PARSER `ngram` */ 注释里，那是权威来源。
+	want := map[string]string{
+		"memories":             "ft_memories",
+		"cards":                "ft_cards",
+		"card_recall_triggers": "ft_triggers", // 0003 补的，card_recall 的降级路径
+	}
+	for table, index := range want {
+		var name, ddl string
+		if err := db.QueryRow("SHOW CREATE TABLE "+table).Scan(&name, &ddl); err != nil {
+			t.Fatalf("读不到 %s 的建表语句，先执行 make migrate: %v", table, err)
+		}
+		if !strings.Contains(ddl, "FULLTEXT KEY `"+index+"`") {
+			t.Errorf("%s 上没有全文索引 %s——检索的第一段粗筛会退化成全表扫", table, index)
+			continue
+		}
+		if !strings.Contains(strings.ToLower(ddl), "with parser `ngram`") {
+			t.Errorf("%s.%s 没有使用 ngram 分词器\n  原因: 默认分词器按空格切词，中文整段被当作一个词——不报错，只是永远返回空\n  DDL: %s",
+				table, index, ddl)
+		}
+	}
+}
+
+// TestEmbeddingsTableShape 盯住 0003 落地时改掉草案的两处。
+//
+// 它们都不是"写得好看一点"，而是设计成立的前提：vector 可空让这张表
+// 同时是索引队列（写入不依赖外部服务），uk_emb 让同一实体在同一模型下
+// 只有一行（换模型是新增行、可灰度重建）。
+func TestEmbeddingsTableShape(t *testing.T) {
+	db := openDB(t)
+
+	var nullable string
+	err := db.QueryRow(`
+		SELECT IS_NULLABLE FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'embeddings' AND COLUMN_NAME = 'vector'`).Scan(&nullable)
+	if err != nil {
+		t.Fatalf("embeddings 表不存在或缺少 vector 列，先执行 make migrate: %v", err)
+	}
+	if nullable != "YES" {
+		t.Error("vector 必须可空：这张表同时是索引队列，NOT NULL 会逼我们用空 BLOB 冒充「还没算」")
+	}
+
+	var cols int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'embeddings'
+		  AND INDEX_NAME = 'uk_emb' AND NON_UNIQUE = 0`).Scan(&cols); err != nil {
+		t.Fatal(err)
+	}
+	if cols != 3 {
+		t.Errorf("uk_emb 应是 (entity_type, entity_id, model) 三列唯一键，实际 %d 列\n  它保证同一实体在同一模型下只有一行，换模型时新旧向量共存", cols)
+	}
+}

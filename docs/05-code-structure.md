@@ -252,6 +252,8 @@ cmd → mcp/web/ingest → domain → ports
 
 **已实现**（2026-08-05）：`test/arch_test.go`，纯标准库 `go/parser` + `go/ast`，**不依赖第三方架构 lint 工具**——那类工具停更之日就是约束失效之时。
 
+> **2026-08-10 补一条纪律：假阳性和假阴性一样坏。** 给 0003 写「全文索引必须带 ngram」的库内检查时，第一版查 `information_schema.STATISTICS.COMMENT`，而 8.0.36 上那一列是空串——于是三张本来完全正确的表全被报成违规。一条会误报的检查，第二次被误报时就会有人去关掉它，那时它连同它本来能挡住的东西一起消失。写完检查除了要验证「它真的会红」，还要验证「它在正确的代码上真的是绿的」。
+
 `test/schema_test.go` 实现 §5.2 的迁移规则，并额外检查迁移文件编号连续、无重复。
 
 > **约束已被反向验证**：构造过一个故意违规的探针文件（domain 里 import adapters + 跨域 import + `net/http` + 包级 var）与一个违规迁移（触发器 + `TIMESTAMP` + `tenant_id DEFAULT` + 缺 `created_at` + 无 utf8mb4），**9 条违规全部被捕获**。
