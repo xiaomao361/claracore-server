@@ -1,7 +1,7 @@
 # ClaraCore Server Web 管理面范围
 
 > 创建日期：2026-08-05
-> 状态：设计中，无代码
+> 状态：**未开工**，下一刀。领域层与 MCP 工作面已就绪，这里是第一版真正缺的最后一块
 > 前置文档：`01-architecture.md`、`02-data-model.md`、`03-mcp-contract.md`
 
 ---
@@ -139,3 +139,27 @@ Web 是 `01-architecture.md` §3 中与 MCP Host 并列的另一个 Host，二�
 ### 6.1 落地时需要注意的一处空白
 
 `draft` 需要一个**可见入口**，否则上面这套审核流程形同虚设——摄取灌进来几千条 draft，没人知道它们在等谁。放在概览页（「本空间还有 N 条待审」）还是空间详情页的独立 tab，实现时定；但**不能没有**。
+
+> **2026-08-10 补**：这个数字的数据来源已经有了。`space_stats` 工具（以及领域层的 `knowledge.Service.SpaceStats`）按空间返回 `draftCards`（待审草稿数）与 `unqualifiedCards`（「理解」栏为空、只算摘要的卡片数）。Web 概览页直接调同一个领域方法即可——**不要另写一份统计 SQL**，那会立刻产生两个对不上的数字。
+
+---
+
+## 7. 开工前必须先解决的一件事（2026-08-10）
+
+**领域层不做密码哈希，而现在没有任何地方能真正创建用户密码。**
+
+`governance.CreateUserInput.PasswordHash` 目前由调用方传入，集成测试里塞的是 `"$argon2id$e2e$fake"` 这种假值。领域层不读配置（铁律），而 argon2id 的 memory / time / parallelism 参数属于配置——所以哈希这件事必须发生在领域层之外。
+
+落地形态（`05-code-structure.md` §3.1 的「纯基础设施接口」）：
+
+```go
+// internal/ports/hasher.go —— 签名里没有任何领域概念
+type PasswordHasher interface {
+    Hash(plaintext string) (string, error)
+    Verify(plaintext, hash string) (bool, error)
+}
+```
+
+Web Host 调用它，把结果传进 `CreateUserInput`。**`Verify` 也必须在这个接口里**，不能让 Host 自己比对——密码校验的常数时间比较、以及将来的参数升级（发现旧 hash 用的是弱参数就重新哈希），都只该有一处实现。
+
+这是 Web 的第一刀绕不开的东西：没有它，登录页和成员管理页都是空壳。

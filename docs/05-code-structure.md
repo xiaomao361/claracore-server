@@ -1,7 +1,7 @@
 # ClaraCore Server 代码结构与工程约束
 
 > 创建日期：2026-08-05
-> 状态：设计中，无代码
+> 状态：**已落地**。§1 的目录树已按实际结构更新，约束机制（§5）全部可执行且反向验证过
 > 前置文档：`01-architecture.md` ~ `04-web-scope.md`
 
 ---
@@ -37,25 +37,31 @@
 ```
 claracore-server/
 ├── cmd/
-│   └── server/main.go          # 唯一入口，只做装配
+│   └── server/main.go          # 唯一入口：装配 + 优雅关闭 + -migrate + 索引 worker
 ├── internal/                   # Go 编译期强制封装，外部无法 import
-│   ├── config/
+│   ├── config/                 # 唯一读环境变量的地方
 │   ├── domain/                 # 领域层：不依赖任何基础设施
-│   │   ├── governance/
-│   │   ├── knowledge/
-│   │   └── continuity/
-│   ├── ports/                  # 接口定义（领域层的出口）
-│   ├── adapters/               # 接口实现（基础设施）
-│   ├── mcp/                    # Host A：MCP 服务
-│   ├── web/                    # Host B：Web 管理面
-│   ├── ingest/                 # 摄取与提炼
-│   └── platform/               # 横切：日志/错误/ID/时钟
-├── migrations/                 # SQL 迁移，编号顺序
+│   │   ├── governance/         # 身份、token、空间权限
+│   │   ├── knowledge/          # memory / card / 召回条件 / 检索 / 索引队列
+│   │   └── continuity/         # ← 尚未开工（shared_line）
+│   ├── ports/                  # 纯基础设施接口（embedder.go）
+│   ├── adapters/               # mysql/ + embedding/
+│   ├── mcp/                    # Host A：16 个工具
+│   ├── web/                    # Host B：← 尚未开工
+│   ├── ingest/                 # ← 尚未开工
+│   └── platform/               # 横切：ID / 时钟
+├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时
 ├── docs/                       # 01–05 设计文档
-├── test/                       # 集成测试与架构测试
+├── test/                       # 架构测试、schema 测试、端到端集成测试
 ├── Makefile
 └── go.mod
 ```
+
+> **2026-08-10 与原设计的一处偏差**：MCP 的工具处理器**没有**放进 `internal/mcp/tools/`
+> 子包（§4 的目录图里画过），而是与 `server.go` 同包，按 `memory.go` / `card.go` /
+> `space.go` 分文件。理由是身份的 context key 是**未导出的空结构体类型**——
+> 外部包无法伪造身份键，这是铁律 4 在类型系统上的落点。拆成子包就得把它导出，
+> 等于为了目录好看削掉一条安全属性。目录分层的收益远小于这个代价。
 
 **`internal/` 不是可选的。** Go 的 `internal` 机制是编译期强制的封装——放在里面的包外部模块无法 import。这是免费拿到的边界保护，全部实现代码都放进去。
 
@@ -144,13 +150,17 @@ know.GetMemory(ctx, tenantID, id, spaces)
 
 ```
 internal/ports/
-├── cache.go          # Get/Set/Del，键值都是 string/[]byte
-├── locker.go
-├── ratelimiter.go
-├── sessionstore.go
-├── embedder.go       # []string → [][]float32
+├── embedder.go       # ✅ 已落地：Model() + Embed([]string) [][]float32
+├── cache.go          # 待做，做向量缓存时（01 §6.2 里价值最高的一项）
+├── locker.go         # 待做，多实例部署时必须
+├── sessionstore.go   # 待做，Web 登录要用
+├── ratelimiter.go    # 待做
 └── eventstore.go     # MCP resumability，第一版不实现
 ```
+
+**只在真的需要时才建**：`embedder.go` 是实现检索那一刀顺手建的，因为那时才知道
+它的签名该长什么样。剩下几个留在这里是**清单不是骨架**——空接口文件比没有更糟，
+它会让人以为某个能力已经有位置了。
 
 **② 涉及领域类型的接口 → 定义在各自的 domain 包内**
 
@@ -200,17 +210,20 @@ internal/adapters/
 ## 4. 两个 Host
 
 ```
-internal/mcp/                  internal/web/
-├── server.go                  ├── server.go
-├── auth.go     ← TokenVerifier├── middleware/
-├── context.go  ← 身份注入 ctx ├── handlers/
-└── tools/                     ├── templates/   //go:embed
-    ├── memory.go              └── static/      //go:embed
-    ├── card.go
-    ├── space.go
-    ├── continuity.go
-    └── system.go
+internal/mcp/（已落地）          internal/web/（未开工）
+├── server.go   ← 工具注册       ├── server.go
+├── auth.go     ← TokenVerifier  ├── middleware/
+│                 + 身份注入 ctx ├── handlers/
+├── errors.go   ← 唯一的错误映射 ├── templates/   //go:embed
+├── knowledge.go← 编排骨架       └── static/      //go:embed
+├── whoami.go
+├── memory.go   ← Memory 6
+├── card.go     ← Card 5
+└── space.go    ← 空间 3 + 系统 2
 ```
+
+工具处理器同包不建子包的理由见 §1 的偏差说明。`continuity.go` 等 `domain/continuity`
+先落地。
 
 **铁律（`04-web-scope.md` §1.4）：两个 Host 都只调用 `domain/`，不允许任何一方持有对方的业务逻辑，也不允许 Host 直接触碰 `adapters/`。**
 

@@ -1,7 +1,7 @@
 # ClaraCore Server MCP 工具契约
 
 > 创建日期：2026-08-05
-> 状态：设计中，无代码
+> 状态：**16/20 已落地**（缺 Continuity 4 个）。落地状态与两处形态偏差见 §4 末尾
 > 前置文档：`01-architecture.md`、`02-data-model.md`
 >
 > **本文档是两条产品线的共同基准**：Desktop（JS）与 Server（Go）各自实现，工具名称、参数、语义保持一致。
