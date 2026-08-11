@@ -23,6 +23,7 @@ import (
 	"claracore-server/internal/adapters/embedding"
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
+	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/ingest"
@@ -111,6 +112,8 @@ func main() {
 	embedder := newEmbedder(cfg.Embedding)
 	knowStore := mysql.NewKnowledgeStore(db)
 	knowService := knowledge.NewService(knowStore, clock, ids, embedder)
+	activityStore := mysql.NewActivityStore(db)
+	activityService := activity.NewService(activityStore, clock, ids)
 
 	// 摄取是显式动作，与 -migrate 同一形态：跑完就退，不启动服务。
 	// 它天生幂等，可以反复跑——「源文档更新了要重扫」就是常态。
@@ -124,14 +127,14 @@ func main() {
 		return
 	}
 
-	mcpHost := mcphost.NewHost(govService, knowService, logger, mcphost.HostOptions{
+	mcpHost := mcphost.NewHost(govService, knowService, activityService, logger, mcphost.HostOptions{
 		Version:        version,
 		SemanticSearch: cfg.Embedding.Enabled(),
 	})
 
 	// Host B：治理面。与 MCP Host 并列，共用同一套领域服务——
 	// 「Web 专用的写入路径」是设计事故（docs/04-web-scope.md §1.4）。
-	webHost := web.NewHost(govService, knowService, logger, web.Options{
+	webHost := web.NewHost(govService, knowService, activityService, logger, web.Options{
 		Version:      version,
 		PublicMCPURL: cfg.Web.PublicMCPURL,
 		SecureCookie: cfg.Web.SecureCookie,
@@ -179,6 +182,11 @@ func main() {
 	indexerDone := make(chan struct{})
 	go runIndexer(ctx, knowService, cfg.Embedding, logger, indexerDone)
 
+	// 调用 trace 只保留 30 天；治理和元审计不走这条删除路径。
+	// worker 启动即清一次，之后每日清理，并跟随服务上下文退出。
+	traceCleanupDone := make(chan struct{})
+	go runTraceCleanup(ctx, activityService, clock, logger, traceCleanupDone)
+
 	go func() {
 		logger.Info("服务启动", "addr", cfg.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -196,6 +204,7 @@ func main() {
 		logger.Error("关闭超时", "error", err)
 	}
 	<-indexerDone
+	<-traceCleanupDone
 	logger.Info("已退出")
 }
 

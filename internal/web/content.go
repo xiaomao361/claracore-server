@@ -140,12 +140,13 @@ func (h *Host) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 		// 「还有 N 条待审」那个数字就失去意义了。
 		status = knowledge.CardDeprecated
 	default:
+		markWebAuditFailed(r)
 		http.Error(w, "未知的操作", http.StatusBadRequest)
 		return
 	}
 
 	triggers := splitTriggers(r.FormValue("triggers"))
-	_, err := h.know.UpdateCard(r.Context(), knowledge.UpdateCardInput{
+	updated, err := h.know.UpdateCard(r.Context(), knowledge.UpdateCardInput{
 		TenantID:       p.TenantID,
 		ID:             id,
 		WritableSpaces: h.writableSpaces(r),
@@ -162,11 +163,13 @@ func (h *Host) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 		RecallTriggers: &triggers,
 	})
 	if err != nil {
+		markWebAuditFailed(r)
 		// 校验失败（比如确认时「理解」栏还空着）要回到详情页并说清楚，
 		// 不能把人填的东西丢掉——那会让人不敢再点第二次
 		h.renderReviewError(w, r, id, userFacing(err, "保存失败"))
 		return
 	}
+	setWebAuditTarget(r, knowledge.EntityCard, updated.ID, updated.SpaceID)
 	http.Redirect(w, r, "/review", http.StatusSeeOther)
 }
 

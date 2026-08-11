@@ -136,6 +136,8 @@ type deleteOut struct {
 	// Note 说清楚这是软删除：agent 需要知道这条还能按 ID 取回来，
 	// 否则它会以为自己刚做了一件不可逆的事而不敢用这个工具。
 	Note string `json:"note"`
+	// spaceID 只给 Host 边界写活动记录，不进 MCP 协议输出。
+	spaceID platform.ID
 }
 
 func (h *Host) handleMemoriaDelete(ctx context.Context, _ *sdk.CallToolRequest, in memoriaDeleteInput) (*sdk.CallToolResult, deleteOut, error) {
@@ -143,13 +145,15 @@ func (h *Host) handleMemoriaDelete(ctx context.Context, _ *sdk.CallToolRequest, 
 	if err != nil {
 		return nil, deleteOut{}, toolError(h.logger, "memoria_delete", err)
 	}
-	if err := h.know.DeleteMemory(ctx, r.identity.TenantID, platform.ID(in.ID), r.writableSpaces()); err != nil {
+	deleted, err := h.know.DeleteMemory(ctx, r.identity.TenantID, platform.ID(in.ID), r.writableSpaces())
+	if err != nil {
 		return nil, deleteOut{}, toolError(h.logger, "memoria_delete", err)
 	}
 	return nil, deleteOut{
 		ID:      in.ID,
 		Deleted: true,
 		Note:    "软删除：不再进默认检索，但仍可按 ID 取回，也可用 memoria_update 把 status 改回 active",
+		spaceID: deleted.SpaceID,
 	}, nil
 }
 

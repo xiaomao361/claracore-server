@@ -1,0 +1,289 @@
+package web
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/governance"
+	"claracore-server/internal/platform"
+)
+
+const (
+	activityPageLimit     = 40
+	activityRecordTimeout = 2 * time.Second
+)
+
+// statusWriter records the final HTTP status without buffering or changing the
+// response. It lets the write middleware audit the real handler outcome.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+type webAuditStateKey struct{}
+
+type webAuditState struct {
+	EntityType string
+	EntityID   *platform.ID
+	SpaceID    *platform.ID
+	Failed     bool
+}
+
+func setWebAuditTarget(r *http.Request, entityType string, entityID, spaceID platform.ID) {
+	state, _ := r.Context().Value(webAuditStateKey{}).(*webAuditState)
+	if state == nil {
+		return
+	}
+	state.EntityType = entityType
+	if entityID != "" {
+		id := entityID
+		state.EntityID = &id
+	}
+	if spaceID != "" {
+		id := spaceID
+		state.SpaceID = &id
+	}
+}
+
+func markWebAuditFailed(r *http.Request) {
+	state, _ := r.Context().Value(webAuditStateKey{}).(*webAuditState)
+	if state != nil {
+		state.Failed = true
+	}
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *statusWriter) Status() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+// recordWebWrite is the single best-effort audit boundary for authenticated
+// browser writes. It stores only stable action and entity identifiers. Form
+// bodies are deliberately never serialized: they contain passwords, token
+// plaintext, titles, and card content.
+func (h *Host) recordWebWrite(r *http.Request, p governance.Principal, status int) {
+	if h.activity == nil {
+		return
+	}
+	action, entityType, entityID := webWriteDescriptor(r, p)
+	var spaceID *platform.ID
+	state, _ := r.Context().Value(webAuditStateKey{}).(*webAuditState)
+	if state != nil {
+		if state.EntityType != "" && state.EntityID != nil {
+			entityType, entityID = state.EntityType, state.EntityID
+		}
+		spaceID = state.SpaceID
+	}
+	outcome := activity.OutcomeSuccess
+	if status >= http.StatusBadRequest || (state != nil && state.Failed) {
+		outcome = activity.OutcomeError
+	}
+	// 业务写已经结束时，客户端断开不应该顺带取消治理记录。
+	// 去掉请求 cancel，但用短超时保证审计故障不会卡住响应。
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), activityRecordTimeout)
+	defer cancel()
+	_, err := h.activity.Record(recordCtx, activity.RecordInput{
+		TenantID:   p.TenantID,
+		UserID:     p.UserID,
+		Source:     activity.SourceWeb,
+		Kind:       activity.KindGovernance,
+		Access:     activity.AccessWrite,
+		Outcome:    outcome,
+		Action:     action,
+		EntityType: entityType,
+		EntityID:   entityID,
+		SpaceID:    spaceID,
+	})
+	if err != nil {
+		// The business write has already happened. Turning this into an HTTP
+		// failure would invite a retry and possibly duplicate the action.
+		h.logger.Error("记录 Web 活动失败", "action", action, "error", err)
+	}
+}
+
+func webWriteDescriptor(r *http.Request, p governance.Principal) (string, string, *platform.ID) {
+	var action, entityType string
+	var id platform.ID
+
+	switch r.Pattern {
+	case "POST /logout":
+		action = "session.logout"
+	case "POST /password":
+		action, entityType, id = "password.change", "user", p.UserID
+	case "POST /tokens":
+		action = "token.issue"
+	case "POST /tokens/revoke":
+		action, entityType, id = "token.revoke", "token", platform.ID(r.FormValue("id"))
+	case "POST /review/{id}":
+		action, entityType, id = "card.review", "card", platform.ID(r.PathValue("id"))
+	case "POST /admin/members":
+		action = "member.create"
+	case "POST /admin/members/status":
+		action, entityType, id = "member.status", "user", platform.ID(r.FormValue("id"))
+	case "POST /admin/members/reset":
+		action, entityType, id = "member.password_reset", "user", platform.ID(r.FormValue("id"))
+	case "POST /admin/audit":
+		action = "admin.audit.query"
+	default:
+		// A new authenticated write cannot silently disappear from audit just
+		// because its richer descriptor was not added yet.
+		action = "web.write"
+	}
+	if entityType == "" || id == "" {
+		return action, "", nil
+	}
+	return action, entityType, &id
+}
+
+type activityEventView struct {
+	Event    activity.Event
+	Own      bool
+	Metadata string
+}
+
+func eventViews(events []activity.Event, userID platform.ID) []activityEventView {
+	views := make([]activityEventView, 0, len(events))
+	for _, event := range events {
+		views = append(views, activityEventView{
+			Event:    event,
+			Own:      event.UserID == userID,
+			Metadata: string(event.Metadata),
+		})
+	}
+	return views
+}
+
+type activityPageData struct {
+	pageData
+	Events     []activityEventView
+	NextCursor string
+}
+
+func (h *Host) handleActivity(w http.ResponseWriter, r *http.Request) {
+	p, _ := principalFrom(r.Context())
+	data := activityPageData{pageData: h.page(r, "活动流", "activity")}
+
+	if h.activity == nil {
+		data.Error = "活动流暂时不可用"
+		h.render(w, "activity.html", data)
+		return
+	}
+
+	scope, err := h.gov.Scope(r.Context(), governance.Identity{TenantID: p.TenantID, UserID: p.UserID})
+	if err != nil {
+		data.Error = "读取空间信息失败"
+		h.logger.Error("活动流解析空间权限失败", "error", err)
+		h.render(w, "activity.html", data)
+		return
+	}
+	var shared []platform.ID
+	for _, access := range scope.All() {
+		if !access.CanRead {
+			continue
+		}
+		switch access.Space.Type {
+		case governance.SpaceTeam, governance.SpaceProject:
+			shared = append(shared, access.Space.ID)
+		}
+	}
+
+	page, err := h.activity.ListVisible(r.Context(), activity.ListVisibleInput{
+		TenantID:               p.TenantID,
+		UserID:                 p.UserID,
+		ReadableSharedSpaceIDs: shared,
+		Cursor:                 r.URL.Query().Get("cursor"),
+		Limit:                  activityPageLimit,
+	})
+	if err != nil {
+		data.Error = "读取活动流失败"
+		h.logger.Error("读取活动流失败", "error", err)
+		h.render(w, "activity.html", data)
+		return
+	}
+	data.Events = eventViews(page.Events, p.UserID)
+	data.NextCursor = page.NextCursor
+	h.render(w, "activity.html", data)
+}
+
+type auditConfirmData struct{ pageData }
+
+func (h *Host) handleAuditConfirm(w http.ResponseWriter, r *http.Request) {
+	data := auditConfirmData{pageData: h.page(r, "完整审计", "audit")}
+	h.render(w, "audit_confirm.html", data)
+}
+
+type auditPageData struct {
+	pageData
+	Events     []activityEventView
+	NextCursor string
+}
+
+func (h *Host) handleAudit(w http.ResponseWriter, r *http.Request) {
+	p, _ := principalFrom(r.Context())
+	if h.activity == nil {
+		h.renderAuditFailure(w, r, "审计服务暂时不可用")
+		return
+	}
+
+	// Fail closed: the complete audit query must never run unless its own
+	// meta-audit record has already been persisted.
+	metadata, _ := json.Marshal(map[string]string{"scope": "tenant", "confirmation": "explicit"})
+	if _, err := h.activity.Record(r.Context(), activity.RecordInput{
+		TenantID: p.TenantID,
+		UserID:   p.UserID,
+		Source:   activity.SourceWeb,
+		Kind:     activity.KindMetaAudit,
+		Access:   activity.AccessRead,
+		Outcome:  activity.OutcomeSuccess,
+		Action:   "admin.audit.query",
+		Metadata: metadata,
+	}); err != nil {
+		h.logger.Error("记录管理员审计查询失败", "error", err)
+		h.renderAuditFailure(w, r, "无法记录本次审计查询，已拒绝展示完整日志")
+		return
+	}
+
+	page, err := h.activity.ListAdmin(r.Context(), activity.ListAdminInput{
+		TenantID: p.TenantID,
+		Cursor:   r.FormValue("cursor"),
+		Limit:    activityPageLimit,
+	})
+	if err != nil {
+		h.logger.Error("读取完整审计日志失败", "error", err)
+		h.renderAuditFailure(w, r, "读取完整审计日志失败")
+		return
+	}
+	data := auditPageData{
+		pageData:   h.page(r, "完整审计", "audit"),
+		Events:     eventViews(page.Events, p.UserID),
+		NextCursor: page.NextCursor,
+	}
+	h.render(w, "audit.html", data)
+}
+
+func (h *Host) renderAuditFailure(w http.ResponseWriter, r *http.Request, message string) {
+	data := auditConfirmData{pageData: h.page(r, "完整审计", "audit")}
+	data.Error = message
+	w.WriteHeader(http.StatusInternalServerError)
+	h.render(w, "audit_confirm.html", data)
+}

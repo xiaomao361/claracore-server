@@ -1,0 +1,10 @@
+{{define "content"}}
+<section class="card narrow audit-confirm">
+  <h2>这是受约束的完整审计入口</h2>
+  <p>继续后会展示本租户的完整活动，包括成员的读取与召回记录。查询动作本身会先写入不可删除的 meta-audit；若写入失败，本次查询会被拒绝。</p>
+  <form method="post" action="/admin/audit">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button>确认并查看完整审计</button>
+  </form>
+</section>
+{{end}}

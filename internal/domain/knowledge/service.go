@@ -188,15 +188,14 @@ func (s *Service) UpdateMemory(ctx context.Context, in UpdateMemoryInput) (Memor
 //
 // 硬删会让指向它的 link 变成悬空引用——多态引用没有外键能拦住这件事。
 // 软删之后仍可按 ID 取到，只是不进默认检索。
-func (s *Service) DeleteMemory(ctx context.Context, tenantID, id platform.ID, writableSpaces []platform.ID) error {
+func (s *Service) DeleteMemory(ctx context.Context, tenantID, id platform.ID, writableSpaces []platform.ID) (Memory, error) {
 	deleted := MemoryDeleted
-	_, err := s.UpdateMemory(ctx, UpdateMemoryInput{
+	return s.UpdateMemory(ctx, UpdateMemoryInput{
 		TenantID:       tenantID,
 		ID:             id,
 		WritableSpaces: writableSpaces,
 		Status:         &deleted,
 	})
-	return err
 }
 
 // ---------------------------------------------------------------------------

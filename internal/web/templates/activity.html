@@ -1,0 +1,23 @@
+{{define "content"}}
+<p class="hint">这里完整展示你自己的 agent 读写；同事只会看到共享空间里的写入。个人空间活动与他人的读取/召回不会出现在你的时间线里。</p>
+<div class="timeline">
+{{range .Events}}
+  <article class="activity-item">
+    <div class="activity-head">
+      <time>{{stamp .Event.CreatedAt}}</time>
+      <span class="tag">{{.Event.Source}}</span>
+      <span class="tag {{.Event.Access}}">{{.Event.Access}}</span>
+      {{if eq .Event.Outcome "error"}}<span class="tag outcome-error">error</span>{{end}}
+    </div>
+    <strong><code>{{.Event.Action}}</code></strong>
+    <p class="activity-actor">{{if .Own}}我的活动{{else}}共享空间成员 {{.Event.UserID}}{{end}}{{if .Event.AgentID}} · agent {{.Event.AgentID}}{{end}}</p>
+    {{if .Event.EntityID}}<p>对象：<code>{{.Event.EntityType}}/{{.Event.EntityID}}</code></p>{{end}}
+    {{if .Event.SpaceID}}<p>空间：<code>{{.Event.SpaceID}}</code></p>{{end}}
+    {{if .Metadata}}<pre class="activity-meta">{{.Metadata}}</pre>{{end}}
+  </article>
+{{else}}
+  <p class="empty-state">还没有可见活动。</p>
+{{end}}
+</div>
+{{if .NextCursor}}<p><a href="/activity?cursor={{.NextCursor}}">更早的活动 →</a></p>{{end}}
+{{end}}

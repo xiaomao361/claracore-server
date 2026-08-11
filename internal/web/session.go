@@ -111,14 +111,39 @@ func (h *Host) requireUser(next http.Handler) http.Handler {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
+		write := isWrite(r)
+		ctx := context.WithValue(r.Context(), principalKey{}, p)
+		if write {
+			// Base recording stays centralized here. Handlers may enrich this
+			// request-local target after a successful domain call.
+			ctx = context.WithValue(ctx, webAuditStateKey{}, &webAuditState{})
+		}
+
 		// 写操作一律校 CSRF。放在中间件里而不是每个 handler 各判一次：
 		// 少判一次不会有编译错误，只会有一个可以被跨站触发的写接口。
-		if isWrite(r) && !checkCSRF(r, token) {
+		if write && !checkCSRF(r, token) {
+			authenticated := r.WithContext(ctx)
 			h.logger.Warn("CSRF 校验失败", "path", r.URL.Path, "user", p.UserID)
+			markWebAuditFailed(authenticated)
+			h.recordWebWrite(authenticated, p, http.StatusForbidden)
 			http.Error(w, "表单已过期，请刷新页面后重试", http.StatusForbidden)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
+		// checkCSRF 会解析表单，所以要在它之后再复制 Request；
+		// 否则副本看不到已解析的 Form，body 又已经被读完。
+		authenticated := r.WithContext(ctx)
+		if write {
+			captured := &statusWriter{ResponseWriter: w}
+			next.ServeHTTP(captured, authenticated)
+			// The full administrator audit query has a stronger contract: its
+			// meta-audit row is written synchronously before the query runs. Do
+			// not add a second best-effort governance row here.
+			if r.Pattern != "POST /admin/audit" {
+				h.recordWebWrite(authenticated, p, captured.Status())
+			}
+			return
+		}
+		next.ServeHTTP(w, authenticated)
 	})
 }
 
@@ -130,6 +155,7 @@ func (h *Host) requirePasswordSet(next http.Handler) http.Handler {
 	return h.requireUser(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, _ := principalFrom(r.Context())
 		if p.MustChangePassword {
+			markWebAuditFailed(r)
 			http.Redirect(w, r, "/password", http.StatusSeeOther)
 			return
 		}

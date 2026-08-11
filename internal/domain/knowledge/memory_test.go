@@ -299,8 +299,12 @@ func TestDeleteMemoryIsSoft(t *testing.T) {
 	ctx := context.Background()
 	m := seedMemory(t, svc, spacePriv)
 
-	if err := svc.DeleteMemory(ctx, tenantA, m.ID, mySpaces()); err != nil {
+	deleted, err := svc.DeleteMemory(ctx, tenantA, m.ID, mySpaces())
+	if err != nil {
 		t.Fatal(err)
+	}
+	if deleted.ID != m.ID || deleted.SpaceID != m.SpaceID || deleted.Status != MemoryDeleted {
+		t.Fatalf("软删除应返回已解析的最终内容: %+v", deleted)
 	}
 	if _, ok := store.memories[m.ID]; !ok {
 		t.Fatal("软删除不该真的删行")

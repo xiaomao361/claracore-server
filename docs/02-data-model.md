@@ -1,7 +1,7 @@
 # ClaraCore Server 数据模型与空间权限设计
 
 > 创建日期：2026-08-05
-> 状态：**已落地**（0001–0003 迁移已应用）。落地时的偏差在正文中就地标注，以 `migrations/` 为准
+> 状态：**已落地**（0001–0006 已应用到 development MySQL；`make itest` 已验证实际结构与 SQL 契约）。落地时的偏差在正文中就地标注，以 `migrations/` 为准
 > 前置文档：`01-architecture.md`
 
 ---
@@ -412,7 +412,9 @@ CREATE TABLE links (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
-### 7.3 运行时域
+### 7.3 运行时与审计记录
+
+`audit_logs` 物理上合并承载调用 trace、治理审计与管理员查询的 meta-audit，但通过 `kind` 保持不同保留策略：只有 `trace` 可进入 30 天清理路径，`governance` 与 `meta_audit` 长期保留。普通成员的可见性不存成一列，也不在模板层过滤；MySQL 查询直接返回「本人全部活动 + 调用者可读共享空间里的他人写入」。
 
 ```sql
 -- ⚠️ 下面是**草案**。实际以 migrations/0003_embeddings.sql 为准，
@@ -439,22 +441,33 @@ CREATE TABLE embeddings (
   KEY idx_emb_hash (content_hash)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- 2026-08-11 已落成 migrations/0006_audit_logs.sql。
+-- 与早期草案相比，真实迁移补齐了来源、保留类型、读写分类、结果分类，
+-- 并把 user_id 收紧为 NOT NULL：第一版只记录已认证主体的动作。
 CREATE TABLE audit_logs (
-  id            CHAR(26)     NOT NULL,
-  tenant_id     CHAR(26)     NOT NULL,
-  user_id       CHAR(26)         NULL,
-  agent_id      CHAR(26)         NULL,       -- 审计维度的唯一用途
+  id            CHAR(26)     CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  tenant_id     CHAR(26)     CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  user_id       CHAR(26)     CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  agent_id      CHAR(26)     CHARACTER SET ascii COLLATE ascii_bin NULL,
+  source        VARCHAR(16)  NOT NULL,       -- mcp | web
+  kind          VARCHAR(24)  NOT NULL,       -- trace | governance | meta_audit
+  access        VARCHAR(16)  NOT NULL,       -- read | write
+  outcome       VARCHAR(16)  NOT NULL,       -- success | error
   action        VARCHAR(64)  NOT NULL,
   entity_type   VARCHAR(24)      NULL,
-  entity_id     CHAR(26)         NULL,
-  space_id      CHAR(26)         NULL,
+  entity_id     CHAR(26)     CHARACTER SET ascii COLLATE ascii_bin NULL,
+  space_id      CHAR(26)     CHARACTER SET ascii COLLATE ascii_bin NULL,
   metadata      JSON             NULL,
   created_at    DATETIME(3)  NOT NULL,
   PRIMARY KEY (id),
-  KEY idx_audit_tenant_created (tenant_id, created_at),
-  KEY idx_audit_entity (entity_type, entity_id)
+  KEY idx_audit_tenant_created (tenant_id, created_at, id),
+  KEY idx_audit_user_created (tenant_id, user_id, created_at, id),
+  KEY idx_audit_space_write (tenant_id, space_id, access, created_at, id),
+  KEY idx_audit_trace_retention (kind, created_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
+
+> **0006 的实现边界**：`metadata` 不是任意请求/响应快照。Host 只允许 ID、命中计数与语义标志等安全字段；query、situation、正文、密码、token 与错误文本不能写入。可选 ID 不符合定长 ASCII 存储形状时只丢目标维度，metadata 超过 8 KiB 时只丢补充信息，两者都不能让主 action/outcome 事件丢失。管理员完整查询必须先成功写入 `meta_audit`，否则拒绝查询。0811 的 `make migrate` 与 `make itest` 已验证开发 MySQL 上的实际结构、可见性、分页与清理契约。
 
 > `shared_line`（Continuity）表结构从 Desktop 契约平移，待 `03-mcp-contract.md` 对齐工具语义后补充。
 

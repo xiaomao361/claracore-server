@@ -37,21 +37,22 @@
 ```
 claracore-server/
 ├── cmd/
-│   └── server/main.go          # 唯一入口：装配 + 优雅关闭 + -migrate + 索引 worker
+│   └── server/main.go          # 唯一入口：装配 + 优雅关闭 + -migrate + 两类后台 worker
 ├── internal/                   # Go 编译期强制封装，外部无法 import
 │   ├── config/                 # 唯一读环境变量的地方
 │   ├── domain/                 # 领域层：不依赖任何基础设施
 │   │   ├── governance/         # 身份、token、空间权限、登录会话
 │   │   ├── knowledge/          # memory / card / 检索 / 索引队列 / 摄取 / 列表
+│   │   ├── activity/           # 活动分类、记录、可见性分页、trace 清理契约
 │   │   └── continuity/         # ← 尚未开工（shared_line）
 │   ├── ports/                  # 纯基础设施接口（embedder / hasher / sessionstore）
-│   ├── adapters/               # mysql/ + embedding/ + crypto/
-│   ├── mcp/                    # Host A：16 个工具
-│   ├── web/                    # Host B：登录 / 成员 / token / 概览
+│   ├── adapters/               # mysql/（含 activity Store）+ embedding/ + crypto/
+│   ├── mcp/                    # Host A：16 个工具 + 统一活动装饰器
+│   ├── web/                    # Host B：治理、内容、活动流与完整审计
 │   ├── ingest/                 # Markdown 目录源（不提炼）
 │   └── platform/               # 横切：ID / 时钟
 ├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时
-│                               # 0004 会话 / 0005 摄取（0006 审计日志待做）
+│                               # 0004 会话 / 0005 摄取 / 0006 活动与审计日志
 ├── docs/                       # 01–05 设计文档
 ├── test/                       # 架构测试、schema 测试、端到端集成测试
 ├── Makefile
@@ -95,12 +96,15 @@ internal/domain/
 │   ├── promote.go           # 提升（复制）
 │   ├── search.go            # 两段式检索编排
 │   └── service.go
+├── activity/                # 已认证主体的活动与审计
+│   ├── activity.go          # Event、分类常量、Store / 查询契约
+│   └── service.go           # 校验、keyset 分页、trace 有界清理
 └── continuity/
     ├── shared_line.go
     └── service.go
 ```
 
-对应 `02-data-model.md` §1 的三域划分（运行时域不是领域概念，落在 `adapters/` 与 `platform/`）。
+对应 `02-data-model.md` §1 的三域划分。`activity` 是一条刻意独立的应用域边界：它定义事件分类、普通成员可见性查询契约与保留策略，但不 import `governance`；Host 先把治理层解析出的可读共享空间 ID 作为值传入。真正的 SQL 与持久化仍只在 adapter。
 
 ### 2.2 域之间不互相 import
 
@@ -170,6 +174,7 @@ internal/ports/
 internal/domain/governance/store.go   → type Store interface { ... }
 internal/domain/knowledge/store.go    → type Store interface { ... }
 internal/domain/knowledge/source.go   → type ExternalSource interface { ... }
+internal/domain/activity/activity.go  → type Store interface { ... }
 ```
 
 **依赖方向因此变成**：
@@ -177,6 +182,7 @@ internal/domain/knowledge/source.go   → type ExternalSource interface { ... }
 ```
 adapters/mysql ──implements──▶ domain/governance.Store
                                domain/knowledge.Store
+                               domain/activity.Store
 ```
 
 即 `adapters` 依赖 `domain`，而 `domain` 不依赖任何人——这才是干净的依赖倒置。装配在 `cmd/server/main.go` 完成。
@@ -217,7 +223,8 @@ internal/mcp/（已落地）          internal/web/（已落地）
 ├── auth.go     ← TokenVerifier  ├── session.go  ← cookie / CSRF / 中间件
 │                 + 身份注入 ctx ├── handlers.go ← 登录/概览/token/成员
 ├── errors.go   ← 唯一的错误映射 ├── content.go  ← 审核 + 浏览
-├── knowledge.go← 编排骨架       ├── templates/  //go:embed
+├── knowledge.go← 编排骨架       ├── activity.go ← 写审计/活动流/管理员审计
+├── activity.go ← 统一工具审计   ├── templates/  //go:embed
 │                               └── static/     //go:embed
 ├── whoami.go
 ├── memory.go   ← Memory 6
@@ -233,13 +240,14 @@ internal/mcp/（已落地）          internal/web/（已落地）
 
 **铁律（`04-web-scope.md` §1.4）：两个 Host 都只调用 `domain/`，不允许任何一方持有对方的业务逻辑，也不允许 Host 直接触碰 `adapters/`。**
 
-Host 层的职责严格限定为三件事：
+Host 层的职责严格限定为四件事：
 
 1. 协议解码（MCP 参数 / HTTP 表单）
 2. 身份解析与权限装配（token/session → `SpaceScope`）
 3. 结果编码（JSON / HTML）
+4. 在已认证的传输边界生成活动事件（MCP 统一装饰器 / Web 写中间件），只把安全的 ID、计数和结果分类交给 `domain/activity`
 
-任何 `if` 业务判断出现在 Host 层，都是应该下沉到 domain 的信号。
+任何 `if` 业务判断出现在 Host 层，都是应该下沉到 domain 的信号。活动埋点是边界事实而非知识/治理业务规则：只有 Host 同时知道认证主体、协议动作与最终结果；因此不把 MCP 工具名或 HTTP 路由反向塞进 knowledge/governance。
 
 ---
 

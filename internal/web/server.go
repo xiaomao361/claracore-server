@@ -7,8 +7,8 @@
 //
 // Web 的第一职责不是「管理」，而是**消除黑盒**（04 §1.1）：团队版里
 // 成员看不见 agent 在读什么写什么，而黑盒的直接后果是没人敢把团队知识
-// 放进来。这一版先把「人能进得来、能发 token、能管账号」这条闭环做通，
-// 可见性页面（内容浏览、活动流、卡片审核）是下一刀。
+// 放进来。当前已经打通登录/接入/成员治理、内容浏览与卡片审核，并通过
+// /activity 和受二次确认 + meta-audit 约束的 /admin/audit 补齐活动可见性。
 package web
 
 import (
@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"time"
 
+	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
@@ -70,6 +71,15 @@ type knowledgeService interface {
 	UpdateCard(ctx context.Context, in knowledge.UpdateCardInput) (knowledge.Card, error)
 }
 
+// activityService is the Web host's narrow view of the activity domain.
+// Ordinary visibility is already reduced to resolved shared-space IDs before
+// it crosses this interface; the MySQL adapter applies the actual predicate.
+type activityService interface {
+	Record(ctx context.Context, in activity.RecordInput) (activity.Event, error)
+	ListVisible(ctx context.Context, in activity.ListVisibleInput) (activity.Page, error)
+	ListAdmin(ctx context.Context, in activity.ListAdminInput) (activity.Page, error)
+}
+
 type Options struct {
 	Version string
 	// PublicMCPURL 是给用户复制的 MCP 连接地址。
@@ -86,10 +96,11 @@ type Options struct {
 }
 
 type Host struct {
-	gov    governanceService
-	know   knowledgeService
-	logger *slog.Logger
-	opts   Options
+	gov      governanceService
+	know     knowledgeService
+	activity activityService
+	logger   *slog.Logger
+	opts     Options
 	// tmpl 是**每个页面一套模板**，不是一个大集合。
 	//
 	// 全部文件 ParseFS 进同一个 Template 时，各页面的 {{define "content"}}
@@ -99,12 +110,13 @@ type Host struct {
 	tmpl map[string]*template.Template
 }
 
-func NewHost(gov governanceService, know knowledgeService, logger *slog.Logger, opts Options) *Host {
+func NewHost(gov governanceService, know knowledgeService, activity activityService, logger *slog.Logger, opts Options) *Host {
 	return &Host{
-		gov:    gov,
-		know:   know,
-		logger: logger,
-		opts:   opts,
+		gov:      gov,
+		know:     know,
+		activity: activity,
+		logger:   logger,
+		opts:     opts,
 		// 模板在启动时一次性解析：解析失败是装配错误，该在启动时炸，
 		// 而不是等某个人点开某个页面时才 500。
 		tmpl: parseTemplates(),
@@ -116,6 +128,7 @@ func NewHost(gov governanceService, know knowledgeService, logger *slog.Logger, 
 var pages = []string{
 	"login.html", "password.html", "overview.html", "tokens.html", "members.html",
 	"review.html", "review_detail.html", "browse.html", "browse_detail.html",
+	"activity.html", "audit_confirm.html", "audit.html",
 }
 
 func parseTemplates() map[string]*template.Template {
@@ -147,7 +160,7 @@ func (h *Host) Handler() http.Handler {
 
 	mux.HandleFunc("GET /login", h.handleLoginPage)
 	mux.HandleFunc("POST /login", h.handleLogin)
-	mux.HandleFunc("POST /logout", h.handleLogout)
+	mux.Handle("POST /logout", h.requireUser(http.HandlerFunc(h.handleLogout)))
 
 	// 改密页只要求「已登录」，不要求「已改密」——否则强制改密的人
 	// 会被自己的中间件挡在改密页外面，形成一个谁也进不去的死锁。
@@ -168,11 +181,14 @@ func (h *Host) Handler() http.Handler {
 
 	mux.Handle("GET /browse", h.requirePasswordSet(http.HandlerFunc(h.handleBrowse)))
 	mux.Handle("GET /browse/{id}", h.requirePasswordSet(http.HandlerFunc(h.handleBrowseDetail)))
+	mux.Handle("GET /activity", h.requirePasswordSet(http.HandlerFunc(h.handleActivity)))
 
 	mux.Handle("GET /admin/members", h.requireAdmin(http.HandlerFunc(h.handleMembersPage)))
 	mux.Handle("POST /admin/members", h.requireAdmin(http.HandlerFunc(h.handleMemberCreate)))
 	mux.Handle("POST /admin/members/status", h.requireAdmin(http.HandlerFunc(h.handleMemberStatus)))
 	mux.Handle("POST /admin/members/reset", h.requireAdmin(http.HandlerFunc(h.handleMemberReset)))
+	mux.Handle("GET /admin/audit", h.requireAdmin(http.HandlerFunc(h.handleAuditConfirm)))
+	mux.Handle("POST /admin/audit", h.requireAdmin(http.HandlerFunc(h.handleAudit)))
 
 	return securityHeaders(mux)
 }

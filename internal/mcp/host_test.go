@@ -98,7 +98,7 @@ func newTestHost(t *testing.T) (*httptest.Server, *fakeGov) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, newFakeKnow(), logger, HostOptions{Version: "test"}).Handler())
+	srv := httptest.NewServer(NewHost(gov, newFakeKnow(), newFakeActivity(), logger, HostOptions{Version: "test"}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, gov
 }
@@ -107,6 +107,10 @@ func newTestHost(t *testing.T) (*httptest.Server, *fakeGov) {
 // 让工具层的测试能断言「Host 到底往领域层传了什么」——那才是这一层
 // 唯一该被测的东西。
 func newToolHost(t *testing.T) (*httptest.Server, *fakeKnow) {
+	return newToolHostWithActivity(t, newFakeActivity())
+}
+
+func newToolHostWithActivity(t *testing.T, activities activityService) (*httptest.Server, *fakeKnow) {
 	t.Helper()
 	owner := platform.ID(userClar)
 	gov := &fakeGov{
@@ -137,7 +141,7 @@ func newToolHost(t *testing.T) (*httptest.Server, *fakeKnow) {
 	}
 	know := newFakeKnow()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, know, logger, HostOptions{Version: "test", SemanticSearch: true}).Handler())
+	srv := httptest.NewServer(NewHost(gov, know, activities, logger, HostOptions{Version: "test", SemanticSearch: true}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, know
 }
@@ -343,7 +347,7 @@ func TestAuthFailuresAreIndistinguishable(t *testing.T) {
 	for _, reason := range reasons {
 		failing := &failingGov{err: reason}
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-		s := httptest.NewServer(NewHost(failing, newFakeKnow(), logger, HostOptions{Version: "test"}).Handler())
+		s := httptest.NewServer(NewHost(failing, newFakeKnow(), newFakeActivity(), logger, HostOptions{Version: "test"}).Handler())
 
 		resp := call(t, s, "ccs_whatever", "tools/call",
 			map[string]any{"name": "whoami", "arguments": map[string]any{}})

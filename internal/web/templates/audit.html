@@ -1,0 +1,29 @@
+{{define "content"}}
+<p class="alert notice">本次完整审计查询已经记录。这里包含读取行为，只用于明确的安全审计场景。</p>
+<div class="table-scroll">
+<table class="grid audit-grid">
+  <thead><tr><th>时间</th><th>主体</th><th>来源</th><th>动作</th><th>对象 / 空间</th><th>结果</th></tr></thead>
+  <tbody>
+  {{range .Events}}
+    <tr>
+      <td>{{stamp .Event.CreatedAt}}</td>
+      <td><code>{{.Event.UserID}}</code>{{if .Event.AgentID}}<br><small>agent {{.Event.AgentID}}</small>{{end}}</td>
+      <td>{{.Event.Source}} / {{.Event.Kind}} / {{.Event.Access}}</td>
+      <td><code>{{.Event.Action}}</code>{{if .Metadata}}<pre class="activity-meta">{{.Metadata}}</pre>{{end}}</td>
+      <td>{{if .Event.EntityID}}<code>{{.Event.EntityType}}/{{.Event.EntityID}}</code>{{else}}—{{end}}{{if .Event.SpaceID}}<br><small>space {{.Event.SpaceID}}</small>{{end}}</td>
+      <td>{{.Event.Outcome}}</td>
+    </tr>
+  {{else}}
+    <tr><td colspan="6" class="empty">没有审计记录。</td></tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{if .NextCursor}}
+<form method="post" action="/admin/audit" class="pager">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="cursor" value="{{.NextCursor}}">
+  <button>更早的记录 →</button>
+</form>
+{{end}}
+{{end}}

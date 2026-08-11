@@ -25,6 +25,7 @@ import (
 
 	"claracore-server/internal/adapters/crypto"
 	"claracore-server/internal/adapters/mysql"
+	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	mcphost "claracore-server/internal/mcp"
@@ -54,6 +55,7 @@ func TestMCPWhoAmIEndToEnd(t *testing.T) {
 	tenantID := provisioned.Tenant.ID
 	t.Cleanup(func() {
 		for _, stmt := range []string{
+			`DELETE FROM audit_logs WHERE tenant_id = ?`,
 			`DELETE FROM tokens WHERE tenant_id = ?`,
 			`DELETE FROM agents WHERE tenant_id = ?`,
 			`DELETE FROM space_permissions WHERE space_id IN (SELECT id FROM spaces WHERE tenant_id = ?)`,
@@ -84,7 +86,8 @@ func TestMCPWhoAmIEndToEnd(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(mcphost.NewHost(svc, knowledge.NewService(mysql.NewKnowledgeStore(db), clock, ids, nil), logger, mcphost.HostOptions{Version: "e2e"}).Handler())
+	activityService := activity.NewService(mysql.NewActivityStore(db), clock, ids)
+	srv := httptest.NewServer(mcphost.NewHost(svc, knowledge.NewService(mysql.NewKnowledgeStore(db), clock, ids, nil), activityService, logger, mcphost.HostOptions{Version: "e2e"}).Handler())
 	t.Cleanup(srv.Close)
 
 	t.Run("真实 token 换到真实身份与空间", func(t *testing.T) {
@@ -134,6 +137,19 @@ func TestMCPWhoAmIEndToEnd(t *testing.T) {
 		}
 		if found.LastUsedAt == nil {
 			t.Error("调用过之后 last_used_at 仍为空——认证路径没有 touch")
+		}
+	})
+
+	t.Run("工具调用写入真实活动流", func(t *testing.T) {
+		var count int
+		if err := db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM audit_logs WHERE tenant_id = ? AND action = 'whoami' AND outcome = 'success'`,
+			string(tenantID),
+		).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("一次成功的 whoami 应留下一条活动记录，实际 %d", count)
 		}
 	})
 

@@ -106,6 +106,7 @@ func (h *Host) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.gov.Logout(r.Context(), token); err != nil {
+		markWebAuditFailed(r)
 		h.logger.Error("登出失败", "error", err)
 	}
 	h.clearSessionCookie(w)
@@ -130,12 +131,14 @@ func (h *Host) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 
 	oldPw, newPw, confirm := r.FormValue("current"), r.FormValue("new"), r.FormValue("confirm")
 	if newPw != confirm {
+		markWebAuditFailed(r)
 		data.Error = "两次输入的新密码不一致"
 		h.render(w, "password.html", data)
 		return
 	}
 
 	if err := h.gov.ChangePassword(r.Context(), p.TenantID, p.UserID, oldPw, newPw); err != nil {
+		markWebAuditFailed(r)
 		data.Error = userFacing(err, "当前密码不正确")
 		h.render(w, "password.html", data)
 		return
@@ -239,6 +242,7 @@ func (h *Host) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 
 	slug, name := r.FormValue("agent"), r.FormValue("name")
 	if slug == "" || name == "" {
+		markWebAuditFailed(r)
 		data.Error = "agent 标识与设备名都要填"
 		h.renderTokens(w, r, data)
 		return
@@ -249,24 +253,29 @@ func (h *Host) handleTokenCreate(w http.ResponseWriter, r *http.Request) {
 	// ErrAlreadyExists——那正是想要的反馈「你已经有一个叫 clara 的 agent 了」。
 	agent, err := h.gov.CreateAgent(r.Context(), p.TenantID, p.UserID, slug, name)
 	if errors.Is(err, governance.ErrAlreadyExists) {
+		markWebAuditFailed(r)
 		data.Error = fmt.Sprintf("你已经有一个标识为 %q 的 agent，换一个标识，或者复用它已有的 token", slug)
 		h.renderTokens(w, r, data)
 		return
 	}
 	if err != nil {
+		markWebAuditFailed(r)
 		data.Error = userFacing(err, "创建 agent 失败")
 		h.renderTokens(w, r, data)
 		return
 	}
 
-	plaintext, _, err := h.gov.IssueToken(r.Context(), governance.IssueTokenInput{
+	plaintext, issued, err := h.gov.IssueToken(r.Context(), governance.IssueTokenInput{
 		TenantID: p.TenantID, UserID: p.UserID, AgentID: agent.ID, Name: name,
 	})
 	if err != nil {
+		markWebAuditFailed(r)
+		setWebAuditTarget(r, "agent", agent.ID, "")
 		data.Error = userFacing(err, "签发 token 失败")
 		h.renderTokens(w, r, data)
 		return
 	}
+	setWebAuditTarget(r, "token", issued.ID, "")
 
 	data.NewToken = plaintext
 	data.MCPSnippet = mcpSnippet(h.opts.PublicMCPURL, plaintext)
@@ -283,6 +292,7 @@ func (h *Host) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	tokenID := platform.ID(r.FormValue("id"))
 	mine, err := h.gov.ListTokens(r.Context(), p.TenantID, p.UserID)
 	if err != nil {
+		markWebAuditFailed(r)
 		http.Error(w, "读取 token 列表失败", http.StatusInternalServerError)
 		return
 	}
@@ -294,13 +304,19 @@ func (h *Host) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !owned {
+		markWebAuditFailed(r)
 		// 不确认「这个 token 存在但不是你的」
 		http.NotFound(w, r)
 		return
 	}
 
 	if err := h.gov.RevokeToken(r.Context(), p.TenantID, tokenID); err != nil {
+		markWebAuditFailed(r)
 		h.logger.Error("吊销 token 失败", "error", err)
+		data := tokensPageData{pageData: h.page(r, "我的接入", "tokens")}
+		data.Error = "吊销 token 失败"
+		h.renderTokens(w, r, data)
+		return
 	}
 	http.Redirect(w, r, "/tokens", http.StatusSeeOther)
 }
@@ -357,6 +373,7 @@ func (h *Host) handleMemberCreate(w http.ResponseWriter, r *http.Request) {
 	username, display, role := r.FormValue("username"), r.FormValue("display"), r.FormValue("role")
 	password, err := generatePassword()
 	if err != nil {
+		markWebAuditFailed(r)
 		data.Error = "生成初始密码失败"
 		h.renderMembers(w, r, data)
 		return
@@ -369,15 +386,18 @@ func (h *Host) handleMemberCreate(w http.ResponseWriter, r *http.Request) {
 		Password: password, Role: role,
 	})
 	if errors.Is(err, governance.ErrAlreadyExists) {
+		markWebAuditFailed(r)
 		data.Error = fmt.Sprintf("账号 %q 已经存在", username)
 		h.renderMembers(w, r, data)
 		return
 	}
 	if err != nil {
+		markWebAuditFailed(r)
 		data.Error = userFacing(err, "创建账号失败")
 		h.renderMembers(w, r, data)
 		return
 	}
+	setWebAuditTarget(r, "user", user.ID, "")
 
 	data.NewPassword = password
 	data.ForUser = user.Username
@@ -393,6 +413,7 @@ func (h *Host) handleMemberStatus(w http.ResponseWriter, r *http.Request) {
 	// 不许停用自己：管理员把自己关在门外之后没有恢复路径
 	// （无自助注册、没有第二个入口）。这不是业务规则，是一道操作护栏。
 	if target == p.UserID {
+		markWebAuditFailed(r)
 		data := membersPageData{pageData: h.page(r, "成员管理", "members")}
 		data.Error = "不能停用自己的账号——没有别的入口能把你放回来"
 		h.renderMembers(w, r, data)
@@ -400,6 +421,7 @@ func (h *Host) handleMemberStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.gov.SetUserStatus(r.Context(), p.TenantID, target, status); err != nil {
+		markWebAuditFailed(r)
 		data := membersPageData{pageData: h.page(r, "成员管理", "members")}
 		data.Error = userFacing(err, "更新账号状态失败")
 		h.renderMembers(w, r, data)
@@ -415,11 +437,13 @@ func (h *Host) handleMemberReset(w http.ResponseWriter, r *http.Request) {
 
 	password, err := generatePassword()
 	if err != nil {
+		markWebAuditFailed(r)
 		data.Error = "生成初始密码失败"
 		h.renderMembers(w, r, data)
 		return
 	}
 	if err := h.gov.ResetPassword(r.Context(), p.TenantID, target, password); err != nil {
+		markWebAuditFailed(r)
 		data.Error = userFacing(err, "重置密码失败")
 		h.renderMembers(w, r, data)
 		return

@@ -27,6 +27,7 @@ import (
 	"claracore-server/internal/adapters/embedding"
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
+	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	mcphost "claracore-server/internal/mcp"
@@ -80,6 +81,7 @@ func newToolEnv(t *testing.T) toolEnv {
 	t.Cleanup(func() {
 		bg := context.Background()
 		for _, stmt := range []string{
+			`DELETE FROM audit_logs WHERE tenant_id = ?`,
 			`DELETE FROM embeddings WHERE tenant_id = ?`,
 			`DELETE FROM card_recall_triggers WHERE tenant_id = ?`,
 			`DELETE FROM labels WHERE tenant_id = ?`,
@@ -124,8 +126,9 @@ func newToolEnv(t *testing.T) toolEnv {
 	}
 
 	know := knowledge.NewService(mysql.NewKnowledgeStore(db), clock, ids, embedder)
+	activityService := activity.NewService(mysql.NewActivityStore(db), clock, ids)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(mcphost.NewHost(gov, know, logger, mcphost.HostOptions{
+	srv := httptest.NewServer(mcphost.NewHost(gov, know, activityService, logger, mcphost.HostOptions{
 		Version: "tools-e2e", SemanticSearch: embedder != nil,
 	}).Handler())
 	t.Cleanup(srv.Close)

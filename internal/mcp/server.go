@@ -6,6 +6,8 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"claracore-server/internal/domain/activity"
 )
 
 // serverName 是 MCP initialize 响应里的服务端标识。
@@ -16,10 +18,11 @@ const serverName = "claracore-server"
 // 它持有领域服务与日志，不持有数据库连接——存储对这一层不可见
 // （test/arch_test.go 会拦住 internal/mcp → internal/adapters 的 import）。
 type Host struct {
-	gov     governanceService
-	know    knowledgeService
-	logger  *slog.Logger
-	version string
+	gov      governanceService
+	know     knowledgeService
+	activity activityService
+	logger   *slog.Logger
+	version  string
 
 	// semanticSearch 只用于 server_status 的自述，不影响任何行为。
 	// 检索该不该用向量由 knowledge.Service 自己知道（它持有 Embedder），
@@ -35,9 +38,12 @@ type HostOptions struct {
 	SemanticSearch bool
 }
 
-func NewHost(gov governanceService, know knowledgeService, logger *slog.Logger, opts HostOptions) *Host {
+func NewHost(gov governanceService, know knowledgeService, activities activityService, logger *slog.Logger, opts HostOptions) *Host {
+	if activities == nil {
+		panic("mcp: activityService 不能为空")
+	}
 	h := &Host{
-		gov: gov, know: know, logger: logger,
+		gov: gov, know: know, activity: activities, logger: logger,
 		version:        opts.Version,
 		semanticSearch: opts.SemanticSearch,
 	}
@@ -62,84 +68,84 @@ func (h *Host) newServer() *sdk.Server {
 	// 它们是人的运维动作，归 Web 治理面。
 
 	// --- 系统 ---
-	sdk.AddTool(s, &sdk.Tool{
+	addAuditedTool(h, s, &sdk.Tool{
 		Name: "whoami",
 		Description: "返回当前 token 背后的身份，以及可读写的空间列表。" +
 			"写入类工具不传 space 时的默认目标即 defaultSpaceId。",
-	}, h.handleWhoAmI)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessRead, auditWhoAmI, h.handleWhoAmI)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "server_status",
 		Description: "服务版本，以及这个部署是否接了语义检索（没接时 card_recall 退化为中文全文匹配）。",
-	}, h.handleServerStatus)
+	}, activity.KindTrace, activity.AccessRead, auditServerStatus, h.handleServerStatus)
 
 	// --- Memory ---
-	sdk.AddTool(s, &sdk.Tool{
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "memoria_create",
 		Description: "记一条记忆。不传 space 即写入个人空间——随手记不该有心智负担，要共享再用 promote。",
-	}, h.handleMemoriaCreate)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessWrite, auditMemoriaCreate, h.handleMemoriaCreate)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name: "memoria_search",
 		Description: "跨空间检索记忆。结果按语义命中在前、字面命中在后分组，每条标注 semantic 与来源空间；" +
 			"命中偏少时还会告诉你「另有 N 条卡片命中」——知识卡片是这里的核心载体，别只搜记忆就下结论。",
-	}, h.handleMemoriaSearch)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessRead, auditMemoriaSearch, h.handleMemoriaSearch)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "memoria_get",
 		Description: "按 ID 取一条记忆，含标签与关联。",
-	}, h.handleMemoriaGet)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessRead, auditMemoriaGet, h.handleMemoriaGet)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name: "memoria_update",
 		Description: "更新记忆的内容、标签或状态。归档、恢复、打标签都用这一个工具（改 status 或 labels）。" +
 			"传上次读到的 version 可获得并发保护：期间被人改过会返回 VERSION_CONFLICT 而不是静默覆盖。",
-	}, h.handleMemoriaUpdate)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessWrite, auditMemoriaUpdate, h.handleMemoriaUpdate)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "memoria_delete",
 		Description: "软删除一条记忆：不再进默认检索，但仍可按 ID 取回。",
-	}, h.handleMemoriaDelete)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessWrite, auditMemoriaDelete, h.handleMemoriaDelete)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "memoria_link",
 		Description: "在两条内容之间建立或删除关联（related / causes / evolved-from / contradicts / part-of）。两端都要在你的可读范围内。",
-	}, h.handleMemoriaLink)
+	}, activity.KindTrace, activity.AccessWrite, auditMemoriaLink, h.handleMemoriaLink)
 
 	// --- Card ---
-	sdk.AddTool(s, &sdk.Tool{
+	addAuditedTool(h, s, &sdk.Tool{
 		Name: "card_create",
 		Description: "创建知识卡片：一次踩坑或一条工程约定的完整记录。" +
 			"recallTriggers 是这张卡的核心——写清楚未来什么情境下该想起它，那是 card_recall 的匹配依据。" +
 			"「理解」栏为空的卡只是摘要。",
-	}, h.handleCardCreate)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessWrite, auditCardCreate, h.handleCardCreate)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name: "card_recall",
 		Description: "按你当前的工作情境召回卡片——「我正在做 X，有什么该注意的」。" +
 			"匹配的是作者显式写下的召回条件而不是卡片全文，所以 situation 要用完整的一句话描述正在做什么，不要传关键词。" +
 			"要按主题找卡片请用 card_search。",
-	}, h.handleCardRecall)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessRead, auditCardRecall, h.handleCardRecall)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "card_search",
 		Description: "按内容检索知识卡片——「关于 X 的卡片有哪些」。与 card_recall 是不同的意图：这里匹配卡片正文。",
-	}, h.handleCardSearch)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessRead, auditCardSearch, h.handleCardSearch)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "card_get",
 		Description: "按 ID 取完整卡片，含全部 section、召回条件与关联。",
-	}, h.handleCardGet)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessRead, auditCardGet, h.handleCardGet)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "card_update",
 		Description: "更新卡片内容、召回条件或状态。把摄取来的 draft 改成 active 就是「审过了」。",
-	}, h.handleCardUpdate)
+	}, activity.KindTrace, activity.AccessWrite, auditCardUpdate, h.handleCardUpdate)
 
 	// --- 空间 ---
-	sdk.AddTool(s, &sdk.Tool{
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "space_list",
 		Description: "列出你能访问的空间及读写权限。",
-	}, h.handleSpaceList)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindTrace, activity.AccessRead, auditSpaceList, h.handleSpaceList)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name: "promote",
 		Description: "把一条记忆或一张卡片复制到另一个空间（个人经验 → 团队共识）。" +
 			"复制不是移动，原件保留；两份此后各自演进，不会自动同步。",
-	}, h.handlePromote)
-	sdk.AddTool(s, &sdk.Tool{
+	}, activity.KindGovernance, activity.AccessWrite, auditPromote, h.handlePromote)
+	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "space_stats",
 		Description: "空间内容统计。unqualifiedCards 是「理解」栏为空、只算摘要的卡片数；draftCards 是等人过目的摄取产物。",
-	}, h.handleSpaceStats)
+	}, activity.KindTrace, activity.AccessRead, auditSpaceStats, h.handleSpaceStats)
 
 	return s
 }

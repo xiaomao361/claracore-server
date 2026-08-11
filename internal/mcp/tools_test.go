@@ -96,9 +96,12 @@ func (f *fakeKnow) UpdateMemory(_ context.Context, in knowledge.UpdateMemoryInpu
 	return f.memory, nil
 }
 
-func (f *fakeKnow) DeleteMemory(_ context.Context, _, _ platform.ID, writable []platform.ID) error {
+func (f *fakeKnow) DeleteMemory(_ context.Context, _, _ platform.ID, writable []platform.ID) (knowledge.Memory, error) {
 	f.lastUpdateMemory = knowledge.UpdateMemoryInput{WritableSpaces: writable}
-	return f.bump()
+	if err := f.bump(); err != nil {
+		return knowledge.Memory{}, err
+	}
+	return f.memory, nil
 }
 
 func (f *fakeKnow) SearchMemories(_ context.Context, in knowledge.SearchMemoriesInput) (knowledge.MemorySearchResult, error) {

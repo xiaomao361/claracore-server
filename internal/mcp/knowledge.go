@@ -16,7 +16,7 @@ type knowledgeService interface {
 	CreateMemory(ctx context.Context, in knowledge.CreateMemoryInput) (knowledge.Memory, error)
 	GetMemory(ctx context.Context, tenantID, id platform.ID, spaces []platform.ID) (knowledge.Memory, []knowledge.Link, error)
 	UpdateMemory(ctx context.Context, in knowledge.UpdateMemoryInput) (knowledge.Memory, error)
-	DeleteMemory(ctx context.Context, tenantID, id platform.ID, writableSpaces []platform.ID) error
+	DeleteMemory(ctx context.Context, tenantID, id platform.ID, writableSpaces []platform.ID) (knowledge.Memory, error)
 	SearchMemories(ctx context.Context, in knowledge.SearchMemoriesInput) (knowledge.MemorySearchResult, error)
 
 	CreateCard(ctx context.Context, in knowledge.CreateCardInput) (knowledge.Card, error)

@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
@@ -169,6 +171,41 @@ type fakeKnow struct {
 	calls      int
 }
 
+type fakeActivity struct {
+	records        []activity.RecordInput
+	visibleInput   activity.ListVisibleInput
+	adminInput     activity.ListAdminInput
+	visiblePage    activity.Page
+	adminPage      activity.Page
+	recordErr      error
+	visibleErr     error
+	adminErr       error
+	listAdminCalls int
+	order          []string
+}
+
+func (f *fakeActivity) Record(_ context.Context, in activity.RecordInput) (activity.Event, error) {
+	f.order = append(f.order, "record")
+	f.records = append(f.records, in)
+	if f.recordErr != nil {
+		return activity.Event{}, f.recordErr
+	}
+	return activity.Event{Action: in.Action}, nil
+}
+
+func (f *fakeActivity) ListVisible(_ context.Context, in activity.ListVisibleInput) (activity.Page, error) {
+	f.order = append(f.order, "visible")
+	f.visibleInput = in
+	return f.visiblePage, f.visibleErr
+}
+
+func (f *fakeActivity) ListAdmin(_ context.Context, in activity.ListAdminInput) (activity.Page, error) {
+	f.order = append(f.order, "admin")
+	f.listAdminCalls++
+	f.adminInput = in
+	return f.adminPage, f.adminErr
+}
+
 func (*fakeKnow) SpaceStats(_ context.Context, _ platform.ID, spaces []platform.ID) ([]knowledge.SpaceStats, error) {
 	out := make([]knowledge.SpaceStats, 0, len(spaces))
 	for _, id := range spaces {
@@ -181,6 +218,7 @@ func newTestWeb(t *testing.T, role string, mustChange bool) (*httptest.Server, *
 	t.Helper()
 	gov := newFakeGov(role, mustChange)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	activity := &fakeActivity{}
 	know := &fakeKnow{
 		card: knowledge.Card{
 			ID: "01CARDAAAAAAAAAAAAAAAAAAAA", TenantID: tenantA, SpaceID: spPers,
@@ -192,7 +230,7 @@ func newTestWeb(t *testing.T, role string, mustChange bool) (*httptest.Server, *
 			Title: "一条记忆", Body: "正文。", Status: knowledge.MemoryActive, Version: 1,
 		},
 	}
-	srv := httptest.NewServer(NewHost(gov, know, logger, Options{
+	srv := httptest.NewServer(NewHost(gov, know, activity, logger, Options{
 		Version: "test", PublicMCPURL: "https://ccs.example.com/mcp",
 	}).Handler())
 	t.Cleanup(srv.Close)
@@ -215,9 +253,26 @@ func newContentWeb(t *testing.T, role string) (*httptest.Server, *fakeGov, *fake
 		},
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, know, logger, Options{Version: "test"}).Handler())
+	srv := httptest.NewServer(NewHost(gov, know, &fakeActivity{}, logger, Options{Version: "test"}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, gov, know
+}
+
+func newActivityWeb(t *testing.T, role string) (*httptest.Server, *fakeGov, *fakeKnow, *fakeActivity) {
+	t.Helper()
+	gov := newFakeGov(role, false)
+	know := &fakeKnow{
+		card: knowledge.Card{
+			ID: "01CARDAAAAAAAAAAAAAAAAAAAA", TenantID: tenantA, SpaceID: spPers,
+			Title: "摄取来的文档", CardType: "摄取原料", Status: knowledge.CardDraft,
+			Source: "docs/x.md", Original: "一段原文。", Version: 1,
+		},
+	}
+	act := &fakeActivity{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, act, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+	return srv, gov, know, act
 }
 
 // client 返回一个不自动跳转的客户端：重定向本身是被测行为。
@@ -284,7 +339,7 @@ func body(t *testing.T, resp *http.Response) string {
 func TestUnauthenticatedIsRedirectedEverywhere(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, false)
 
-	for _, path := range []string{"/", "/tokens", "/password", "/admin/members"} {
+	for _, path := range []string{"/", "/tokens", "/password", "/activity", "/admin/members", "/admin/audit"} {
 		t.Run(path, func(t *testing.T) {
 			resp := get(t, srv, path, false)
 			defer resp.Body.Close()
@@ -301,11 +356,13 @@ func TestUnauthenticatedIsRedirectedEverywhere(t *testing.T) {
 func TestMemberCannotSeeAdminPages(t *testing.T) {
 	srv, gov := newTestWeb(t, governance.RoleMember, false)
 
-	resp := get(t, srv, "/admin/members", true)
-	defer resp.Body.Close()
-	// 404 而不是 403：不确认「这个管理页存在」
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("普通成员访问管理页应得到 404，实际 %d", resp.StatusCode)
+	for _, path := range []string{"/admin/members", "/admin/audit"} {
+		resp := get(t, srv, path, true)
+		defer resp.Body.Close()
+		// 404 而不是 403：不确认「这个管理页存在」
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("普通成员访问 %s 应得到 404，实际 %d", path, resp.StatusCode)
+		}
 	}
 	if gov.calls != 0 {
 		t.Fatal("权限没通过时不该调领域层")
@@ -315,7 +372,7 @@ func TestMemberCannotSeeAdminPages(t *testing.T) {
 func TestMemberCannotPostToAdminEndpoints(t *testing.T) {
 	srv, gov := newTestWeb(t, governance.RoleMember, false)
 
-	for _, path := range []string{"/admin/members", "/admin/members/status", "/admin/members/reset"} {
+	for _, path := range []string{"/admin/members", "/admin/members/status", "/admin/members/reset", "/admin/audit"} {
 		t.Run(path, func(t *testing.T) {
 			resp := post(t, srv, path, url.Values{"id": {string(userOther)}, "status": {"disabled"}}, true, true)
 			defer resp.Body.Close()
@@ -336,7 +393,7 @@ func TestMemberCannotPostToAdminEndpoints(t *testing.T) {
 func TestMustChangePasswordBlocksEverythingElse(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, true)
 
-	for _, path := range []string{"/", "/tokens", "/admin/members"} {
+	for _, path := range []string{"/", "/tokens", "/activity", "/admin/members", "/admin/audit"} {
 		resp := get(t, srv, path, true)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/password" {
@@ -363,13 +420,15 @@ func TestWritesRequireCSRF(t *testing.T) {
 	srv, gov := newTestWeb(t, governance.RoleAdmin, false)
 
 	writes := map[string]url.Values{
-		"/logout":               {},
-		"/password":             {"current": {"x"}, "new": {"yyyyyyyyyy"}, "confirm": {"yyyyyyyyyy"}},
-		"/tokens":               {"agent": {"clara"}, "name": {"MacBook"}},
-		"/tokens/revoke":        {"id": {"01TOKENAAAAAAAAAAAAAAAAAAA"}},
-		"/admin/members":        {"username": {"newbie"}},
-		"/admin/members/status": {"id": {string(userOther)}, "status": {"disabled"}},
-		"/admin/members/reset":  {"id": {string(userOther)}},
+		"/logout":                            {},
+		"/password":                          {"current": {"x"}, "new": {"yyyyyyyyyy"}, "confirm": {"yyyyyyyyyy"}},
+		"/tokens":                            {"agent": {"clara"}, "name": {"MacBook"}},
+		"/tokens/revoke":                     {"id": {"01TOKENAAAAAAAAAAAAAAAAAAA"}},
+		"/review/01CARDAAAAAAAAAAAAAAAAAAAA": {"action": {"reject"}},
+		"/admin/members":                     {"username": {"newbie"}},
+		"/admin/members/status":              {"id": {string(userOther)}, "status": {"disabled"}},
+		"/admin/members/reset":               {"id": {string(userOther)}},
+		"/admin/audit":                       {},
 	}
 	for path, form := range writes {
 		t.Run(path, func(t *testing.T) {
@@ -867,4 +926,211 @@ func getBody(t *testing.T, srv *httptest.Server, path string) (string, string) {
 		return "", "HTTP " + resp.Status
 	}
 	return body(t, resp), ""
+}
+
+// ---------------------------------------------------------------------------
+// 活动流与完整审计
+// ---------------------------------------------------------------------------
+
+func TestActivityPassesOnlyReadableSharedSpaces(t *testing.T) {
+	srv, _, _, act := newActivityWeb(t, governance.RoleMember)
+	agentID := platform.ID("01AGENTAAAAAAAAAAAAAAAAAAA")
+	act.visiblePage = activity.Page{Events: []activity.Event{{
+		ID: "01AUDITAAAAAAAAAAAAAAAAAAA", TenantID: tenantA, UserID: userMe,
+		AgentID: &agentID, Source: activity.SourceMCP, Kind: activity.KindTrace,
+		Access: activity.AccessRead, Outcome: activity.OutcomeSuccess,
+		Action: "card_recall", CreatedAt: time.Now().UTC(),
+	}}}
+
+	page := body(t, get(t, srv, "/activity", true))
+	if !strings.Contains(page, "card_recall") {
+		t.Fatal("活动页应渲染领域层返回的事件")
+	}
+	if act.visibleInput.TenantID != tenantA || act.visibleInput.UserID != userMe {
+		t.Fatalf("可见性查询身份不对: %+v", act.visibleInput)
+	}
+	if len(act.visibleInput.ReadableSharedSpaceIDs) != 1 || act.visibleInput.ReadableSharedSpaceIDs[0] != spTeam {
+		t.Fatalf("只应把可读的 team/project 交给活动域，实际 %v", act.visibleInput.ReadableSharedSpaceIDs)
+	}
+}
+
+func TestAdminAuditRequiresConfirmationAndRecordsBeforeQuery(t *testing.T) {
+	srv, _, _, act := newActivityWeb(t, governance.RoleAdmin)
+
+	confirm := body(t, get(t, srv, "/admin/audit", true))
+	if !strings.Contains(confirm, "查询动作本身会先写入") {
+		t.Fatal("GET 只能展示二次确认说明")
+	}
+	if act.listAdminCalls != 0 || len(act.records) != 0 {
+		t.Fatal("仅打开确认页不得读取完整日志或伪造 meta-audit")
+	}
+
+	resp := post(t, srv, "/admin/audit", url.Values{}, true, true)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("确认后的审计查询应成功，实际 %d", resp.StatusCode)
+	}
+	if len(act.order) < 2 || act.order[0] != "record" || act.order[1] != "admin" {
+		t.Fatalf("必须先写 meta-audit 再查完整日志，实际顺序 %v", act.order)
+	}
+	if len(act.records) != 1 {
+		t.Fatalf("期望一条 meta-audit，实际 %d", len(act.records))
+	}
+	meta := act.records[0]
+	if meta.Kind != activity.KindMetaAudit || meta.Access != activity.AccessRead || meta.Action != "admin.audit.query" {
+		t.Fatalf("meta-audit 形态不对: %+v", meta)
+	}
+}
+
+func TestAdminAuditFailsClosedWhenMetaAuditCannotPersist(t *testing.T) {
+	srv, _, _, act := newActivityWeb(t, governance.RoleAdmin)
+	act.recordErr = errors.New("audit unavailable")
+
+	resp := post(t, srv, "/admin/audit", url.Values{}, true, true)
+	page := body(t, resp)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("meta-audit 写不下时应拒绝查询，实际 %d", resp.StatusCode)
+	}
+	if act.listAdminCalls != 0 {
+		t.Fatal("meta-audit 写不下时不得先把完整日志读进内存")
+	}
+	if !strings.Contains(page, "已拒绝展示完整日志") {
+		t.Fatalf("页面应解释 fail-closed，实际 %.200s", page)
+	}
+}
+
+func TestAuthenticatedWebWritesAreAuditedWithoutSensitivePayloads(t *testing.T) {
+	tests := []struct {
+		name, path, action string
+		form               url.Values
+	}{
+		{"logout", "/logout", "session.logout", url.Values{}},
+		{"password", "/password", "password.change", url.Values{"current": {"current-password"}, "new": {"secret-password-123"}, "confirm": {"secret-password-123"}}},
+		{"token issue", "/tokens", "token.issue", url.Values{"agent": {"secret-agent-slug"}, "name": {"Secret Device"}}},
+		{"token revoke", "/tokens/revoke", "token.revoke", url.Values{"id": {"01TOKENAAAAAAAAAAAAAAAAAAA"}}},
+		{"review", "/review/01CARDAAAAAAAAAAAAAAAAAAAA", "card.review", url.Values{"action": {"reject"}, "title": {"secret-card-title"}}},
+		{"member create", "/admin/members", "member.create", url.Values{"username": {"secret-user"}, "display": {"Secret User"}, "role": {"member"}}},
+		{"member status", "/admin/members/status", "member.status", url.Values{"id": {string(userOther)}, "status": {"disabled"}}},
+		{"member reset", "/admin/members/reset", "member.password_reset", url.Values{"id": {string(userOther)}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, gov, _, act := newActivityWeb(t, governance.RoleAdmin)
+			if tt.action == "token.revoke" {
+				gov.tokens = []governance.Token{{ID: "01TOKENAAAAAAAAAAAAAAAAAAA"}}
+			}
+			resp := post(t, srv, tt.path, tt.form, true, true)
+			defer resp.Body.Close()
+			if len(act.records) != 1 {
+				t.Fatalf("每个已认证写请求必须留一条记录，实际 %d", len(act.records))
+			}
+			if got := act.records[0].Action; got != tt.action {
+				t.Fatalf("动作不对: want %q, got %q", tt.action, got)
+			}
+			encoded, err := json.Marshal(act.records[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, secret := range []string{"secret-password-123", "secret-agent-slug", "Secret Device", "secret-card-title", "secret-user", "Secret User", "ccs_plaintext_token_value"} {
+				if strings.Contains(string(encoded), secret) {
+					t.Fatalf("审计记录泄露了表单或凭据 %q: %s", secret, encoded)
+				}
+			}
+		})
+	}
+}
+
+func TestWebWriteAuditCapturesRenderedFailureAndCreatedTargets(t *testing.T) {
+	t.Run("rendered validation failure", func(t *testing.T) {
+		srv, _, _, act := newActivityWeb(t, governance.RoleMember)
+		resp := post(t, srv, "/password", url.Values{
+			"current": {"current-password"},
+			"new":     {"new-password-one"},
+			"confirm": {"different-password"},
+		}, true, true)
+		defer resp.Body.Close()
+
+		// Form validation deliberately re-renders with HTTP 200. The audit
+		// outcome must still describe the failed action, not the render status.
+		if len(act.records) != 1 || act.records[0].Outcome != activity.OutcomeError {
+			t.Fatalf("rendered validation error must be audited as error: %+v", act.records)
+		}
+	})
+
+	tests := []struct {
+		name, path, entityType string
+		form                   url.Values
+		entityID               platform.ID
+	}{
+		{
+			name: "issued token", path: "/tokens", entityType: "token",
+			form:     url.Values{"agent": {"clara"}, "name": {"MacBook"}},
+			entityID: "01TOKENAAAAAAAAAAAAAAAAAAA",
+		},
+		{
+			name: "created member", path: "/admin/members", entityType: "user",
+			form:     url.Values{"username": {"new-user"}, "display": {"New User"}, "role": {"member"}},
+			entityID: "01NEWUSERAAAAAAAAAAAAAAAAA",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, _, _, act := newActivityWeb(t, governance.RoleAdmin)
+			resp := post(t, srv, tt.path, tt.form, true, true)
+			defer resp.Body.Close()
+
+			if len(act.records) != 1 {
+				t.Fatalf("expected one audit record, got %d", len(act.records))
+			}
+			record := act.records[0]
+			if record.EntityType != tt.entityType || record.EntityID == nil || *record.EntityID != tt.entityID {
+				t.Fatalf("created target was not resolved from domain output: %+v", record)
+			}
+			if record.Outcome != activity.OutcomeSuccess {
+				t.Fatalf("successful write outcome = %s", record.Outcome)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedCSRFRejectionIsAuditedAsFailure(t *testing.T) {
+	srv, _, _, act := newActivityWeb(t, governance.RoleMember)
+	resp := post(t, srv, "/tokens", url.Values{
+		"agent": {"clara"}, "name": {"MacBook"},
+	}, true, false)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("missing CSRF status = %d, want 403", resp.StatusCode)
+	}
+	if len(act.records) != 1 || act.records[0].Action != "token.issue" || act.records[0].Outcome != activity.OutcomeError {
+		t.Fatalf("authenticated rejected write must leave a failed audit record: %+v", act.records)
+	}
+}
+
+func TestOrdinaryAuditFailureDoesNotChangeCompletedWriteResult(t *testing.T) {
+	srv, _, _, act := newActivityWeb(t, governance.RoleMember)
+	act.recordErr = errors.New("audit unavailable")
+
+	resp := post(t, srv, "/tokens", url.Values{"agent": {"clara"}, "name": {"MacBook"}}, true, true)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("业务写已完成后，审计失败不应把响应改成失败，实际 %d", resp.StatusCode)
+	}
+}
+
+func TestReviewAuditCarriesResolvedSpaceForSharedVisibility(t *testing.T) {
+	srv, _, know, act := newActivityWeb(t, governance.RoleMember)
+	// The handler must use the domain result rather than guessing from the URL
+	// or form. A real domain call only returns this card after write permission.
+	know.card.SpaceID = spTeam
+
+	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
+		"action": {"reject"}, "title": {"不需要的卡"},
+	}, true, true)
+	defer resp.Body.Close()
+	if len(act.records) != 1 || act.records[0].SpaceID == nil || *act.records[0].SpaceID != spTeam {
+		t.Fatalf("共享写入必须带领域层解析后的空间，实际 %+v", act.records)
+	}
 }

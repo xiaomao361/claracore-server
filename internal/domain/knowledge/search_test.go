@@ -144,7 +144,7 @@ func TestSearchRequiresSpaces(t *testing.T) {
 func TestSearchExcludesNonVisibleStatus(t *testing.T) {
 	svc, _ := newTestService(t)
 	m := seedMemory(t, svc, spacePriv)
-	if err := svc.DeleteMemory(context.Background(), tenantA, m.ID, mySpaces()); err != nil {
+	if _, err := svc.DeleteMemory(context.Background(), tenantA, m.ID, mySpaces()); err != nil {
 		t.Fatal(err)
 	}
 

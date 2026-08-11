@@ -1,13 +1,13 @@
 # ClaraCore Server — 接手指南
 
-> 最后更新：2026-08-10 17:15
+> 最后更新：2026-08-11
 > 给下一次接手的人或 agent（Clara / Codex / 其他）
 
 ---
 
 ## 一句话状态
 
-**现在是一个能交付给团队的东西了**：管理员能在浏览器里开账号、发 token、复制配置片段；agent 拿着那个 token 通过 MCP 记经验、提炼卡片、在对的情境下被召回。工作面（16 个 MCP 工具）与治理面（Web 登录/成员/token）都通了。
+**现在是一个能交付给团队的东西了**：管理员能在浏览器里开账号、发 token、复制配置片段；agent 拿着那个 token 通过 MCP 记经验、提炼卡片、在对的情境下被召回。工作面（16 个 MCP 工具）与治理面（Web 登录/成员/token/内容/活动）都通了。
 
 **整条链路闭环了**（0810 第六刀）。这是这个产品的一句话价值，第一次真的跑通：
 
@@ -23,16 +23,20 @@ docs/06-poc-findings.md → 摄取成 draft
 
 0.7515 比之前那个对抗性构造的 0.6195 高得多——因为这次的召回条件是**人照着原文写的**，不是测试数据。
 
-还差的是 **活动流**（04 §3.1 页面 4，消除黑盒的最后一块）：它要 `audit_logs`（0006 迁移）与全写路径埋点，是一块独立的基础设施。
+**活动流与完整审计已在 0811 落地到代码**：`0006_audit_logs.sql`、独立的 `domain/activity` 与 MySQL Store、16 个 MCP 工具的统一装饰器、Web 写中间件、`/activity`，以及需要二次确认且先写 meta-audit 才能查询的 `/admin/audit`。普通成员可见性在 SQL 中收紧为「自己的全部活动 + 自己可读共享空间里的他人写入」，不是把租户全量读进应用后再过滤；活动元数据只允许 ID、计数和语义标志，不落 query、situation、正文、密码或 token。
+
+**0811 这一刀已收到真库 + 真浏览器层**：`make check` 通过（domain 87.1%）；`0006` 已应用到 `development` MySQL；完整 `make itest` 通过，包括活动 SQL 可见性、租户隔离、keyset 分页、保留期删除与 MCP 真实写入。浏览器用隔离的临时租户走了登录 → `/activity` → `/admin/audit` 二次确认 → meta-audit 出现的完整链路，并补测 390px 窄屏。这些是开发环境验收，不是部署或生产验收。
 
 两条端到端证据（`make itest` 每次真跑，Ollama 不在线则 skip）：
 
 - `test/mcp_tools_integration_test.go` —— 走 MCP 协议的完整工作流：`memoria_create` 默认落个人空间 → 写不可写空间被 `FORBIDDEN` 拦下 → `card_create` 带召回条件 → 索引 worker 补上 3 条向量 → `card_recall` 命中并给出召回理由 → 乐观锁冲突带回当前版本 → 软删除后仍可按 ID 取到但不进检索。
 - `test/recall_e2e_integration_test.go` —— 检索质量本身：一张召回条件与情境**没有字面重叠**的卡，加一张有字面重叠的干扰卡。纯全文路径把干扰卡排第一，两段式检索把正确的那张纠正回第一位（bge-m3 实测 0.6195 vs 0.6051）。**这条是唯一能证明检索「确实在起作用」而不只是「跑通了」的测试，别让它烂掉。**
 
-`make run` 起来就是完整的服务：`/mcp` 是 MCP Host，`/` 是 Web 治理面，后台跑索引 worker。装配全在 `cmd/server/main.go`。
+`make run` 起来就是完整的服务：`/mcp` 是 MCP Host，`/` 是 Web 治理面，后台跑索引 worker 与 trace 保留期清理 worker。装配全在 `cmd/server/main.go`。
 
-Web 那条链路 0810 在真浏览器会话里手跑过一遍：未登录访问首页 303 → 登录 → 被强制赶去改密页 → 改密后进概览（看到空间与权限）→ 签发 token 拿到明文与可直接粘贴的 MCP 配置块 → 建同事账号拿到生成的初始密码 → 不带 CSRF 的 POST 得到 403。
+Web 那条链路 0810 在真浏览器会话里手跑过一遍：未登录访问首页 303 → 登录 → 被强制赶去改密页 → 改密后进概览（看到空间与权限）→ 签发 token 拿到明文与可直接粘贴的 MCP 配置块 → 建同事账号拿到生成的初始密码 → 不带 CSRF 的 POST 得到 403。0811 又在真浏览器补验了活动流与完整审计：普通时间线只显示自己全部 + 共享写入，管理员确认后能看到全量，且首条就是本次 `admin.audit.query` meta-audit。
+
+**Web 视觉方向已在 0811 单独进入 Figma 生产设计**：文件是 [ClaraCore Server — Product Direction 01](https://www.figma.com/design/6ObFIgv8rQVrZnEX5WdaMr)，当前基准页为 `03 · Web Workspace`。第一轮偏独立 App 的大标题/舞台式方案已被否决；确认的方向是桌面浏览器工作台：持久左侧导航、顶部面包屑/搜索/环境状态、紧凑指标、筛选表格与双栏工作区。Figma 只代表已确认的设计基准，**尚未同步进 Go 模板/CSS**。
 
 **还缺的是 Continuity**：`shared_line_*` 那 4 个工具要先有 `internal/domain/continuity`（仍是空目录）。
 
@@ -108,11 +112,11 @@ curl http://127.0.0.1:51890/healthz
 | `docs/01-architecture.md` | 想知道"为什么这么设计"、部署形态、nginx 配置 | §11.0 有实现进度表 |
 | `docs/02-data-model.md` | **写迁移文件前必读**。表结构、三层空间、检索模型、并发控制 | 已落地，偏差就地标注 |
 | `docs/03-mcp-contract.md` | 写 MCP 工具前必读 | 16/20 已落地 |
-| `docs/04-web-scope.md` | 写 Web 前必读。页面清单 + **可见性边界** | 活动流未做，§3.3 有进度表 |
+| `docs/04-web-scope.md` | 写 Web 前必读。页面清单 + **可见性边界** | 活动流与管理员完整审计已实现，§3.3 有进度表 |
 | `docs/05-code-structure.md` | **动手前必读**。目录结构、依赖方向、约束机制 | 目录树已按实际结构更新 |
 | `docs/06-poc-findings.md` | 遇到 MCP 协议/传输层问题时查 | 已验证的结论与已知限制 |
 
-各文档末尾的「待确认」清单已于 2026-08-06 全部拍板，速查表见本文 §已拍板。**目前没有未决问题**——下一刀开工前不需要再拍任何板，除非活动流的实现里冒出新的取舍。
+各文档末尾的「待确认」清单已于 2026-08-06 全部拍板，速查表见本文 §已拍板。**目前没有未决问题**——下一刀 Continuity 开工前先对齐 Desktop 契约与 `03-mcp-contract.md` 的既有语义，不凭空再造一套。
 
 ---
 
@@ -127,6 +131,7 @@ internal/platform/             Clock（可测试的时间）+ ULID（6 个测试
 internal/adapters/mysql/       连接池（启动即 Ping）+ 迁移执行器（12 个拆分用例）
   └─ governance.go             governance.Store 的 MySQL 实现，11 个方法
   └─ knowledge.go              knowledge.Store 的写入侧实现，13 个方法
+  └─ activity.go               audit_logs 写入、SQL 可见性查询、管理员查询、trace 分批清理
   └─ search.go                 粗筛 SQL：权限下推、MATCH 打分、标签交集、候选截断
   └─ embedding.go              向量 BLOB 编解码 + 索引队列（upsert / 领活 / 写回 / 标失败）
   └─ *_integration_test.go     对着真实 MySQL 的契约测试（make itest）
@@ -137,12 +142,14 @@ internal/domain/knowledge/     memory / card / 召回条件 / 标签 / 关联 / 
   └─ store_fake_test.go        行为基准：剥离关联列、乐观锁、唯一键、事务回滚
                                  └─ store_fake_search_test.go 检索侧的行为基准：空间/租户/状态过滤、标签交集、
                                MATCH 只排序不过滤、内容未变不重算
-                               （domain/ 合计 88.6% 覆盖，门槛 85）
+                               （domain/ 合计 87.1% 覆盖，门槛 85）
+internal/domain/activity/      不可变活动事件 + 分类校验 + keyset 分页 + 保留期清理契约
 internal/ports/embedder.go     Model() + Embed()。纯基础设施接口，不认识领域概念
 internal/adapters/embedding/   Ollama（/api/embed 批量）+ OpenAI-compatible（按 index 归位）
   └─ embedding_test.go         用 httptest 造真服务不会给你的坏响应：数量对不上、
                                维度不一致、空向量、404、错误信息泄露内网地址
 internal/mcp/                  MCP Host：bearer 认证 + 身份注入 + 错误映射 + 16 个工具
+  └─ activity.go               16 个工具统一审计装饰器 + 强类型安全元数据提取
   └─ knowledge.go              编排骨架：begin() 是唯一的权限解析入口 + 结果编码
   └─ memory.go / card.go / space.go   Memory 6 + Card 5 + 空间 3 + 系统 2
   └─ host_test.go              8 个协议层测试，用 fake 治理服务，不碰数据库
@@ -152,13 +159,15 @@ internal/web/                  Host B：治理面（SSR + htmx 的位置，第�
   └─ server.go                 路由三层门 + 每页一套模板 + 安全响应头
   └─ session.go                会话 cookie、CSRF、requireUser/PasswordSet/Admin
   └─ handlers.go               登录 / 改密 / 概览 / 我的接入 / 成员管理
-  └─ content.go                卡片审核（Web 唯一的写入场景）+ 内容浏览
+  └─ content.go                卡片审核（Web 唯一的内容写入场景）+ 内容浏览
+  └─ activity.go               Web 写审计 + 普通活动流 + 管理员二次确认/meta-audit
   └─ templates|static/         //go:embed，CSS 编进二进制
   └─ web_test.go               33 个测试，全是安全属性：越权、CSRF、cookie、转义
 internal/domain/knowledge/list.go  ListContents：治理面的列表查询（**不是检索**）
 internal/adapters/crypto/      argon2id，参数编码进 PHC 串（调参不锁死存量用户）
 migrations/0004_sessions.sql   Web 会话表，与 MCP token 彻底分开
 migrations/0005_ingest.sql     cards 加 source_key / source_hash + uk_cards_source（幂等锚点）
+migrations/0006_audit_logs.sql 活动/审计日志 + 普通可见性、管理员时间线、trace 清理索引
 internal/ingest/markdown.go    第一个知识源：本地 Markdown 目录。**不提炼**
   └─ markdown_test.go          7 个测试：源身份稳定性、指纹跟内容走、坏文件不中断整批
 internal/domain/knowledge/
@@ -169,7 +178,7 @@ test/mcp_tools_integration_test.go 全栈工作流：真 token → MCP → 真�
 migrations/0001_governance.sql 治理域 6 张表，已应用到 192.168.3.200 的库
 migrations/0002_knowledge.sql  核心域 5 张表，已应用
 migrations/0003_embeddings.sql 运行时域 embeddings 表 + 给 card_recall_triggers 补 ngram 全文索引
-cmd/server/main.go             最小入口，装配 + 优雅关闭 + -migrate flag
+cmd/server/main.go             最小入口，装配 + 优雅关闭 + -migrate + 两类后台 worker
 Makefile                       make check 是提交前的门槛
 poc/                           丢弃型验证代码，独立 go.mod，不参与主模块构建
 ```
@@ -555,7 +564,7 @@ requireAdmin        ↑ 且角色是 admin
 
 **多取一条判断有没有下一页**，而不是「取满 limit 就假设还有」：后者会在正好取满时给出一个点进去是空的下一页。
 
-### 审核页：Web 上唯一的写入场景
+### 审核页：Web 上唯一的内容写入场景
 
 它与「让人在库里随手写」的区别是三条硬条件（01 §10 的唯一例外）：只针对 draft、发生在明确的摄取流程内、**有原文可对照**。少任何一条，这个口子就变成「Web 上也能创建内容」，那意味着两套写入路径。
 
@@ -568,14 +577,31 @@ requireAdmin        ↑ 且角色是 admin
 | 校验失败把人填的内容放回表单 | 丢掉一屏字，他下次就不敢再点那个按钮——而审核本来就是最容易被拖延的事 |
 | 召回条件用一行一条的文本域 | 比一堆 `<input>` 好用得多，而审核时最常做的动作正是「加两三条触发条件」 |
 
-### 这一层缺的东西
+### 活动流与完整审计（2026-08-11 已实现）
 
-- **活动流没做**（04 §3.1 页面 4）。它要 `audit_logs`（0006 迁移）+ 全写路径埋点 + 可见性规则下推 SQL（写入可见、读取不可见），是一块独立的基础设施。**04 §1.1 说 Web 的第一职责是消除黑盒，而那一半到现在还没做。**
+- `internal/mcp/activity.go` 是 16 个 MCP 工具的唯一注册/审计边界；每个工具必须声明读写分类与强类型安全提取器，新工具不能悄悄绕过活动记录。
+- `requireUser` 是 Web 已认证写操作的统一审计边界；业务响应先完成，普通审计失败只记服务端错误，不把已经成功的写改成失败。管理员完整审计例外：meta-audit 写不下时**拒绝查询**，不能先看再补记。
+- 普通 `/activity` 只把治理层已解析出的 team/project 可读空间 ID 交给 `activity.ListVisible`；MySQL 在 SQL 中只返回「本人全部 + 他人共享空间写入」。个人空间与他人读取/召回不会先进入应用内存。
+- `/admin/audit` 与日常活动页分离：GET 只展示风险说明和确认，POST 先持久化 `admin.audit.query` 的 meta-audit，再读取租户完整日志；翻下一页也要重新确认并留痕。
+- MCP 元数据白名单只含实体/空间 ID、命中 ID、计数与语义标志；Web 写审计不序列化表单。query、situation、标题、正文、密码、token 与错误文本都不进 `audit_logs`。
+- `trace` 与 `governance` / `meta_audit` 共用一张表但分类独立：后台 worker 启动时立即清一次，之后每 24 小时按 1000 条一批抽干 30 天前的 `trace`；治理与 meta-audit 不进入这条删除路径。服务关闭会等待这一 worker 退出。
+
+**当前最远证据**：开发 MySQL 已应用 `0006`；`make check` 与完整 `make itest` 均过；真浏览器已验 `/activity` 的可见结果、`/admin/audit` 的二次确认和查询自留痕，桌面与 390px 窄屏均无 console 错误。最远只到开发环境验收，未部署。
+
+### 这一层还缺的东西
+
 - **审核页没有批量操作**。几千条 draft 一条条点是不现实的，但「批量确认」与「必须有人真的看过」直接冲突——这个取舍要等真实的审核负担出现再定。
 - **浏览页没有全文搜索框**。要接的是 `SearchCards`，但那和列表是两条路径，混在一个页面上要先想清楚交互。
-- **没有审计日志**。`audit_logs` 表在 `02` §7.3 设计过但还没建（没有 0005 迁移）。治理动作（建号、发 token、改权限）目前只进 slog，不进库。活动流页面要用它。
 - **会话过期靠 `CleanupSessions` 手动调**，没有定时任务。行会一直堆着——不影响正确性（过期判断在领域层），但表会长。
 - **项目空间与权限管理页没做**，只能靠代码调 `CreateProjectSpace` / `GrantSpaceAccess`。团队真用起来会立刻需要它。
+
+### Web 视觉设计基准（2026-08-11 已确认，尚未实现）
+
+- Figma 文件：[ClaraCore Server — Product Direction 01](https://www.figma.com/design/6ObFIgv8rQVrZnEX5WdaMr)。
+- 以 `03 · Web Workspace` 为唯一继续扩展的基准；`00`–`02` 是方向过程与被否决方案，只作取舍记录。
+- 这是 **Web 治理工作台**，不是独立桌面 App：1440 桌面视口、持久侧栏、顶栏上下文、页面级标题/动作、筛选与表格是基本骨架。
+- 保留现有温暖、可信、低装饰的色彩语气；不要恢复巨型编辑式标题、居中舞台、三张等权大卡，也不要套紫色 AI 渐变或通用 SaaS 圆角卡片墙。
+- 生产设计顺序已经确认：基础 tokens / 组件 → 活动流 → 卡片审核 → 内容浏览 → 响应式与状态补全。设计通过后再同步进 SSR 模板与嵌入 CSS。
 
 ---
 
@@ -585,8 +611,6 @@ requireAdmin        ↑ 且角色是 admin
 
 | 缺口 | 影响 | 在哪一段 |
 |---|---|---|
-| **活动流没做** | Web 的第一职责是消除黑盒（04 §1.1），而那一半到现在没有。要 `audit_logs`（0006）+ 全写路径埋点 | §Web 治理面 |
-| **没有审计日志** | 治理动作（建号、发 token、改权限）只进 slog 不进库 | §Web 治理面 |
 | **embedding 没有 backfill** | 后来才打开 embedding 的存量内容不会被补索引；换模型灰度重建同理 | §检索层 |
 | **摄取没有删除检测** | 源里删掉的文档，库里那张卡会一直留着 | §摄取 |
 | **摄取只有 CLI 入口** | 空间 ID / 用户 ID 要人从 Web 上抄，没有管理页 | §摄取 |
@@ -611,38 +635,13 @@ requireAdmin        ↑ 且角色是 admin
 
 ## 下一步
 
-**1. 活动流（Web 的最后一块，也是 04 §1.1 说的「消除黑盒」主体）。**
+**0. 当前工作流：完成 Web 的 Figma 生产设计。** 以 `03 · Web Workspace` 为基准，按「基础 tokens / 组件 → 活动流 → 卡片审核 → 内容浏览 → 响应式与状态」推进。这个阶段只改 Figma 与设计文档；未经页面验收，不把探索稿直接翻进 Go 模板/CSS。
 
-开工顺序建议：
+**1. 代码下一优先级：Continuity。** `shared_line_*` 4 个工具还没做，`internal/domain/continuity` 仍是空目录。先从 Desktop 的现行契约与 `03-mcp-contract.md` 对齐实体、可见性和四个工具语义，再按现有结构落 Store → Service → MCP Host → 装配与测试；不要直接复制 Desktop 的本地身份或 SQLite 假设。
 
-```
-0006_audit_logs.sql        表结构在 02 §7.3 已有草案
-  ↓
-knowledge/governance 各自的写入用例埋点？—— 不。见下面那条判断
-  ↓
-internal/mcp: 在工具分发处套一层装饰器（每个新工具自动被覆盖）
-internal/web: 在写中间件里埋（与 CSRF 校验同一个位置）
-  ↓
-domain: ListActivity（可见性规则下推 SQL）
-  ↓
-web: /activity 页面 + 管理员审计入口（二次确认 + meta-audit）
-```
+第一轮先做一件可验证的事：把 Desktop 当前「`agent_id` 是稳定 owner、显式跨 agent 写保留 writer provenance、不隐式转移归属」的模型，映射到 Server 已认证的 `(tenant, user, agent)` 身份，再写迁移与领域契约。团队版的任何额外共享/空间语义只能来自现有产品契约或明确需求，不能因为这里已经有 `space_id` 就顺手加进去。
 
-**埋点位置是这一刀最要紧的判断**：埋在领域层的话，每个用例都要知道审计的存在；埋在每个 handler 里，少埋一次不会有编译错误。所以走装饰器/中间件——与 `mcp.begin()` 和 `web.requireUser` 是同一个思路。
-
-**可见性规则必须下推 SQL**（04 §2.1、§5）：写入是协作行为可见，读取是私人行为不可见。具体四条：
-- 我自己 agent 的全部活动（读 + 写）→ 我完整可见
-- 共享空间（team/project）的**写入** → 该空间全体可读成员可见
-- 他人在**个人空间**的任何活动 → 不可见
-- 他人的**读取/召回**记录 → 不可见（看别人读了什么等于监控）
-
-管理员的完整审计（含读取）要**二次确认 + meta-audit**（04 §2.2）：审计查询本身必须被记录且管理员不可删。理由是「一个能悄悄查看所有人读取记录的管理员账号，会让整个产品失去信任基础」——让审计留痕不是防坏人，是让好人可以自证。
-
-保留期拆两类（04 §6 已拍板）：治理审计长期保留，调用 trace 30 天滚动删除。
-
-**2. Continuity**（`shared_line_*` 4 个工具）。`internal/domain/continuity` 是空目录，工具契约从 Desktop 平移。不阻塞活动流。
-
-**3. 零散但值得顺手做的**：见 §缺口总览。其中「项目空间与权限管理页」是团队真用起来第一个会要的东西。
+**2. 零散但值得顺手做的**：见 §缺口总览。其中「项目空间与权限管理页」是团队真用起来第一个会要的东西。
 
 ---
 
@@ -729,7 +728,7 @@ web: /activity 页面 + 管理员审计入口（二次确认 + meta-audit）
 
 ### 拍板带出的两笔代码欠账 —— **2026-08-06 已还清**
 
-- [x] **覆盖率门槛进了 `make check`**：新增 `make cover`，跑 `./internal/domain/...`，低于 `COVERAGE_MIN`（85）退出码非零。当前 90.0%。验证过它真会红（门槛提到 95 会红；移走 `space_test.go` 让覆盖率掉到 71.5% 也会红）。
+- [x] **覆盖率门槛进了 `make check`**：新增 `make cover`，跑 `./internal/domain/...`，低于 `COVERAGE_MIN`（85）退出码非零。当前 87.1%。验证过它真会红（门槛提到 95 会红；移走 `space_test.go` 让覆盖率掉到 71.5% 也会红）。
 - [x] **`ErrAlreadyExists` 已落地**：`governance` 加哨兵，`adapters/mysql` 的 `writeErr` 识别 MySQL 1062 后翻译，五种冲突（第二个个人空间 / 第二个团队空间 / 账号重名 / agent slug 重复 / token hash 重复）都有集成测试。**领域层的 fake store 同步加了对应的唯一性检查**——它是行为基准，原先重名时 map 直接赋值会静默顶掉原用户，而真库会拒绝，那种 fake 会让领域测试跑在数据库不可能达到的状态上。
 
 ---
