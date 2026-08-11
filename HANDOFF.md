@@ -36,7 +36,7 @@ docs/06-poc-findings.md → 摄取成 draft
 
 Web 那条链路 0810 在真浏览器会话里手跑过一遍：未登录访问首页 303 → 登录 → 被强制赶去改密页 → 改密后进概览（看到空间与权限）→ 签发 token 拿到明文与可直接粘贴的 MCP 配置块 → 建同事账号拿到生成的初始密码 → 不带 CSRF 的 POST 得到 403。0811 又在真浏览器补验了活动流与完整审计：普通时间线只显示自己全部 + 共享写入，管理员确认后能看到全量，且首条就是本次 `admin.audit.query` meta-audit。
 
-**Web 视觉方向已在 0811 单独进入 Figma 生产设计**：文件是 [ClaraCore Server — Product Direction 01](https://www.figma.com/design/6ObFIgv8rQVrZnEX5WdaMr)，当前基准页为 `03 · Web Workspace`。第一轮偏独立 App 的大标题/舞台式方案已被否决；确认的方向是桌面浏览器工作台：持久左侧导航、顶部面包屑/搜索/环境状态、紧凑指标、筛选表格与双栏工作区。Figma 只代表已确认的设计基准，**尚未同步进 Go 模板/CSS**。
+**Web 生产视觉已在 0811 完成 Figma 验收**：文件是 [ClaraCore Server — Product Direction 01](https://www.figma.com/design/6ObFIgv8rQVrZnEX5WdaMr)。`03 · Web Workspace` 是基准，`04 · Activity Feed`、`05 · Card Review`、`06 · Content Browse` 是生产页，`07 · Responsive & States` 覆盖 390px 窄屏和关键反馈状态。方向是桌面浏览器治理工作台，不是独立 App；14 个组件/组件集覆盖 61 个形态，生产页与组件已通过命名、变量绑定、字体、焦点态、对比度和横向溢出检查。**设计已完成，但尚未同步进 Go 模板/CSS**。
 
 **还缺的是 Continuity**：`shared_line_*` 那 4 个工具要先有 `internal/domain/continuity`（仍是空目录）。
 
@@ -595,13 +595,15 @@ requireAdmin        ↑ 且角色是 admin
 - **会话过期靠 `CleanupSessions` 手动调**，没有定时任务。行会一直堆着——不影响正确性（过期判断在领域层），但表会长。
 - **项目空间与权限管理页没做**，只能靠代码调 `CreateProjectSpace` / `GrantSpaceAccess`。团队真用起来会立刻需要它。
 
-### Web 视觉设计基准（2026-08-11 已确认，尚未实现）
+### Web 视觉设计节点（2026-08-11 已验收，尚未实现）
 
 - Figma 文件：[ClaraCore Server — Product Direction 01](https://www.figma.com/design/6ObFIgv8rQVrZnEX5WdaMr)。
-- 以 `03 · Web Workspace` 为唯一继续扩展的基准；`00`–`02` 是方向过程与被否决方案，只作取舍记录。
+- `03 · Web Workspace` 是工作台基准；生产页是 `04 · Activity Feed`、`05 · Card Review`、`06 · Content Browse`；`07 · Responsive & States` 覆盖 390px 窄屏与加载、空、错误、焦点等状态。`00`–`02` 只保留方向过程与被否决方案。
 - 这是 **Web 治理工作台**，不是独立桌面 App：1440 桌面视口、持久侧栏、顶栏上下文、页面级标题/动作、筛选与表格是基本骨架。
 - 保留现有温暖、可信、低装饰的色彩语气；不要恢复巨型编辑式标题、居中舞台、三张等权大卡，也不要套紫色 AI 渐变或通用 SaaS 圆角卡片墙。
-- 生产设计顺序已经确认：基础 tokens / 组件 → 活动流 → 卡片审核 → 内容浏览 → 响应式与状态补全。设计通过后再同步进 SSR 模板与嵌入 CSS。
+- 设计系统现有 3 个变量集合、61 个变量、9 个文字样式、1 个效果样式；14 个组件/组件集共 61 个形态，覆盖按钮、表单、导航、分页、表格行、反馈状态与业务列表项。
+- 结构验收已过：生产页与组件没有默认命名、占位文案或未绑定填充/描边；统一 Noto Sans SC；390px 根容器无横向溢出；交互控件有焦点态，状态不只靠颜色；关键对比度不低于 5.0:1。
+- 下一阶段不是继续探索视觉，而是按「共享 shell / tokens / 组件 → 活动流 → 卡片审核 → 内容浏览 → 响应式与状态」同步进 SSR 模板与嵌入 CSS。Code Connect 等到代码组件与 Figma 组件稳定一一对应后再接。
 
 ---
 
@@ -635,7 +637,7 @@ requireAdmin        ↑ 且角色是 admin
 
 ## 下一步
 
-**0. 当前工作流：完成 Web 的 Figma 生产设计。** 以 `03 · Web Workspace` 为基准，按「基础 tokens / 组件 → 活动流 → 卡片审核 → 内容浏览 → 响应式与状态」推进。这个阶段只改 Figma 与设计文档；未经页面验收，不把探索稿直接翻进 Go 模板/CSS。
+**0. 当前工作流：把已验收的 Web 生产设计同步进 SSR。** 先落共享 shell、变量与基础组件，再按「活动流 → 卡片审核 → 内容浏览 → 响应式与状态」逐页替换现有 Go 模板与嵌入 CSS。每一页都保留现有路由、权限、CSRF 与领域调用，只改呈现层；完成后同时跑模板测试，并在真浏览器验 1440 与 390px。除非实现暴露真实问题，不再回到方向探索。
 
 **1. 代码下一优先级：Continuity。** `shared_line_*` 4 个工具还没做，`internal/domain/continuity` 仍是空目录。先从 Desktop 的现行契约与 `03-mcp-contract.md` 对齐实体、可见性和四个工具语义，再按现有结构落 Store → Service → MCP Host → 装配与测试；不要直接复制 Desktop 的本地身份或 SQLite 假设。
 
