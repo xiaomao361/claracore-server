@@ -1480,7 +1480,9 @@ func TestAuthenticatedWebWritesAreAuditedWithoutSensitivePayloads(t *testing.T) 
 				gov.tokens = []governance.Token{{ID: "01TOKENAAAAAAAAAAAAAAAAAAA"}}
 			}
 			resp := post(t, srv, tt.path, tt.form, true, true)
-			defer resp.Body.Close()
+			// The audit runs after the handler returns. Drain the response so
+			// net/http completes the middleware chain before inspecting the fake.
+			_ = body(t, resp)
 			if len(act.records) != 1 {
 				t.Fatalf("每个已认证写请求必须留一条记录，实际 %d", len(act.records))
 			}
@@ -1508,7 +1510,7 @@ func TestWebWriteAuditCapturesRenderedFailureAndCreatedTargets(t *testing.T) {
 			"new":     {"new-password-one"},
 			"confirm": {"different-password"},
 		}, true, true)
-		defer resp.Body.Close()
+		_ = body(t, resp)
 
 		// Form validation deliberately re-renders with HTTP 200. The audit
 		// outcome must still describe the failed action, not the render status.
@@ -1542,7 +1544,7 @@ func TestWebWriteAuditCapturesRenderedFailureAndCreatedTargets(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv, _, _, act := newActivityWeb(t, governance.RoleAdmin)
 			resp := post(t, srv, tt.path, tt.form, true, true)
-			defer resp.Body.Close()
+			_ = body(t, resp)
 
 			if len(act.records) != 1 {
 				t.Fatalf("expected one audit record, got %d", len(act.records))
@@ -1563,7 +1565,7 @@ func TestAuthenticatedCSRFRejectionIsAuditedAsFailure(t *testing.T) {
 	resp := post(t, srv, "/tokens", url.Values{
 		"agent": {"clara"}, "name": {"MacBook"},
 	}, true, false)
-	defer resp.Body.Close()
+	_ = body(t, resp)
 
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("missing CSRF status = %d, want 403", resp.StatusCode)
@@ -1593,7 +1595,7 @@ func TestReviewAuditCarriesResolvedSpaceForSharedVisibility(t *testing.T) {
 	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
 		"action": {"reject"}, "title": {"不需要的卡"},
 	}, true, true)
-	defer resp.Body.Close()
+	_ = body(t, resp)
 	if len(act.records) != 1 || act.records[0].SpaceID == nil || *act.records[0].SpaceID != spTeam {
 		t.Fatalf("共享写入必须带领域层解析后的空间，实际 %+v", act.records)
 	}
