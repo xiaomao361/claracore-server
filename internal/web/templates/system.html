@@ -1,0 +1,31 @@
+{{define "content"}}
+<section class="metric-grid" aria-label="系统运行摘要">
+  <div class="metric"><span>服务版本</span><strong><code>{{.Version}}</code></strong><small>环境 {{.Environment}}</small></div>
+  <div class="metric"><span>MySQL</span><strong>{{.DatabaseStatus}}</strong><small>知识、治理、会话与审计存储</small></div>
+  <div class="metric"><span>Embedding</span><strong>{{if .Embedding.Enabled}}已启用{{else}}全文降级{{end}}</strong><small>{{if .Embedding.Model}}{{.Embedding.Model}}{{else}}{{.EmbeddingProvider}}{{end}}</small></div>
+  <div class="metric"><span>查询缓存</span><strong>{{if .CacheEnabled}}已启用{{else}}未启用{{end}}</strong><small>{{if .CacheEnabled}}命中 {{.CacheHits}} / 未命中 {{.CacheMisses}}{{else}}不影响核心功能{{end}}</small></div>
+</section>
+
+<div class="overview-panels">
+  <section class="card">
+    <h2>依赖与降级</h2>
+    <dl class="system-list">
+      <div><dt>MySQL</dt><dd>{{.DatabaseStatus}}</dd></div>
+      <div><dt>Redis</dt><dd>{{.RedisStatus}}</dd></div>
+      <div><dt>Embedding provider</dt><dd>{{if .EmbeddingProvider}}<code>{{.EmbeddingProvider}}</code>{{else}}disabled{{end}}</dd></div>
+      <div><dt>索引队列</dt><dd>{{if .Embedding.Enabled}}待处理 {{.Embedding.Stats.Pending}}，已完成 {{.Embedding.Stats.Ready}}，失败 {{.Embedding.Stats.Failed}}{{else}}未启用语义索引，检索使用中文全文匹配{{end}}</dd></div>
+    </dl>
+  </section>
+  <section class="card">
+    <h2>当前固定策略</h2>
+    <dl class="system-list">
+      <div><dt>Trace 保留期</dt><dd>30 天滚动清理</dd></div>
+      <div><dt>治理与 meta-audit</dt><dd>长期保留，不进入自动清理</dd></div>
+      <div><dt>租户配额</dt><dd>当前版本没有可编辑的租户级配额，避免展示不会生效的设置</dd></div>
+      <div><dt>运行形态</dt><dd>单实例；多实例协调尚未启用</dd></div>
+    </dl>
+  </section>
+</div>
+
+<p><a href="/admin/indexing">查看语义索引详情与失败项 →</a></p>
+{{end}}

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"claracore-server/internal/domain/governance"
@@ -85,6 +86,7 @@ type reviewDetailData struct {
 	pageData
 	Card                knowledge.Card
 	Space               governance.Space
+	Editable            bool
 	Triggers            string
 	DuplicateCandidates []knowledge.CardDuplicateCandidate
 }
@@ -104,6 +106,7 @@ func (h *Host) handleReviewDetail(w http.ResponseWriter, r *http.Request) {
 		pageData: h.page(r, "审核："+card.Title, "review"),
 		Card:     card,
 		Space:    space,
+		Editable: card.Status == knowledge.CardDraft,
 		// 召回条件在表单里是一行一条的文本域。比一堆 <input> 好用得多，
 		// 而审核时最常做的动作正是「加两三条触发条件」。
 		Triggers: triggerLines(card),
@@ -113,8 +116,8 @@ func (h *Host) handleReviewDetail(w http.ResponseWriter, r *http.Request) {
 		h.logger.Warn("读取重复知识卡候选失败", "card_id", card.ID, "error", err)
 		data.Notice = "重复候选暂时不可用；你仍可继续审核这张卡。"
 	}
-	if card.Status != knowledge.CardDraft {
-		data.Notice = strings.TrimSpace(data.Notice + " 这张卡已经不是待审状态了（当前：" + card.Status + "），下面的改动仍会生效。")
+	if !data.Editable {
+		data.Notice = strings.TrimSpace(data.Notice + " 这张卡已经不是待审草稿，Web 仅提供只读查看。需要修正已发布内容时，请让 agent 走正常更新流程。")
 	}
 	_ = p
 	h.render(w, "review_detail.html", data)
@@ -136,6 +139,23 @@ func triggerLines(c knowledge.Card) string {
 func (h *Host) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 	p, _ := principalFrom(r.Context())
 	id := platform.ID(r.PathValue("id"))
+	card, scope, err := h.loadWritableCard(r, id)
+	if err != nil {
+		markWebAuditFailed(r)
+		h.notFoundOr500(w, r, err, "读取卡片失败")
+		return
+	}
+	if card.Status != knowledge.CardDraft {
+		markWebAuditFailed(r)
+		http.Error(w, "只有待审草稿可以在 Web 中修改", http.StatusConflict)
+		return
+	}
+	expectedVersion, err := strconv.Atoi(r.FormValue("version"))
+	if err != nil || expectedVersion != card.Version {
+		markWebAuditFailed(r)
+		http.Error(w, "卡片版本已经变化，请刷新后重新审核", http.StatusConflict)
+		return
+	}
 
 	var status string
 	switch r.FormValue("action") {
@@ -154,10 +174,11 @@ func (h *Host) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 
 	triggers := splitTriggers(r.FormValue("triggers"))
 	updated, err := h.know.UpdateCard(r.Context(), knowledge.UpdateCardInput{
-		TenantID:       p.TenantID,
-		ID:             id,
-		WritableSpaces: h.writableSpaces(r),
-		Status:         &status,
+		TenantID:        p.TenantID,
+		ID:              id,
+		WritableSpaces:  writableSpaceIDs(scope),
+		ExpectedVersion: &expectedVersion,
+		Status:          &status,
 		// 标题与类型也能改：摄取给的标题是文件名或第一个 #，
 		// cardType 一律是「摄取原料」。不让改的话，审完的卡类型
 		// 全是一个值，card_search 的 cardType 过滤就废了。
@@ -189,7 +210,7 @@ func (h *Host) renderReviewError(w http.ResponseWriter, r *http.Request, id plat
 	space, _ := scope.Space(card.SpaceID)
 	data := reviewDetailData{
 		pageData: h.page(r, "审核："+card.Title, "review"),
-		Card:     card, Space: space, Triggers: r.FormValue("triggers"),
+		Card:     card, Space: space, Editable: card.Status == knowledge.CardDraft, Triggers: r.FormValue("triggers"),
 	}
 	// 把人刚填的内容放回表单，别让他重打一遍
 	data.Card.Title = firstNonEmpty(r.FormValue("title"), card.Title)
@@ -217,11 +238,13 @@ type browseData struct {
 	Total      int
 	NextCursor string
 	NextURL    string
+	ListURL    string
+	SpaceNames map[platform.ID]string
 }
 
 func (h *Host) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	p, _ := principalFrom(r.Context())
-	data := browseData{pageData: h.page(r, "内容浏览", "browse")}
+	data := browseData{pageData: h.page(r, "内容浏览", "browse"), ListURL: r.URL.RequestURI(), SpaceNames: make(map[platform.ID]string)}
 
 	scope, err := h.gov.Scope(r.Context(), governance.Identity{TenantID: p.TenantID, UserID: p.UserID})
 	if err != nil {
@@ -235,6 +258,7 @@ func (h *Host) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	for _, a := range scope.All() {
 		if a.CanRead {
 			data.Spaces = append(data.Spaces, a)
+			data.SpaceNames[a.Space.ID] = a.Space.Name
 		}
 	}
 	if len(readable) == 0 {
@@ -298,6 +322,7 @@ type browseDetailData struct {
 	// Writable 决定要不要显示「去审核」的入口。
 	Writable            bool
 	DuplicateCandidates []knowledge.CardDuplicateCandidate
+	BackURL             string
 }
 
 func (h *Host) handleBrowseDetail(w http.ResponseWriter, r *http.Request) {
@@ -312,7 +337,7 @@ func (h *Host) handleBrowseDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	readable := scope.Readable()
 
-	data := browseDetailData{pageData: h.page(r, "详情", "browse"), Kind: kind}
+	data := browseDetailData{pageData: h.page(r, "详情", "browse"), Kind: kind, BackURL: safeBrowseBackURL(r.URL.Query().Get("back"))}
 	switch kind {
 	case knowledge.EntityMemory:
 		m, links, err := h.know.GetMemory(r.Context(), p.TenantID, id, readable)
@@ -343,6 +368,13 @@ func (h *Host) handleBrowseDetail(w http.ResponseWriter, r *http.Request) {
 	h.render(w, "browse_detail.html", data)
 }
 
+func safeBrowseBackURL(raw string) string {
+	if raw == "/browse" || strings.HasPrefix(raw, "/browse?") {
+		return raw
+	}
+	return "/browse"
+}
+
 // ---------------------------------------------------------------------------
 // 共用
 // ---------------------------------------------------------------------------
@@ -371,12 +403,7 @@ func (h *Host) loadWritableCard(r *http.Request, id platform.ID) (knowledge.Card
 	return card, scope, err
 }
 
-func (h *Host) writableSpaces(r *http.Request) []platform.ID {
-	p, _ := principalFrom(r.Context())
-	scope, err := h.gov.Scope(r.Context(), governance.Identity{TenantID: p.TenantID, UserID: p.UserID})
-	if err != nil {
-		return nil
-	}
+func writableSpaceIDs(scope governance.SpaceScope) []platform.ID {
 	var out []platform.ID
 	for _, a := range scope.All() {
 		if a.CanWrite {

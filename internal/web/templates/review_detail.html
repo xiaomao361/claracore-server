@@ -14,8 +14,10 @@
 </section>
 {{end}}
 
+{{if .Editable}}
 <form method="post" action="/review/{{.Card.ID}}" class="review">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <input type="hidden" name="version" value="{{.Card.Version}}">
 
   <div class="review-original">
     <h2>原文</h2>
@@ -36,8 +38,15 @@
     <p class="hint">没有召回条件的卡永远不会被 card_recall 命中——那是这个产品的核心能力。</p>
     <div class="actions">
       <button type="submit" name="action" value="publish">确认发布</button>
-      <button type="submit" name="action" value="reject" class="danger">标记不需要</button>
+      <button type="submit" name="action" value="reject" class="danger" data-confirm-message="确认将这张草稿标记为不需要？它会退出待审队列并保留为历史记录。">标记不需要</button>
     </div>
   </div>
 </form>
+{{else}}
+<section class="card narrow">
+  <h2>此卡片不可在 Web 中编辑</h2>
+  <p>审核队列只处理待审草稿。已发布或已归档内容需要由 agent 通过正常更新流程修正，以保留完整版本和审计记录。</p>
+  <p><a href="/browse/{{.Card.ID}}?kind=card">查看卡片详情 →</a></p>
+</section>
+{{end}}
 {{end}}

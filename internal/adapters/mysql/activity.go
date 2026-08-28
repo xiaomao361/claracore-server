@@ -63,13 +63,39 @@ func (s *ActivityStore) ListVisible(ctx context.Context, query activity.VisibleQ
 		args = append(args, idArgs(query.ReadableSharedSpaceIDs)...)
 	}
 	where.WriteString(")")
+	whereString, args := appendActivityFilters(where.String(), args, query.Action, query.Outcome, query.AgentID, query.SpaceID, query.Since)
 
-	return s.list(ctx, where.String(), args, query.AfterCreatedAt, query.AfterID, query.Limit)
+	return s.list(ctx, whereString, args, query.AfterCreatedAt, query.AfterID, query.Limit)
 }
 
 func (s *ActivityStore) ListAdmin(ctx context.Context, query activity.AdminQuery) ([]activity.Event, error) {
-	return s.list(ctx, " WHERE tenant_id = ?", []any{string(query.TenantID)},
+	where, args := appendActivityFilters(" WHERE tenant_id = ?", []any{string(query.TenantID)}, query.Action, query.Outcome, query.AgentID, query.SpaceID, query.Since)
+	return s.list(ctx, where, args,
 		query.AfterCreatedAt, query.AfterID, query.Limit)
+}
+
+func appendActivityFilters(where string, args []any, action, outcome string, agentID, spaceID platform.ID, since time.Time) (string, []any) {
+	if action != "" {
+		where += " AND action LIKE ?"
+		args = append(args, "%"+action+"%")
+	}
+	if outcome != "" {
+		where += " AND outcome = ?"
+		args = append(args, outcome)
+	}
+	if agentID != "" {
+		where += " AND agent_id = ?"
+		args = append(args, string(agentID))
+	}
+	if spaceID != "" {
+		where += " AND space_id = ?"
+		args = append(args, string(spaceID))
+	}
+	if !since.IsZero() {
+		where += " AND created_at >= ?"
+		args = append(args, since.UTC())
+	}
+	return where, args
 }
 
 func (s *ActivityStore) CountContextFeedback(ctx context.Context, query activity.ContextFeedbackQuery) (activity.ContextFeedbackQuality, error) {

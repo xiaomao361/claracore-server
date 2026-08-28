@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"claracore-server/internal/domain/governance"
@@ -174,12 +175,27 @@ type overviewTotals struct {
 	Drafts         int
 }
 
+type overviewAgent struct {
+	ID           platform.ID
+	Devices      []string
+	TokenCount   int
+	ActiveTokens int
+	LastUsedAt   *time.Time
+}
+
+type overviewRecentCard struct {
+	Item      knowledge.ContentItem
+	SpaceName string
+}
+
 func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 	p, _ := principalFrom(r.Context())
 	data := struct {
 		pageData
-		Spaces []overviewSpace
-		Totals overviewTotals
+		Spaces      []overviewSpace
+		Totals      overviewTotals
+		Agents      []overviewAgent
+		RecentCards []overviewRecentCard
 	}{pageData: h.page(r, "概览", "overview")}
 
 	scope, err := h.gov.Scope(r.Context(), governance.Identity{TenantID: p.TenantID, UserID: p.UserID})
@@ -191,6 +207,8 @@ func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	readable := scope.Readable()
+	var sharedReadable []platform.ID
+	spaceNames := make(map[platform.ID]string)
 	statsByID := map[platform.ID]knowledge.SpaceStats{}
 	if len(readable) > 0 {
 		stats, err := h.know.SpaceStats(r.Context(), p.TenantID, readable)
@@ -209,6 +227,10 @@ func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		st := statsByID[a.Space.ID]
+		spaceNames[a.Space.ID] = a.Space.Name
+		if a.Space.Type == governance.SpaceTeam || a.Space.Type == governance.SpaceProject {
+			sharedReadable = append(sharedReadable, a.Space.ID)
+		}
 		data.Spaces = append(data.Spaces, overviewSpace{Space: a.Space, Stats: st, Write: a.CanWrite})
 		data.Totals.Spaces++
 		if a.CanWrite {
@@ -218,6 +240,47 @@ func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 		data.Totals.Cards += st.Cards
 		// 「本空间还有 N 条待审」正是 04 §6.1 点名的那个空白
 		data.Totals.Drafts += st.DraftCards
+	}
+
+	tokens, err := h.gov.ListTokens(r.Context(), p.TenantID, p.UserID)
+	if err != nil {
+		h.logger.Warn("读取概览 agent 失败", "error", err)
+		data.Notice = "Agent 接入状态暂时不可用。"
+	} else {
+		byAgent := make(map[platform.ID]int)
+		for _, token := range tokens {
+			idx, ok := byAgent[token.AgentID]
+			if !ok {
+				idx = len(data.Agents)
+				byAgent[token.AgentID] = idx
+				data.Agents = append(data.Agents, overviewAgent{ID: token.AgentID})
+			}
+			agent := &data.Agents[idx]
+			agent.TokenCount++
+			agent.Devices = append(agent.Devices, token.Name)
+			if token.RevokedAt == nil {
+				agent.ActiveTokens++
+			}
+			if token.LastUsedAt != nil && (agent.LastUsedAt == nil || token.LastUsedAt.After(*agent.LastUsedAt)) {
+				lastUsed := *token.LastUsedAt
+				agent.LastUsedAt = &lastUsed
+			}
+		}
+	}
+
+	if len(sharedReadable) > 0 {
+		res, err := h.know.ListContents(r.Context(), knowledge.ListContentsInput{
+			TenantID: p.TenantID, Spaces: sharedReadable, Kind: knowledge.EntityCard,
+			Statuses: []string{knowledge.CardActive}, Limit: 6,
+		})
+		if err != nil {
+			h.logger.Warn("读取概览共享卡片失败", "error", err)
+			data.Notice = strings.TrimSpace(data.Notice + " 团队近期卡片暂时不可用。")
+		} else {
+			for _, item := range res.Items {
+				data.RecentCards = append(data.RecentCards, overviewRecentCard{Item: item, SpaceName: spaceNames[item.SpaceID]})
+			}
+		}
 	}
 	h.render(w, "overview.html", data)
 }

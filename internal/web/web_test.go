@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html"
 	"io"
 	"log/slog"
@@ -270,7 +271,31 @@ func newFakeContinuity() *fakeContinuity {
 
 func (f *fakeContinuity) List(_ context.Context, in continuity.ListInput) ([]continuity.LineSummary, error) {
 	f.lastInput = in
-	return f.lines, f.err
+	lines := f.lines
+	if in.Limit > 0 && len(lines) > in.Limit {
+		lines = lines[:in.Limit]
+	}
+	return lines, f.err
+}
+
+func (f *fakeContinuity) ListPage(_ context.Context, in continuity.ListInput) (continuity.ListPage, error) {
+	f.lastInput = in
+	start := 0
+	if in.Cursor != "" {
+		start = 30
+	}
+	if start >= len(f.lines) {
+		return continuity.ListPage{}, f.err
+	}
+	end := start + in.Limit
+	if end > len(f.lines) {
+		end = len(f.lines)
+	}
+	page := continuity.ListPage{Lines: f.lines[start:end]}
+	if end < len(f.lines) {
+		page.NextCursor = "next-cursor"
+	}
+	return page, f.err
 }
 
 func (f *fakeContinuity) Get(_ context.Context, in continuity.GetInput) (continuity.ResumePacket, error) {
@@ -934,6 +959,29 @@ func TestOverviewShowsDraftBacklog(t *testing.T) {
 	}
 }
 
+func TestOverviewShowsAgentsAndRecentSharedCards(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	lastUsed := time.Date(2026, 8, 28, 8, 0, 0, 0, time.UTC)
+	gov.tokens = []governance.Token{{ID: "token", AgentID: "01AGENTAAAAAAAAAAAAAAAAAAA", Name: "MacBook", Prefix: "ccs", LastUsedAt: &lastUsed}}
+	know := &fakeKnow{items: []knowledge.ContentItem{{
+		Ref: knowledge.Ref{Type: knowledge.EntityCard, ID: "01CARDAAAAAAAAAAAAAAAAAAAA"}, SpaceID: spTeam,
+		Title: "团队发布卡片", Status: knowledge.CardActive, AuthorUserID: userOther, UpdatedAt: lastUsed,
+	}}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), &fakeActivity{}, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/", true))
+	for _, want := range []string{"我的 Agent", "MacBook", "团队近期卡片", "团队发布卡片", "团队"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("概览缺少 %q", want)
+		}
+	}
+	if know.lastList.Kind != knowledge.EntityCard || len(know.lastList.Statuses) != 1 || know.lastList.Statuses[0] != knowledge.CardActive || len(know.lastList.Spaces) != 1 || know.lastList.Spaces[0] != spTeam {
+		t.Fatalf("概览近期动态必须只查共享空间 active 卡片，实际 %+v", know.lastList)
+	}
+}
+
 func TestWorkspaceShellKeepsNavigationAndAccessibilityContracts(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, false)
 	page := body(t, get(t, srv, "/", true))
@@ -963,6 +1011,25 @@ func TestWorkspaceShellKeepsNavigationAndAccessibilityContracts(t *testing.T) {
 	}
 	if strings.Contains(css, "transition: all") || strings.Contains(css, "transition-property: all") {
 		t.Fatal("界面样式不得使用 transition: all")
+	}
+}
+
+func TestAdminSystemPageReportsActualRuntimeShape(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	know := &fakeKnow{embedHealth: knowledge.EmbeddingHealth{Enabled: true, Model: "bge-m3", Stats: knowledge.EmbeddingStats{Ready: 12, Failed: 1}}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), &fakeActivity{}, logger, Options{
+		Version: "v-test", Env: "development", RedisConfigured: true, EmbeddingProvider: "ollama",
+		DatabaseHealth:      func(context.Context) error { return nil },
+		EmbeddingCacheStats: func() (uint64, uint64, bool) { return 7, 3, true },
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/admin/system", true))
+	for _, want := range []string{"系统状态", "v-test", "development", "连接正常", "尚未装配 Redis", "bge-m3", "命中 7", "租户配额"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("系统页缺少 %q", want)
+		}
 	}
 }
 
@@ -999,6 +1066,21 @@ func TestSecurityHeadersArePresent(t *testing.T) {
 	}
 	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatal("缺少 nosniff")
+	}
+}
+
+func TestConsequentialActionsHaveExplicitConfirmation(t *testing.T) {
+	srv, gov := newTestWeb(t, governance.RoleAdmin, false)
+	gov.tokens = []governance.Token{{ID: "01TOKENAAAAAAAAAAAAAAAAAAA", Name: "MacBook", Prefix: "ccs_test"}}
+	gov.permissions = []governance.Permission{{SpaceID: spTeam, UserID: userOther, CanRead: true}}
+	for _, path := range []string{"/tokens", "/admin/members", "/admin/spaces", "/continuity/01LINEAAAAAAAAAAAAAAAAAAAA", "/review/01CARDAAAAAAAAAAAAAAAAAAAA"} {
+		page, errMsg := getBody(t, srv, path)
+		if errMsg != "" {
+			t.Fatalf("%s: %s", path, errMsg)
+		}
+		if !strings.Contains(page, "data-confirm-message=") {
+			t.Fatalf("%s 的高影响操作缺少二次确认", path)
+		}
 	}
 }
 
@@ -1095,7 +1177,7 @@ func TestReviewPublishGoesThroughUpdateCard(t *testing.T) {
 
 	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
 		"action": {"publish"}, "title": {"审过之后的标题"}, "cardType": {"协作安全"},
-		"understanding": {"我想明白的那一层"}, "triggers": {"第一条\n\n第二条\n"},
+		"understanding": {"我想明白的那一层"}, "triggers": {"第一条\n\n第二条\n"}, "version": {"1"},
 	}, true, true)
 	defer resp.Body.Close()
 
@@ -1128,7 +1210,7 @@ func TestReviewRejectUsesDeprecated(t *testing.T) {
 	srv, _, know := newContentWeb(t, governance.RoleMember)
 
 	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
-		"action": {"reject"}, "title": {"不需要的文档"}, "cardType": {"摄取原料"},
+		"action": {"reject"}, "title": {"不需要的文档"}, "cardType": {"摄取原料"}, "version": {"1"},
 	}, true, true)
 	defer resp.Body.Close()
 
@@ -1141,7 +1223,7 @@ func TestReviewRejectsUnknownAction(t *testing.T) {
 	srv, _, know := newContentWeb(t, governance.RoleMember)
 
 	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
-		"action": {"delete-everything"},
+		"action": {"delete-everything"}, "version": {"1"},
 	}, true, true)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
@@ -1162,7 +1244,7 @@ func TestReviewKeepsInputOnValidationError(t *testing.T) {
 
 	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
 		"action": {"publish"}, "title": {"我刚打的标题"},
-		"understanding": {"我刚打的理解"}, "triggers": {"我刚写的召回条件"},
+		"understanding": {"我刚打的理解"}, "triggers": {"我刚写的召回条件"}, "version": {"1"},
 	}, true, true)
 	page := body(t, resp)
 
@@ -1170,6 +1252,44 @@ func TestReviewKeepsInputOnValidationError(t *testing.T) {
 		if !strings.Contains(page, typed) {
 			t.Fatalf("校验失败后必须把人填的内容放回表单，丢了 %q", typed)
 		}
+	}
+}
+
+func TestReviewRefusesNonDraftCard(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+	know.card.Status = knowledge.CardActive
+
+	page, errMsg := getBody(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA")
+	if errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	if strings.Contains(page, "name=\"action\"") || !strings.Contains(page, "不可在 Web 中编辑") {
+		t.Fatal("非草稿只能只读查看，不应渲染审核提交按钮")
+	}
+
+	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
+		"action": {"publish"}, "version": {"1"},
+	}, true, true)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("非草稿提交应返回 409，实际 %d", resp.StatusCode)
+	}
+	if know.lastUpdate.ID != "" {
+		t.Fatal("非草稿提交不应进入领域更新")
+	}
+}
+
+func TestReviewRejectsStaleVersion(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
+		"action": {"publish"}, "version": {"0"},
+	}, true, true)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("过期版本提交应返回 409，实际 %d", resp.StatusCode)
+	}
+	if know.lastUpdate.ID != "" {
+		t.Fatal("过期版本不应进入领域更新")
 	}
 }
 
@@ -1253,6 +1373,26 @@ func TestBrowseFullTextQueryIsBoundedAndPreservedInPagination(t *testing.T) {
 	}
 }
 
+func TestBrowseShowsSpaceAuthorAndPreservesListContext(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+	agentID := platform.ID("01AGENTAAAAAAAAAAAAAAAAAAA")
+	know.items = []knowledge.ContentItem{{
+		Ref: knowledge.Ref{Type: knowledge.EntityCard, ID: "01CARDAAAAAAAAAAAAAAAAAAAA"}, SpaceID: spPers,
+		Title: "带来源的卡片", Status: knowledge.CardActive, AuthorUserID: userMe, AuthorAgentID: &agentID,
+	}}
+	page := body(t, get(t, srv, "/browse?kind=card&q="+url.QueryEscape("部署 回滚")+"&space="+string(spPers), true))
+	for _, want := range []string{"毛仔", string(agentID), "back="} {
+		if !strings.Contains(page, want) {
+			t.Errorf("内容列表缺少 %q", want)
+		}
+	}
+	back := "/browse?kind=card&q=" + url.QueryEscape("部署 回滚") + "&space=" + string(spPers)
+	detail := body(t, get(t, srv, "/browse/01CARDAAAAAAAAAAAAAAAAAAAA?kind=card&back="+url.QueryEscape(back), true))
+	if !strings.Contains(html.UnescapeString(detail), `href="`+back+`"`) {
+		t.Fatalf("详情返回链接应保留原筛选，实际 %s", detail)
+	}
+}
+
 func TestBrowseFilterFormAutoSubmitsWithoutInlineScript(t *testing.T) {
 	srv, _, _ := newContentWeb(t, governance.RoleMember)
 
@@ -1317,6 +1457,29 @@ func TestContinuityPageShowsSharedLinesAndFilters(t *testing.T) {
 	}
 	if lines.lastInput.TenantID != tenantA || !lines.lastInput.AllAgents || lines.lastInput.Status != "all" {
 		t.Fatalf("共同线查询边界错误: %+v", lines.lastInput)
+	}
+}
+
+func TestContinuityPagePaginatesWithoutSilentTruncation(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	lines := newFakeContinuity()
+	base := lines.lines[0]
+	lines.lines = make([]continuity.LineSummary, 62)
+	for i := range lines.lines {
+		lines.lines[i] = base
+		lines.lines[i].ID = platform.ID(fmt.Sprintf("line-%02d", i))
+		lines.lines[i].Title = fmt.Sprintf("共同线 %02d", i)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, lines, &fakeActivity{}, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/continuity?status=all&cursor=page-two", true))
+	if lines.lastInput.Cursor != "page-two" || lines.lastInput.Limit != 30 {
+		t.Fatalf("第二页应使用不透明游标，实际 %+v", lines.lastInput)
+	}
+	if !strings.Contains(page, "回到第一页") || !strings.Contains(page, "下一页") {
+		t.Fatal("共同线分页应显示第一页与下一页导航")
 	}
 }
 
@@ -1409,6 +1572,21 @@ func TestActivityPassesOnlyReadableSharedSpaces(t *testing.T) {
 	}
 }
 
+func TestActivityFiltersReachDomainAndSurvivePagination(t *testing.T) {
+	srv, _, _, act := newActivityWeb(t, governance.RoleMember)
+	act.visiblePage = activity.Page{NextCursor: "cursor+/="}
+	path := "/activity?action=card.update&outcome=error&agent=" + url.QueryEscape("agent-a") + "&space=" + url.QueryEscape(string(spTeam)) + "&range=7d"
+	page := html.UnescapeString(body(t, get(t, srv, path, true)))
+	if act.visibleInput.Action != "card.update" || act.visibleInput.Outcome != activity.OutcomeError || act.visibleInput.AgentID != "agent-a" || act.visibleInput.SpaceID != spTeam || act.visibleInput.Since.IsZero() {
+		t.Fatalf("活动筛选没有下推到领域层: %+v", act.visibleInput)
+	}
+	for _, want := range []string{"action=card.update", "outcome=error", "agent=agent-a", "space=" + string(spTeam), "range=7d", "cursor=cursor%2B%2F%3D"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("活动分页没有保留 %q: %s", want, page)
+		}
+	}
+}
+
 func TestAdminAuditRequiresConfirmationAndRecordsBeforeQuery(t *testing.T) {
 	srv, _, _, act := newActivityWeb(t, governance.RoleAdmin)
 
@@ -1434,6 +1612,23 @@ func TestAdminAuditRequiresConfirmationAndRecordsBeforeQuery(t *testing.T) {
 	meta := act.records[0]
 	if meta.Kind != activity.KindMetaAudit || meta.Access != activity.AccessRead || meta.Action != "admin.audit.query" {
 		t.Fatalf("meta-audit 形态不对: %+v", meta)
+	}
+}
+
+func TestAdminAuditFiltersReachDomainAndPaginationForm(t *testing.T) {
+	srv, _, _, act := newActivityWeb(t, governance.RoleAdmin)
+	act.adminPage = activity.Page{NextCursor: "next-page"}
+	resp := post(t, srv, "/admin/audit", url.Values{
+		"action": {"token"}, "outcome": {activity.OutcomeSuccess}, "agent": {"agent-a"}, "space": {string(spTeam)}, "range": {"24h"},
+	}, true, true)
+	page := body(t, resp)
+	if act.adminInput.Action != "token" || act.adminInput.Outcome != activity.OutcomeSuccess || act.adminInput.AgentID != "agent-a" || act.adminInput.SpaceID != spTeam || act.adminInput.Since.IsZero() {
+		t.Fatalf("审计筛选没有下推到领域层: %+v", act.adminInput)
+	}
+	for _, want := range []string{`name="action" value="token"`, `name="outcome" value="success"`, `name="agent" value="agent-a"`, `name="space" value="` + string(spTeam) + `"`, `name="range" value="24h"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("审计下一页表单没有保留 %q", want)
+		}
 	}
 }
 
@@ -1593,7 +1788,7 @@ func TestReviewAuditCarriesResolvedSpaceForSharedVisibility(t *testing.T) {
 	know.card.SpaceID = spTeam
 
 	resp := post(t, srv, "/review/01CARDAAAAAAAAAAAAAAAAAAAA", url.Values{
-		"action": {"reject"}, "title": {"不需要的卡"},
+		"action": {"reject"}, "title": {"不需要的卡"}, "version": {"1"},
 	}, true, true)
 	_ = body(t, resp)
 	if len(act.records) != 1 || act.records[0].SpaceID == nil || *act.records[0].SpaceID != spTeam {

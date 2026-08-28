@@ -97,12 +97,18 @@ type activityService interface {
 // 知识卡是并列领域，因此在 Web 中使用独立页面，不混进内容类型筛选。
 type continuityService interface {
 	List(ctx context.Context, in continuity.ListInput) ([]continuity.LineSummary, error)
+	ListPage(ctx context.Context, in continuity.ListInput) (continuity.ListPage, error)
 	Get(ctx context.Context, in continuity.GetInput) (continuity.ResumePacket, error)
 	SetStatus(ctx context.Context, in continuity.SetStatusInput) (continuity.ResumePacket, error)
 }
 
 type Options struct {
-	Version string
+	Version             string
+	Env                 string
+	DatabaseHealth      func(context.Context) error
+	RedisConfigured     bool
+	EmbeddingProvider   string
+	EmbeddingCacheStats func() (hits, misses uint64, enabled bool)
 	// PublicMCPURL 是给用户复制的 MCP 连接地址。
 	//
 	// 必须可配：服务监听的是 127.0.0.1:51890，而用户要填进 agent 配置的
@@ -159,7 +165,7 @@ var pages = []string{
 	"indexing.html",
 	"review.html", "review_detail.html", "browse.html", "browse_detail.html",
 	"continuity.html", "continuity_detail.html",
-	"activity.html", "audit_confirm.html", "audit.html",
+	"activity.html", "audit_confirm.html", "audit.html", "system.html",
 }
 
 func parseTemplates() map[string]*template.Template {
@@ -232,6 +238,7 @@ func (h *Host) Handler() http.Handler {
 	mux.Handle("POST /admin/indexing/retry", h.requireAdmin(http.HandlerFunc(h.handleIndexingRetry)))
 	mux.Handle("GET /admin/audit", h.requireAdmin(http.HandlerFunc(h.handleAuditConfirm)))
 	mux.Handle("POST /admin/audit", h.requireAdmin(http.HandlerFunc(h.handleAudit)))
+	mux.Handle("GET /admin/system", h.requireAdmin(http.HandlerFunc(h.handleSystem)))
 
 	return securityHeaders(mux)
 }

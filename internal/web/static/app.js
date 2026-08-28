@@ -11,6 +11,16 @@ document.addEventListener("change", function (event) {
   }
 });
 
+// Consequential actions ask for an explicit second confirmation. The action
+// name is repeated in the prompt so the choice is understandable on its own.
+document.addEventListener("submit", function (event) {
+  var submitter = event.submitter;
+  var message = (submitter && submitter.dataset.confirmMessage) || event.target.dataset.confirmMessage;
+  if (message && !window.confirm(message)) {
+    event.preventDefault();
+  }
+});
+
 // Copy is an enhancement only: the preformatted value remains selectable when
 // Clipboard API access is unavailable (for example on an insecure origin).
 document.addEventListener("click", async function (event) {

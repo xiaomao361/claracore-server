@@ -269,6 +269,35 @@ func TestListVisibleBuildsBoundedKeysetQuery(t *testing.T) {
 	}
 }
 
+func TestListFiltersAreValidatedAndPassedToStore(t *testing.T) {
+	store := &fakeStore{}
+	svc, _ := newTestService(store)
+	_, err := svc.ListVisible(context.Background(), ListVisibleInput{
+		TenantID: "tenant", UserID: "user", Action: " card.update ", Outcome: OutcomeError,
+		AgentID: "agent", SpaceID: "space", Since: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := store.visibleQueries[0]
+	if q.Action != "card.update" || q.Outcome != OutcomeError || q.AgentID != "agent" || q.SpaceID != "space" || q.Since.IsZero() {
+		t.Fatalf("筛选应原样下推到可见性查询，实际 %+v", q)
+	}
+	_, err = svc.ListAdmin(context.Background(), ListAdminInput{
+		TenantID: "tenant", Action: "token", Outcome: OutcomeSuccess, AgentID: "agent", SpaceID: "space", Since: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	aq := store.adminQueries[0]
+	if aq.Action != "token" || aq.Outcome != OutcomeSuccess || aq.AgentID != "agent" || aq.SpaceID != "space" || aq.Since.IsZero() {
+		t.Fatalf("筛选应原样下推到管理员查询，实际 %+v", aq)
+	}
+	if _, err := svc.ListAdmin(context.Background(), ListAdminInput{TenantID: "tenant", Outcome: "maybe"}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("非法结果筛选应拒绝，实际 %v", err)
+	}
+}
+
 func TestListVisibleRejectsInvalidScopeAndCursor(t *testing.T) {
 	svc, _ := newTestService(&fakeStore{})
 	tests := []ListVisibleInput{

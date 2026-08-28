@@ -2,9 +2,12 @@ package continuity
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"claracore-server/internal/platform"
 )
@@ -25,6 +28,12 @@ type ListInput struct {
 	AllAgents bool
 	Status    string
 	Limit     int
+	Cursor    string
+}
+
+type ListPage struct {
+	Lines      []LineSummary
+	NextCursor string
 }
 
 func (s *Service) List(ctx context.Context, in ListInput) ([]LineSummary, error) {
@@ -43,10 +52,18 @@ func (s *Service) List(ctx context.Context, in ListInput) ([]LineSummary, error)
 	if in.Limit > MaxListLimit {
 		in.Limit = MaxListLimit
 	}
-	lines, err := s.store.ListLines(ctx, ListQuery{
+	query := ListQuery{
 		TenantID: in.TenantID, OwnerAgent: in.AgentID, AllAgents: in.AllAgents,
 		Status: in.Status, Limit: in.Limit,
-	})
+	}
+	if in.Cursor != "" {
+		var err error
+		query.AfterUpdatedAt, query.AfterID, err = decodeListCursor(in.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
+	lines, err := s.store.ListLines(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +84,49 @@ func (s *Service) List(ctx context.Context, in ListInput) ([]LineSummary, error)
 		out = append(out, summary)
 	}
 	return out, nil
+}
+
+func (s *Service) ListPage(ctx context.Context, in ListInput) (ListPage, error) {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit >= MaxListLimit {
+		limit = MaxListLimit - 1
+	}
+	in.Limit = limit + 1
+	lines, err := s.List(ctx, in)
+	if err != nil {
+		return ListPage{}, err
+	}
+	page := ListPage{Lines: lines}
+	if len(lines) > limit {
+		last := lines[limit-1]
+		page.Lines = lines[:limit]
+		page.NextCursor = encodeListCursor(last.UpdatedAt, last.ID)
+	}
+	return page, nil
+}
+
+func encodeListCursor(updatedAt time.Time, id platform.ID) string {
+	raw := strconv.FormatInt(updatedAt.UTC().UnixMilli(), 10) + ":" + string(id)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+func decodeListCursor(cursor string) (time.Time, platform.ID, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("%w: 游标格式非法", ErrInvalidArgument)
+	}
+	millis, rawID, ok := strings.Cut(string(raw), ":")
+	if !ok || rawID == "" {
+		return time.Time{}, "", fmt.Errorf("%w: 游标格式非法", ErrInvalidArgument)
+	}
+	n, err := strconv.ParseInt(millis, 10, 64)
+	if err != nil {
+		return time.Time{}, "", fmt.Errorf("%w: 游标格式非法", ErrInvalidArgument)
+	}
+	return time.UnixMilli(n).UTC(), platform.ID(rawID), nil
 }
 
 type GetInput struct {

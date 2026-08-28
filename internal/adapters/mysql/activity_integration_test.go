@@ -152,6 +152,26 @@ func TestActivityVisibleQueryEnforcesPrivacyInSQL(t *testing.T) {
 	if len(ownOnly) != 2 {
 		t.Fatalf("空共享空间集合应只返回自己的 2 条，实际 %d", len(ownOnly))
 	}
+
+	failedOnly, err := store.ListVisible(context.Background(), activity.VisibleQuery{
+		TenantID: f.tenant, UserID: f.me, ReadableSharedSpaceIDs: []platform.ID{f.shared},
+		Action: "card_", Outcome: activity.OutcomeError, Since: base.Add(5 * time.Minute), Limit: 50,
+	})
+	if err != nil || len(failedOnly) != 1 || failedOnly[0].ID != ownError.ID {
+		t.Fatalf("动作/结果/时间筛选应在 SQL 生效，actual=%+v err=%v", failedOnly, err)
+	}
+	agentOnly, err := store.ListVisible(context.Background(), activity.VisibleQuery{
+		TenantID: f.tenant, UserID: f.me, AgentID: f.agent, Limit: 50,
+	})
+	if err != nil || len(agentOnly) != 1 || agentOnly[0].ID != ownRead.ID {
+		t.Fatalf("Agent 筛选应在 SQL 生效，actual=%+v err=%v", agentOnly, err)
+	}
+	spaceOnly, err := store.ListVisible(context.Background(), activity.VisibleQuery{
+		TenantID: f.tenant, UserID: f.me, ReadableSharedSpaceIDs: []platform.ID{f.shared}, SpaceID: f.shared, Limit: 50,
+	})
+	if err != nil || len(spaceOnly) != 1 || spaceOnly[0].ID != otherSharedWrite.ID {
+		t.Fatalf("空间筛选仍应服从可见性边界，actual=%+v err=%v", spaceOnly, err)
+	}
 }
 
 func TestActivityAdminAndKeysetPaginationStayTenantScoped(t *testing.T) {

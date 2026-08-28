@@ -27,6 +27,7 @@
     <a href="/admin/ingest" class="{{if eq .Nav "ingest"}}on{{end}}" {{if eq .Nav "ingest"}}aria-current="page"{{end}}>知识导入</a>
     <a href="/admin/indexing" class="{{if eq .Nav "indexing"}}on{{end}}" {{if eq .Nav "indexing"}}aria-current="page"{{end}}>语义索引</a>
     <a href="/admin/audit" class="{{if eq .Nav "audit"}}on{{end}}" {{if eq .Nav "audit"}}aria-current="page"{{end}}>完整审计</a>
+    <a href="/admin/system" class="{{if eq .Nav "system"}}on{{end}}" {{if eq .Nav "system"}}aria-current="page"{{end}}>系统状态</a>
     {{end}}
     <a class="mobile-only {{if eq .Nav "password"}}on{{end}}" href="/password" {{if eq .Nav "password"}}aria-current="page"{{end}}>账号</a>
     <form class="mobile-only" method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit" class="nav-action">登出</button></form>

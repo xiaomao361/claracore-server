@@ -174,7 +174,18 @@ func main() {
 	// Host B：治理面。与 MCP Host 并列，共用同一套领域服务——
 	// 「Web 专用的写入路径」是设计事故（docs/04-web-scope.md §1.4）。
 	webHost := web.NewHost(govService, knowService, continuityService, activityService, logger, web.Options{
-		Version:      version,
+		Version:           version,
+		Env:               cfg.Env,
+		DatabaseHealth:    db.PingContext,
+		RedisConfigured:   cfg.Redis.Enabled(),
+		EmbeddingProvider: cfg.Embedding.Provider,
+		EmbeddingCacheStats: func() (uint64, uint64, bool) {
+			if embeddingCache == nil {
+				return 0, 0, false
+			}
+			hits, misses := embeddingCache.Stats()
+			return hits, misses, true
+		},
 		PublicMCPURL: cfg.Web.PublicMCPURL,
 		SecureCookie: cfg.Web.SecureCookie,
 		IngestRoot:   cfg.Web.IngestRoot,

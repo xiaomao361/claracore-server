@@ -3,6 +3,7 @@ package continuity
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"testing"
@@ -68,6 +69,19 @@ func (f *fakeStore) ListLines(_ context.Context, q ListQuery) ([]Line, error) {
 		}
 		return 0
 	})
+	if !q.AfterUpdatedAt.IsZero() {
+		filtered := out[:0]
+		for _, line := range out {
+			at := line.UpdatedAt
+			if line.Position != nil && line.Position.UpdatedAt.After(at) {
+				at = line.Position.UpdatedAt
+			}
+			if at.Before(q.AfterUpdatedAt) || (at.Equal(q.AfterUpdatedAt) && line.ID < q.AfterID) {
+				filtered = append(filtered, line)
+			}
+		}
+		out = filtered
+	}
 	if q.Limit > 0 && len(out) > q.Limit {
 		out = out[:q.Limit]
 	}
@@ -332,6 +346,38 @@ func TestListDefaultsToOwnerAndCanExplicitlyListTenant(t *testing.T) {
 		t.Fatalf("显式 allAgents 应列租户内两条: %+v err=%v", all, err)
 	}
 	_ = b
+}
+
+func TestListPageUsesStableKeysetCursor(t *testing.T) {
+	svc, store := newService()
+	base := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 35; i++ {
+		id := platform.ID(fmt.Sprintf("line-%02d", i))
+		store.lines[id] = Line{
+			ID: id, TenantID: tenantA, OwnerUserID: userA, OwnerAgentID: agentA,
+			Title: fmt.Sprintf("共同线 %02d", i), Status: LineActive, UpdatedAt: base.Add(-time.Duration(i) * time.Minute),
+		}
+	}
+	first, err := svc.ListPage(context.Background(), ListInput{TenantID: tenantA, AgentID: agentA, AllAgents: true, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Lines) != 20 || first.NextCursor == "" {
+		t.Fatalf("第一页应返回 20 条与游标，实际 %d/%q", len(first.Lines), first.NextCursor)
+	}
+	second, err := svc.ListPage(context.Background(), ListInput{TenantID: tenantA, AgentID: agentA, AllAgents: true, Limit: 20, Cursor: first.NextCursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Lines) != 15 || second.NextCursor != "" {
+		t.Fatalf("第二页应返回剩余 15 条且没有游标，实际 %d/%q", len(second.Lines), second.NextCursor)
+	}
+	if first.Lines[len(first.Lines)-1].ID == second.Lines[0].ID {
+		t.Fatal("keyset 分页不应重复边界行")
+	}
+	if _, err := svc.ListPage(context.Background(), ListInput{TenantID: tenantA, AgentID: agentA, Cursor: "not-a-cursor"}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("非法游标应拒绝，实际 %v", err)
+	}
 }
 
 func TestHandoffReturnsExactLineResumePacket(t *testing.T) {

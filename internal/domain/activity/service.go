@@ -80,6 +80,9 @@ func (s *Service) ListVisible(ctx context.Context, in ListVisibleInput) (Page, e
 	if err != nil {
 		return Page{}, err
 	}
+	if err := validateListFilters(in.Action, in.Outcome); err != nil {
+		return Page{}, err
+	}
 
 	limit := normalizedLimit(in.Limit)
 	query := VisibleQuery{
@@ -87,6 +90,11 @@ func (s *Service) ListVisible(ctx context.Context, in ListVisibleInput) (Page, e
 		UserID:                 in.UserID,
 		ReadableSharedSpaceIDs: spaces,
 		Limit:                  limit + 1,
+		Action:                 strings.TrimSpace(in.Action),
+		Outcome:                strings.TrimSpace(in.Outcome),
+		AgentID:                in.AgentID,
+		SpaceID:                in.SpaceID,
+		Since:                  in.Since.UTC(),
 	}
 	if in.Cursor != "" {
 		query.AfterCreatedAt, query.AfterID, err = decodeCursor(in.Cursor)
@@ -107,8 +115,16 @@ func (s *Service) ListAdmin(ctx context.Context, in ListAdminInput) (Page, error
 		return Page{}, fmt.Errorf("%w: 缺少租户", ErrInvalidArgument)
 	}
 
+	if err := validateListFilters(in.Action, in.Outcome); err != nil {
+		return Page{}, err
+	}
 	limit := normalizedLimit(in.Limit)
-	query := AdminQuery{TenantID: in.TenantID, Limit: limit + 1}
+	query := AdminQuery{
+		TenantID: in.TenantID, Limit: limit + 1,
+		Action: strings.TrimSpace(in.Action), Outcome: strings.TrimSpace(in.Outcome),
+		AgentID: in.AgentID, SpaceID: in.SpaceID,
+		Since: in.Since.UTC(),
+	}
 	var err error
 	if in.Cursor != "" {
 		query.AfterCreatedAt, query.AfterID, err = decodeCursor(in.Cursor)
@@ -122,6 +138,18 @@ func (s *Service) ListAdmin(ctx context.Context, in ListAdminInput) (Page, error
 		return Page{}, err
 	}
 	return makePage(events, limit), nil
+}
+
+func validateListFilters(action, outcome string) error {
+	action = strings.TrimSpace(action)
+	if utf8.RuneCountInString(action) > 120 {
+		return fmt.Errorf("%w: 动作筛选超过 120 字", ErrInvalidArgument)
+	}
+	outcome = strings.TrimSpace(outcome)
+	if outcome != "" && outcome != OutcomeSuccess && outcome != OutcomeError {
+		return fmt.Errorf("%w: 结果筛选只能是 success 或 error", ErrInvalidArgument)
+	}
+	return nil
 }
 
 // ContextFeedbackQuality returns aggregate submitted feedback since the given

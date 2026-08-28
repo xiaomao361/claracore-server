@@ -30,16 +30,16 @@
       <td>{{.Status}}</td>
       <td>{{stamp .CreatedAt}}</td>
       <td class="actions">
-        <form method="post" action="/admin/members/reset">
+        <form method="post" action="/admin/members/reset" data-confirm-message="确认重置“{{.DisplayName}}”的密码？此人下次登录必须使用新密码。">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <input type="hidden" name="id" value="{{.ID}}">
           <button>重置密码</button>
         </form>
-        <form method="post" action="/admin/members/status">
+        <form method="post" action="/admin/members/status" {{if .IsActive}}data-confirm-message="确认停用“{{.DisplayName}}”？这会立即结束其全部 Web 会话，并让 MCP token 在下次调用时失效。"{{end}}>
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <input type="hidden" name="id" value="{{.ID}}">
           <input type="hidden" name="status" value="{{if .IsActive}}disabled{{else}}active{{end}}">
-          <button class="{{if .IsActive}}danger{{end}}">{{if .IsActive}}停用{{else}}启用{{end}}</button>
+          <button class="{{if .IsActive}}danger{{end}}">{{if .IsActive}}停用成员{{else}}启用成员{{end}}</button>
         </form>
       </td>
     </tr>

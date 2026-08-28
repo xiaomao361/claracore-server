@@ -9,6 +9,36 @@
   <div class="metric {{if gt .Totals.Drafts 0}}attention{{end}}"><span>等待审核</span><strong>{{.Totals.Drafts}}</strong><small>{{if gt .Totals.Drafts 0}}需要人工判断{{else}}队列已清空{{end}}</small></div>
 </section>
 
+<div class="overview-panels">
+  <section>
+    <div class="section-heading"><div><h2>我的 Agent</h2><p class="hint">按接入身份汇总设备与最近使用时间。</p></div><a href="/tokens">管理接入 →</a></div>
+    <div class="card compact-list">
+      {{range .Agents}}
+      <article>
+        <div><strong><code>{{.ID}}</code></strong><p class="hint">{{range $i, $device := .Devices}}{{if $i}}、{{end}}{{$device}}{{end}}</p></div>
+        <p><span class="tag {{if gt .ActiveTokens 0}}team{{end}}">{{.ActiveTokens}} 个有效 token</span><br><small>最近使用 {{stampPtr .LastUsedAt}}</small></p>
+      </article>
+      {{else}}
+      <div class="empty-state">还没有 Agent 接入。<a href="/tokens">签发第一个 token →</a></div>
+      {{end}}
+    </div>
+  </section>
+
+  <section>
+    <div class="section-heading"><div><h2>团队近期卡片</h2><p class="hint">只显示共享空间最近新增或更新的卡片。</p></div><a href="/browse?kind=card&amp;status=active">浏览卡片 →</a></div>
+    <div class="card compact-list">
+      {{range .RecentCards}}
+      <article>
+        <div><strong><a href="/browse/{{.Item.Ref.ID}}?kind=card">{{.Item.Title}}</a></strong><p class="hint">{{.SpaceName}} · {{if .Item.AuthorAgentID}}Agent <code>{{.Item.AuthorAgentID}}</code>{{else}}成员创建{{end}}</p></div>
+        <time>{{stamp .Item.UpdatedAt}}</time>
+      </article>
+      {{else}}
+      <div class="empty-state">共享空间里还没有已发布卡片。</div>
+      {{end}}
+    </div>
+  </section>
+</div>
+
 <div class="section-heading"><div><h2>空间明细</h2><p class="hint">按空间核对内容规模、权限与召回覆盖。</p></div><a href="/browse">浏览全部内容 →</a></div>
 <div class="table-scroll" role="region" aria-label="空间内容统计" tabindex="0"><table class="grid">
   <thead><tr><th scope="col">空间</th><th scope="col">类型</th><th scope="col">权限</th><th scope="col">记忆</th><th scope="col">卡片</th><th scope="col">待审</th><th scope="col">只是摘要</th><th scope="col">召回条件</th></tr></thead>

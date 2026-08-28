@@ -71,6 +71,22 @@ func TestContinuityStoreAndServiceIntegration(t *testing.T) {
 	if err != nil || len(all) != 1 || all[0].ID != created.Line.ID {
 		t.Fatalf("allAgents 应看到同租户目录，actual=%+v err=%v", all, err)
 	}
+	for _, title := range []string{"第二条线", "第三条线"} {
+		pageAgent := ids.New()
+		if _, err := svc.Update(ctx, continuity.UpdateInput{
+			TenantID: tenantID, UserID: ownerUser, AgentID: pageAgent, Title: title, Summary: "分页探针",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstPage, err := svc.ListPage(ctx, continuity.ListInput{TenantID: tenantID, AgentID: writerAgent, AllAgents: true, Limit: 1})
+	if err != nil || len(firstPage.Lines) != 1 || firstPage.NextCursor == "" {
+		t.Fatalf("真实 SQL 第一页应有游标，actual=%+v err=%v", firstPage, err)
+	}
+	secondPage, err := svc.ListPage(ctx, continuity.ListInput{TenantID: tenantID, AgentID: writerAgent, AllAgents: true, Limit: 1, Cursor: firstPage.NextCursor})
+	if err != nil || len(secondPage.Lines) != 1 || secondPage.Lines[0].ID == firstPage.Lines[0].ID {
+		t.Fatalf("真实 SQL keyset 第二页应推进且不重复，first=%+v second=%+v err=%v", firstPage, secondPage, err)
+	}
 
 	_, err = svc.Update(ctx, continuity.UpdateInput{
 		TenantID: tenantID, UserID: ownerUser, AgentID: ownerAgent, LineID: created.Line.ID,

@@ -39,17 +39,19 @@
   <thead><tr>
     <th scope="col">标题</th><th scope="col">状态</th>
     {{if eq .Kind "card"}}<th scope="col">类型</th><th scope="col">合格</th>{{end}}
-    <th scope="col">来源</th><th scope="col">更新</th>
+    <th scope="col">空间</th><th scope="col">作者</th><th scope="col">来源</th><th scope="col">更新</th>
   </tr></thead>
   <tbody>
   {{range .Items}}
     <tr class="{{if ne .Status "active"}}muted{{end}}">
-      <td><a href="/browse/{{.Ref.ID}}?kind={{.Ref.Type}}">{{.Title}}</a></td>
+      <td><a href="/browse/{{.Ref.ID}}?kind={{.Ref.Type}}&amp;back={{urlquery $.ListURL}}">{{.Title}}</a></td>
       <td>{{.Status}}</td>
       {{if eq $.Kind "card"}}
         <td>{{.CardType}}</td>
         <td>{{if .Qualified}}✓{{else}}<span title="「理解」栏为空，只算摘要">—</span>{{end}}</td>
       {{end}}
+      <td>{{index $.SpaceNames .SpaceID}}</td>
+      <td>{{if .AuthorAgentID}}Agent <code>{{.AuthorAgentID}}</code>{{else}}成员 <code>{{.AuthorUserID}}</code>{{end}}</td>
       <td>
         {{if .IsIngested}}<span class="tag">摄取</span> <code>{{.SourcePath}}</code>
         {{else if .CopiedFrom}}<span class="tag">提升自</span> <code>{{.CopiedFrom.ID}}</code>
@@ -58,7 +60,7 @@
       <td>{{stamp .UpdatedAt}}</td>
     </tr>
   {{else}}
-    <tr><td colspan="6" class="empty">{{if .Query}}当前筛选中没有匹配内容。{{else}}这个范围里还没有内容。{{end}}</td></tr>
+    <tr><td colspan="{{if eq $.Kind "card"}}8{{else}}6{{end}}" class="empty">{{if .Query}}当前筛选中没有匹配内容。{{else}}这个范围里还没有内容。{{end}}</td></tr>
   {{end}}
   </tbody>
 </table></div>

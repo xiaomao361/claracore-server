@@ -4,6 +4,11 @@
   <p>继续后会展示本租户的完整活动，包括成员的读取与召回记录。查询动作本身会先写入不可删除的 meta-audit；若写入失败，本次查询会被拒绝。</p>
   <form method="post" action="/admin/audit">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>动作包含<input type="search" name="action" maxlength="120" placeholder="例如 token.revoke"></label>
+    <label>结果<select name="outcome"><option value="">全部结果</option><option value="success">成功</option><option value="error">失败</option></select></label>
+    <label>Agent ID<input name="agent" placeholder="可选"></label>
+    <label>空间 ID<input name="space" placeholder="可选"></label>
+    <label>时间范围<select name="range"><option value="">全部时间</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option></select></label>
     <button>确认并查看完整审计</button>
   </form>
 </section>

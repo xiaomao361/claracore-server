@@ -8,11 +8,13 @@ import (
 )
 
 type ListQuery struct {
-	TenantID   platform.ID
-	OwnerAgent platform.ID
-	AllAgents  bool
-	Status     string
-	Limit      int
+	TenantID       platform.ID
+	OwnerAgent     platform.ID
+	AllAgents      bool
+	Status         string
+	Limit          int
+	AfterUpdatedAt time.Time
+	AfterID        platform.ID
 }
 
 type Store interface {

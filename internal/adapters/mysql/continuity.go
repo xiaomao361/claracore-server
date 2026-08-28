@@ -23,8 +23,10 @@ var _ continuity.Store = (*ContinuityStore)(nil)
 func NewContinuityStore(db *sql.DB) *ContinuityStore { return &ContinuityStore{db: db, ex: db} }
 
 const lineProjection = `l.id, l.tenant_id, l.owner_user_id, l.owner_agent_id,
-	l.title, l.status, l.created_at, l.updated_at,
-	p.id, p.summary, p.interpretation_status, p.next_step, p.version, p.updated_at`
+		l.title, l.status, l.created_at, l.updated_at,
+		p.id, p.summary, p.interpretation_status, p.next_step, p.version, p.updated_at`
+
+const lineUpdatedExpr = `GREATEST(l.updated_at, COALESCE(p.updated_at, l.updated_at))`
 
 func (s *ContinuityStore) ListLines(ctx context.Context, q continuity.ListQuery) ([]continuity.Line, error) {
 	where := []string{"l.tenant_id = ?"}
@@ -37,13 +39,17 @@ func (s *ContinuityStore) ListLines(ctx context.Context, q continuity.ListQuery)
 		where = append(where, "l.status = ?")
 		args = append(args, q.Status)
 	}
+	if !q.AfterUpdatedAt.IsZero() {
+		where = append(where, "("+lineUpdatedExpr+" < ? OR ("+lineUpdatedExpr+" = ? AND l.id < ?))")
+		args = append(args, q.AfterUpdatedAt.UTC(), q.AfterUpdatedAt.UTC(), string(q.AfterID))
+	}
 	args = append(args, q.Limit)
 	rows, err := s.ex.QueryContext(ctx,
 		`SELECT `+lineProjection+`
 		 FROM continuity_lines l
 		 LEFT JOIN continuity_positions p ON p.tenant_id = l.tenant_id AND p.line_id = l.id
 		 WHERE `+strings.Join(where, " AND ")+`
-		 ORDER BY COALESCE(p.updated_at, l.updated_at) DESC, l.id DESC LIMIT ?`, args...)
+		 ORDER BY `+lineUpdatedExpr+` DESC, l.id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: 查询 Shared Line: %w", err)
 	}

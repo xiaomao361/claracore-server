@@ -3,17 +3,21 @@ package web
 import (
 	"errors"
 	"net/http"
+	"net/url"
 
 	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/platform"
 )
 
 const webContinuityAgentID = platform.ID("web-governance")
+const webContinuityPageSize = 30
 
 type continuityData struct {
 	pageData
-	Lines  []continuity.LineSummary
-	Status string
+	Lines       []continuity.LineSummary
+	Status      string
+	HasPrevious bool
+	NextURL     string
 }
 
 func (h *Host) handleContinuity(w http.ResponseWriter, r *http.Request) {
@@ -23,15 +27,16 @@ func (h *Host) handleContinuity(w http.ResponseWriter, r *http.Request) {
 	if data.Status != continuity.LineArchived && data.Status != "all" {
 		data.Status = continuity.LineActive
 	}
-
-	lines, err := h.continuity.List(r.Context(), continuity.ListInput{
+	cursor := r.URL.Query().Get("cursor")
+	page, err := h.continuity.ListPage(r.Context(), continuity.ListInput{
 		TenantID: p.TenantID,
 		// Web 是用户治理面，没有 agent 身份；AllAgents=true 时这里只作为
 		// 领域接口要求的非空调用方标识，实际结果仍由 tenant 严格隔离。
 		AgentID:   webContinuityAgentID,
 		AllAgents: true,
 		Status:    data.Status,
-		Limit:     100,
+		Limit:     webContinuityPageSize,
+		Cursor:    cursor,
 	})
 	if err != nil {
 		h.logger.Error("读取共同线失败", "error", err)
@@ -39,8 +44,20 @@ func (h *Host) handleContinuity(w http.ResponseWriter, r *http.Request) {
 		h.render(w, "continuity.html", data)
 		return
 	}
-	data.Lines = lines
+	data.Lines = page.Lines
+	data.HasPrevious = cursor != ""
+	if page.NextCursor != "" {
+		data.NextURL = continuityPageURL(data.Status, page.NextCursor)
+	}
 	h.render(w, "continuity.html", data)
+}
+
+func continuityPageURL(status, cursor string) string {
+	q := url.Values{"status": {status}}
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+	return "/continuity?" + q.Encode()
 }
 
 type continuityDetailData struct {

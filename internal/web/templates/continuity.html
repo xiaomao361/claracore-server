@@ -12,7 +12,7 @@
   <button type="submit">应用筛选</button>
 </form>
 
-<p class="hint">共 {{len .Lines}} 条。</p>
+<p class="hint">本页 {{len .Lines}} 条。</p>
 <div class="continuity-list">
   {{range .Lines}}
   <article class="card continuity-item">
@@ -28,4 +28,10 @@
   <div class="card empty-state">这个状态下还没有共同线。</div>
   {{end}}
 </div>
+{{if or .HasPrevious .NextURL}}
+<nav class="pager" aria-label="共同线分页">
+  {{if .HasPrevious}}<a href="/continuity?status={{.Status}}">← 回到第一页</a>{{end}}
+  {{if .NextURL}}<a href="{{.NextURL}}">下一页 →</a>{{end}}
+</nav>
+{{end}}
 {{end}}

@@ -17,7 +17,7 @@
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     {{if eq .Packet.Line.Status "active"}}
       <input type="hidden" name="status" value="archived">
-      <button type="submit" class="danger">归档共同线</button>
+      <button type="submit" class="danger" data-confirm-message="确认归档这条共同线？归档后仍可从已归档列表恢复。">归档共同线</button>
     {{else}}
       <input type="hidden" name="status" value="active">
       <button type="submit">恢复为进行中</button>

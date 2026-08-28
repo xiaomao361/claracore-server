@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"claracore-server/internal/domain/activity"
@@ -191,11 +193,20 @@ type activityPageData struct {
 	pageData
 	Events     []activityEventView
 	NextCursor string
+	NextURL    string
+	Action     string
+	Outcome    string
+	AgentID    string
+	SpaceID    string
+	Range      string
 }
 
 func (h *Host) handleActivity(w http.ResponseWriter, r *http.Request) {
 	p, _ := principalFrom(r.Context())
 	data := activityPageData{pageData: h.page(r, "活动流", "activity")}
+	data.Action, data.Outcome = strings.TrimSpace(r.URL.Query().Get("action")), r.URL.Query().Get("outcome")
+	data.AgentID, data.SpaceID = strings.TrimSpace(r.URL.Query().Get("agent")), strings.TrimSpace(r.URL.Query().Get("space"))
+	data.Range = normalizedActivityRange(r.URL.Query().Get("range"))
 
 	if h.activity == nil {
 		data.Error = "活动流暂时不可用"
@@ -227,6 +238,11 @@ func (h *Host) handleActivity(w http.ResponseWriter, r *http.Request) {
 		ReadableSharedSpaceIDs: shared,
 		Cursor:                 r.URL.Query().Get("cursor"),
 		Limit:                  activityPageLimit,
+		Action:                 data.Action,
+		Outcome:                data.Outcome,
+		AgentID:                platform.ID(data.AgentID),
+		SpaceID:                platform.ID(data.SpaceID),
+		Since:                  activitySince(data.Range),
 	})
 	if err != nil {
 		data.Error = "读取活动流失败"
@@ -236,6 +252,9 @@ func (h *Host) handleActivity(w http.ResponseWriter, r *http.Request) {
 	}
 	data.Events = eventViews(page.Events, p.UserID)
 	data.NextCursor = page.NextCursor
+	if data.NextCursor != "" {
+		data.NextURL = activityURL("/activity", data.NextCursor, data.Action, data.Outcome, data.AgentID, data.SpaceID, data.Range)
+	}
 	h.render(w, "activity.html", data)
 }
 
@@ -250,6 +269,11 @@ type auditPageData struct {
 	pageData
 	Events     []activityEventView
 	NextCursor string
+	Action     string
+	Outcome    string
+	AgentID    string
+	SpaceID    string
+	Range      string
 }
 
 func (h *Host) handleAudit(w http.ResponseWriter, r *http.Request) {
@@ -277,10 +301,18 @@ func (h *Host) handleAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	action, outcome := strings.TrimSpace(r.FormValue("action")), r.FormValue("outcome")
+	agentID, spaceID := strings.TrimSpace(r.FormValue("agent")), strings.TrimSpace(r.FormValue("space"))
+	rangeValue := normalizedActivityRange(r.FormValue("range"))
 	page, err := h.activity.ListAdmin(r.Context(), activity.ListAdminInput{
 		TenantID: p.TenantID,
 		Cursor:   r.FormValue("cursor"),
 		Limit:    activityPageLimit,
+		Action:   action,
+		Outcome:  outcome,
+		AgentID:  platform.ID(agentID),
+		SpaceID:  platform.ID(spaceID),
+		Since:    activitySince(rangeValue),
 	})
 	if err != nil {
 		h.logger.Error("读取完整审计日志失败", "error", err)
@@ -291,8 +323,50 @@ func (h *Host) handleAudit(w http.ResponseWriter, r *http.Request) {
 		pageData:   h.page(r, "完整审计", "audit"),
 		Events:     eventViews(page.Events, p.UserID),
 		NextCursor: page.NextCursor,
+		Action:     action,
+		Outcome:    outcome,
+		AgentID:    agentID,
+		SpaceID:    spaceID,
+		Range:      rangeValue,
 	}
 	h.render(w, "audit.html", data)
+}
+
+func activityURL(path, cursor, action, outcome, agentID, spaceID, rangeValue string) string {
+	q := url.Values{}
+	for key, value := range map[string]string{"cursor": cursor, "action": action, "outcome": outcome, "agent": agentID, "space": spaceID, "range": rangeValue} {
+		if value != "" {
+			q.Set(key, value)
+		}
+	}
+	if len(q) == 0 {
+		return path
+	}
+	return path + "?" + q.Encode()
+}
+
+func normalizedActivityRange(raw string) string {
+	switch raw {
+	case "24h", "7d", "30d":
+		return raw
+	default:
+		return ""
+	}
+}
+
+func activitySince(rangeValue string) time.Time {
+	var duration time.Duration
+	switch rangeValue {
+	case "24h":
+		duration = 24 * time.Hour
+	case "7d":
+		duration = 7 * 24 * time.Hour
+	case "30d":
+		duration = 30 * 24 * time.Hour
+	default:
+		return time.Time{}
+	}
+	return time.Now().UTC().Add(-duration)
 }
 
 func (h *Host) renderAuditFailure(w http.ResponseWriter, r *http.Request, message string) {

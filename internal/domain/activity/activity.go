@@ -94,6 +94,11 @@ type ListVisibleInput struct {
 	ReadableSharedSpaceIDs []platform.ID
 	Cursor                 string
 	Limit                  int
+	Action                 string
+	Outcome                string
+	AgentID                platform.ID
+	SpaceID                platform.ID
+	Since                  time.Time
 }
 
 // ListAdminInput lists the full tenant-wide audit stream.
@@ -102,6 +107,11 @@ type ListAdminInput struct {
 	TenantID platform.ID
 	Cursor   string
 	Limit    int
+	Action   string
+	Outcome  string
+	AgentID  platform.ID
+	SpaceID  platform.ID
+	Since    time.Time
 }
 
 type Page struct {
@@ -119,6 +129,11 @@ type VisibleQuery struct {
 	AfterCreatedAt         time.Time
 	AfterID                platform.ID
 	Limit                  int
+	Action                 string
+	Outcome                string
+	AgentID                platform.ID
+	SpaceID                platform.ID
+	Since                  time.Time
 }
 
 // AdminQuery is the persistence contract for the tenant-wide audit stream.
@@ -127,6 +142,11 @@ type AdminQuery struct {
 	AfterCreatedAt time.Time
 	AfterID        platform.ID
 	Limit          int
+	Action         string
+	Outcome        string
+	AgentID        platform.ID
+	SpaceID        platform.ID
+	Since          time.Time
 }
 
 // ContextFeedbackQuery selects durable automatic-context feedback. Results are

@@ -17,25 +17,26 @@
 </form>
 
 <div class="table-scroll" role="region" aria-label="访问令牌" tabindex="0"><table class="grid">
-  <thead><tr><th scope="col">设备</th><th scope="col">前缀</th><th scope="col">创建</th><th scope="col">最后使用</th><th scope="col">状态</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
+  <thead><tr><th scope="col">设备</th><th scope="col">Agent</th><th scope="col">前缀</th><th scope="col">创建</th><th scope="col">最后使用</th><th scope="col">状态</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
   <tbody>
   {{range .Tokens}}
     <tr class="{{if .RevokedAt}}muted{{end}}">
       <td>{{.Name}}</td>
+      <td><code>{{.AgentID}}</code></td>
       <td><code>{{.Prefix}}…</code></td>
       <td>{{stamp .CreatedAt}}</td>
       <td>{{stampPtr .LastUsedAt}}</td>
       <td>{{if .RevokedAt}}已吊销{{else}}有效{{end}}</td>
       <td>{{if not .RevokedAt}}
-        <form method="post" action="/tokens/revoke">
+        <form method="post" action="/tokens/revoke" data-confirm-message="确认吊销设备“{{.Name}}”的 token？吊销后无法恢复，请先确认新 token 已经可用。">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <input type="hidden" name="id" value="{{.ID}}">
-          <button class="danger">吊销</button>
+          <button class="danger">吊销 token</button>
         </form>
       {{end}}</td>
     </tr>
   {{else}}
-    <tr><td colspan="6" class="empty">还没有 token。签发一个，把配置粘进你的 agent。</td></tr>
+    <tr><td colspan="7" class="empty">还没有 token。签发一个，把配置粘进你的 agent。</td></tr>
   {{end}}
   </tbody>
 </table></div>

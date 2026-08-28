@@ -33,11 +33,11 @@
             <button type="submit">保存</button>
           </form>
           {{if .Permission}}
-          <form method="post" action="/admin/spaces/revoke">
+          <form method="post" action="/admin/spaces/revoke" data-confirm-message="确认撤销“{{.User.DisplayName}}”对“{{$space.Space.Name}}”的显式权限？">
             <input type="hidden" name="csrf" value="{{$.CSRF}}">
             <input type="hidden" name="space" value="{{$space.Space.ID}}">
             <input type="hidden" name="user" value="{{.User.ID}}">
-            <button class="danger" type="submit">撤销</button>
+            <button class="danger" type="submit">撤销权限</button>
           </form>
           {{end}}
         </td>

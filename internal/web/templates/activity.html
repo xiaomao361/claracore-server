@@ -1,5 +1,13 @@
 {{define "content"}}
 <p class="hint">这里完整展示你自己的 agent 读写；同事只会看到共享空间里的写入。个人空间活动与他人的读取/召回不会出现在你的时间线里。</p>
+<form method="get" class="card row filter-bar" aria-label="活动筛选">
+  <label>动作<input type="search" name="action" value="{{.Action}}" maxlength="120" placeholder="例如 card.update"></label>
+  <label>结果<select name="outcome"><option value="">全部结果</option><option value="success" {{if eq .Outcome "success"}}selected{{end}}>成功</option><option value="error" {{if eq .Outcome "error"}}selected{{end}}>失败</option></select></label>
+  <label>Agent ID<input name="agent" value="{{.AgentID}}" placeholder="可选"></label>
+  <label>空间 ID<input name="space" value="{{.SpaceID}}" placeholder="可选"></label>
+  <label>时间范围<select name="range"><option value="">全部时间</option><option value="24h" {{if eq .Range "24h"}}selected{{end}}>最近 24 小时</option><option value="7d" {{if eq .Range "7d"}}selected{{end}}>最近 7 天</option><option value="30d" {{if eq .Range "30d"}}selected{{end}}>最近 30 天</option></select></label>
+  <button type="submit">应用筛选</button>
+</form>
 <div class="timeline">
 {{range .Events}}
   <article class="activity-item">
@@ -19,5 +27,5 @@
   <p class="empty-state">还没有可见活动。</p>
 {{end}}
 </div>
-{{if .NextCursor}}<p><a href="/activity?cursor={{.NextCursor}}">更早的活动 →</a></p>{{end}}
+{{if .NextURL}}<p><a href="{{.NextURL}}">更早的活动 →</a></p>{{end}}
 {{end}}
