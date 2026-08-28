@@ -38,8 +38,8 @@
 
 {{if .Links}}
 <h2>关联</h2>
-<div class="table-scroll"><table class="grid">
-  <thead><tr><th>方向</th><th>类型</th><th>对端</th><th>说明</th></tr></thead>
+<div class="table-scroll" role="region" aria-label="内容关联" tabindex="0"><table class="grid">
+  <thead><tr><th scope="col">方向</th><th scope="col">类型</th><th scope="col">对端</th><th scope="col">说明</th></tr></thead>
   <tbody>{{range .Links}}
     <tr><td>{{.From.Type}} → {{.To.Type}}</td><td>{{.Kind}}</td><td><code>{{.To.ID}}</code></td><td>{{.Note}}</td></tr>
   {{end}}</tbody>

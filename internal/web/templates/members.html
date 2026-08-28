@@ -6,7 +6,7 @@
 </div>
 {{end}}
 
-<form method="post" action="/admin/members" class="card row">
+<form method="post" action="/admin/members" class="card row filter-bar" aria-label="创建成员">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <label>账号<input name="username" required></label>
   <label>显示名<input name="display"></label>
@@ -19,8 +19,8 @@
   <button type="submit">创建账号</button>
 </form>
 
-<div class="table-scroll"><table class="grid">
-  <thead><tr><th>账号</th><th>显示名</th><th>角色</th><th>状态</th><th>创建</th><th></th></tr></thead>
+<div class="table-scroll" role="region" aria-label="成员列表" tabindex="0"><table class="grid">
+  <thead><tr><th scope="col">账号</th><th scope="col">显示名</th><th scope="col">角色</th><th scope="col">状态</th><th scope="col">创建</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
   <tbody>
   {{range .Members}}
     <tr class="{{if not .IsActive}}muted{{end}}">

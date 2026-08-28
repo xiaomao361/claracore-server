@@ -23,8 +23,8 @@
 {{if .Retried}}<p class="hint">本次重新入队 {{.Retried}} 条失败项。</p>{{end}}
 
 {{if .Health.Failures}}
-<div class="table-scroll"><table class="grid">
-  <thead><tr><th>实体</th><th>尝试次数</th><th>最近错误</th><th>更新时间</th></tr></thead>
+<div class="table-scroll" role="region" aria-label="索引失败项" tabindex="0"><table class="grid">
+  <thead><tr><th scope="col">实体</th><th scope="col">尝试次数</th><th scope="col">最近错误</th><th scope="col">更新时间</th></tr></thead>
   <tbody>{{range .Health.Failures}}<tr>
     <td><code>{{.Ref.Type}}:{{.Ref.ID}}</code></td><td>{{.Attempts}}</td><td>{{.LastError}}</td><td>{{stamp .UpdatedAt}}</td>
   </tr>{{end}}</tbody>

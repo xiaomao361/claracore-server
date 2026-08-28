@@ -1,5 +1,5 @@
 {{define "content"}}
-<form method="post" action="/admin/spaces" class="card row">
+<form method="post" action="/admin/spaces" class="card row filter-bar" aria-label="创建项目空间">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <label>项目空间名称<input name="name" required maxlength="120"></label>
   <button type="submit">创建项目空间</button>
@@ -10,9 +10,9 @@
 <section class="card space-admin">
   <h2>{{.Space.Name}} <span class="tag {{.Space.Type}}">{{.Space.Type}}</span></h2>
   {{if .OwnerName}}<p class="hint">创建者：{{.OwnerName}}（始终读写）</p>{{else}}<p class="hint">团队空间对所有成员默认可读；下面只需配置谁可以写。</p>{{end}}
-  <div class="table-scroll">
+  <div class="table-scroll" role="region" aria-label="{{.Space.Name}}的成员权限" tabindex="0">
   <table class="grid">
-    <thead><tr><th>成员</th><th>当前权限</th><th>调整</th></tr></thead>
+    <thead><tr><th scope="col">成员</th><th scope="col">当前权限</th><th scope="col">调整</th></tr></thead>
     <tbody>
     {{range $space.Grants}}
       <tr>

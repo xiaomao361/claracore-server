@@ -1,5 +1,5 @@
 {{define "content"}}
-<form method="get" class="card row">
+<form method="get" class="card row filter-bar" aria-label="内容筛选">
   <label for="browse-query">全文查找
     <input id="browse-query" type="search" name="q" value="{{.Query}}" maxlength="200" placeholder="标题或正文" autocomplete="off">
   </label>
@@ -35,11 +35,11 @@
 
 {{if ge .Total 0}}<p class="hint" role="status">{{if .Query}}当前查找共 {{.Total}} 条。{{else}}共 {{.Total}} 条。{{end}}</p>{{end}}
 
-<div class="table-scroll"><table class="grid">
+<div class="table-scroll" role="region" aria-label="内容列表" tabindex="0"><table class="grid">
   <thead><tr>
-    <th>标题</th><th>状态</th>
-    {{if eq .Kind "card"}}<th>类型</th><th>合格</th>{{end}}
-    <th>来源</th><th>更新</th>
+    <th scope="col">标题</th><th scope="col">状态</th>
+    {{if eq .Kind "card"}}<th scope="col">类型</th><th scope="col">合格</th>{{end}}
+    <th scope="col">来源</th><th scope="col">更新</th>
   </tr></thead>
   <tbody>
   {{range .Items}}

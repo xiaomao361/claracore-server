@@ -40,13 +40,17 @@
 {{end}}
 <div class="workspace">
   <header class="workspace-header">
-    <div><p class="eyebrow">{{if .Principal.UserID}}团队记忆工作台{{else}}安全接入{{end}}</p><h1>{{.Title}}</h1></div>
-    {{if .Principal.UserID}}<div class="environment"><span aria-hidden="true"></span>Server 在线 <code>{{.Version}}</code></div>{{end}}
+    <div>
+      {{if not .Principal.UserID}}<div class="auth-brand"><span class="brand-mark" aria-hidden="true">C</span><strong>ClaraCore</strong></div>{{end}}
+      <p class="eyebrow">{{if .Principal.UserID}}ClaraCore / {{.Title}}{{else}}安全接入{{end}}</p><h1>{{.Title}}</h1>
+    </div>
+    {{if .Principal.UserID}}<div class="environment" aria-label="服务状态：在线，版本 {{.Version}}"><span aria-hidden="true"></span><span>服务在线</span> <code>{{.Version}}</code></div>{{end}}
   </header>
   <main id="main-content" tabindex="-1">
     <div class="content-frame">
       {{if .Error}}<p class="alert error" role="alert">{{.Error}}</p>{{end}}
       {{if .Notice}}<p class="alert notice" role="status">{{.Notice}}</p>{{end}}
+      <p class="visually-hidden" id="ui-status" role="status" aria-live="polite"></p>
       {{block "content" .}}{{end}}
     </div>
   </main>

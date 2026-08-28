@@ -1,5 +1,5 @@
 {{define "content"}}
-<form method="get" class="card row">
+<form method="get" class="card row filter-bar" aria-label="审核队列筛选">
   <label>空间
     <select name="space" data-auto-submit>
       <option value="">全部可写空间</option>
@@ -11,8 +11,8 @@
 
 {{if ge .Total 0}}<p class="hint">共 <strong>{{.Total}}</strong> 条待审。它们不进默认检索——在有人过一遍之前，agent 看不到。</p>{{end}}
 
-<div class="table-scroll"><table class="grid">
-  <thead><tr><th>标题</th><th>空间</th><th>来源</th><th>摄入时间</th><th></th></tr></thead>
+<div class="table-scroll" role="region" aria-label="待审卡片" tabindex="0"><table class="grid">
+  <thead><tr><th scope="col">标题</th><th scope="col">空间</th><th scope="col">来源</th><th scope="col">摄入时间</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
   <tbody>
   {{range .Items}}
     <tr>

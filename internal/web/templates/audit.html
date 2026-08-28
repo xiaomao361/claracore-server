@@ -1,8 +1,8 @@
 {{define "content"}}
 <p class="alert notice">本次完整审计查询已经记录。这里包含读取行为，只用于明确的安全审计场景。</p>
-<div class="table-scroll">
+<div class="table-scroll" role="region" aria-label="完整审计记录" tabindex="0">
 <table class="grid audit-grid">
-  <thead><tr><th>时间</th><th>主体</th><th>来源</th><th>动作</th><th>对象 / 空间</th><th>结果</th></tr></thead>
+  <thead><tr><th scope="col">时间</th><th scope="col">主体</th><th scope="col">来源</th><th scope="col">动作</th><th scope="col">对象 / 空间</th><th scope="col">结果</th></tr></thead>
   <tbody>
   {{range .Events}}
     <tr>

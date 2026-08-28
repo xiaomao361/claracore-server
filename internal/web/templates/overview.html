@@ -1,9 +1,17 @@
 {{define "content"}}
-{{if gt .Drafts 0}}
-<p class="alert notice">你可读的空间里还有 <strong>{{.Drafts}}</strong> 条待审草稿。它们不进默认检索，需要人过一遍。<a href="/review">去审核 →</a></p>
+{{if gt .Totals.Drafts 0}}
+<p class="alert notice">你可读的空间里还有 <strong>{{.Totals.Drafts}}</strong> 条待审草稿。它们不进默认检索，需要人过一遍。<a href="/review">去审核 →</a></p>
 {{end}}
-<div class="table-scroll"><table class="grid">
-  <thead><tr><th>空间</th><th>类型</th><th>权限</th><th>记忆</th><th>卡片</th><th>待审</th><th>只是摘要</th><th>召回条件</th></tr></thead>
+<section class="metric-grid" aria-label="内容概览">
+  <div class="metric"><span>可访问空间</span><strong>{{.Totals.Spaces}}</strong><small>其中 {{.Totals.WritableSpaces}} 个可写</small></div>
+  <div class="metric"><span>记忆</span><strong>{{.Totals.Memories}}</strong><small>当前可读范围</small></div>
+  <div class="metric"><span>知识卡片</span><strong>{{.Totals.Cards}}</strong><small>含草稿与历史状态</small></div>
+  <div class="metric {{if gt .Totals.Drafts 0}}attention{{end}}"><span>等待审核</span><strong>{{.Totals.Drafts}}</strong><small>{{if gt .Totals.Drafts 0}}需要人工判断{{else}}队列已清空{{end}}</small></div>
+</section>
+
+<div class="section-heading"><div><h2>空间明细</h2><p class="hint">按空间核对内容规模、权限与召回覆盖。</p></div><a href="/browse">浏览全部内容 →</a></div>
+<div class="table-scroll" role="region" aria-label="空间内容统计" tabindex="0"><table class="grid">
+  <thead><tr><th scope="col">空间</th><th scope="col">类型</th><th scope="col">权限</th><th scope="col">记忆</th><th scope="col">卡片</th><th scope="col">待审</th><th scope="col">只是摘要</th><th scope="col">召回条件</th></tr></thead>
   <tbody>
   {{range .Spaces}}
     <tr>

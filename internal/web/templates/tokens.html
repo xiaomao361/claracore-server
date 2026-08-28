@@ -1,22 +1,23 @@
 {{define "content"}}
 {{if .NewToken}}
 <div class="card reveal">
-  <h2>新 token</h2>
-  <pre class="token">{{.NewToken}}</pre>
-  <h3>直接粘进 agent 配置</h3>
-  <pre class="snippet">{{.MCPSnippet}}</pre>
+  <div class="code-heading"><h2>新 token</h2><button type="button" class="copy-button" data-copy-target="new-token">复制 token</button></div>
+  <pre class="token" id="new-token">{{.NewToken}}</pre>
+  <div class="code-heading"><h3>直接粘进 agent 配置</h3><button type="button" class="copy-button" data-copy-target="mcp-snippet">复制配置</button></div>
+  <pre class="snippet" id="mcp-snippet">{{.MCPSnippet}}</pre>
+  <p class="hint">token 明文只显示这一次。确认配置可用后再离开页面。</p>
 </div>
 {{end}}
 
-<form method="post" action="/tokens" class="card row">
+<form method="post" action="/tokens" class="card row filter-bar" aria-label="签发访问令牌">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <label>agent 标识<input name="agent" placeholder="clara" required pattern="[a-z0-9-]+"></label>
   <label>设备名<input name="name" placeholder="MacBook" required></label>
   <button type="submit">签发 token</button>
 </form>
 
-<div class="table-scroll"><table class="grid">
-  <thead><tr><th>设备</th><th>前缀</th><th>创建</th><th>最后使用</th><th>状态</th><th></th></tr></thead>
+<div class="table-scroll" role="region" aria-label="访问令牌" tabindex="0"><table class="grid">
+  <thead><tr><th scope="col">设备</th><th scope="col">前缀</th><th scope="col">创建</th><th scope="col">最后使用</th><th scope="col">状态</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
   <tbody>
   {{range .Tokens}}
     <tr class="{{if .RevokedAt}}muted{{end}}">

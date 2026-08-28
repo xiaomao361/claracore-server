@@ -1,7 +1,7 @@
 {{define "content"}}
 <p class="hint">共同线保存 agent 当前推进到的位置，便于跨会话继续；它不是记忆或知识卡。</p>
 
-<form method="get" class="card row">
+<form method="get" class="card row filter-bar" aria-label="共同线筛选">
   <label>状态
     <select name="status" data-auto-submit>
       <option value="active" {{if eq .Status "active"}}selected{{end}}>进行中</option>

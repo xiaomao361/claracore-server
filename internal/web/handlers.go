@@ -166,12 +166,20 @@ type overviewSpace struct {
 	Write bool
 }
 
+type overviewTotals struct {
+	Spaces         int
+	WritableSpaces int
+	Memories       int
+	Cards          int
+	Drafts         int
+}
+
 func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 	p, _ := principalFrom(r.Context())
 	data := struct {
 		pageData
 		Spaces []overviewSpace
-		Drafts int
+		Totals overviewTotals
 	}{pageData: h.page(r, "概览", "overview")}
 
 	scope, err := h.gov.Scope(r.Context(), governance.Identity{TenantID: p.TenantID, UserID: p.UserID})
@@ -202,8 +210,14 @@ func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		st := statsByID[a.Space.ID]
 		data.Spaces = append(data.Spaces, overviewSpace{Space: a.Space, Stats: st, Write: a.CanWrite})
+		data.Totals.Spaces++
+		if a.CanWrite {
+			data.Totals.WritableSpaces++
+		}
+		data.Totals.Memories += st.Memories
+		data.Totals.Cards += st.Cards
 		// 「本空间还有 N 条待审」正是 04 §6.1 点名的那个空白
-		data.Drafts += st.DraftCards
+		data.Totals.Drafts += st.DraftCards
 	}
 	h.render(w, "overview.html", data)
 }
