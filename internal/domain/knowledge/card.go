@@ -39,6 +39,7 @@ type Card struct {
 	CardType      string
 	Status        string
 	Source        string
+	SourceName    string // 可枚举摄取源的稳定名字；手写卡片为空
 
 	// SourceKey / SourceHash 只有摄取产物才有（手写卡片为空）。
 	//

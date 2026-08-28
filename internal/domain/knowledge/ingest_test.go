@@ -113,6 +113,33 @@ func TestChangedContentUpdatesInPlace(t *testing.T) {
 	}
 }
 
+func TestSourceNameBackfillDoesNotInvalidateVector(t *testing.T) {
+	svc, store, emb := newSearchService(t, "连接池")
+	d := doc("k1", "h1", "连接池调优", "把最大连接数降到四十。")
+	ingestInto(t, svc, d)
+	indexAll(t, svc)
+
+	var cardID platform.ID
+	for id := range store.cards {
+		cardID = id
+	}
+	before, _ := store.embeddingOf(Ref{EntityCard, cardID}, emb.Model())
+	report, err := svc.Ingest(context.Background(), IngestInput{
+		TenantID: tenantA, SpaceID: spaceTeam, AuthorUserID: userA,
+		SourceName: "team-handbook", Documents: []Document{d},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Updated != 1 || store.cards[cardID].SourceName != "team-handbook" {
+		t.Fatalf("稳定来源名应补写到原卡，实际 report=%+v card=%+v", report, store.cards[cardID])
+	}
+	after, _ := store.embeddingOf(Ref{EntityCard, cardID}, emb.Model())
+	if after.Status != EmbedReady || after.UpdatedAt != before.UpdatedAt {
+		t.Fatal("只补来源元数据时不该让已有向量失效")
+	}
+}
+
 // TestUpdateKeepsHumanWork 是这一刀最要紧的一条取舍。
 //
 // 源文档改了一个错别字就把提炼、理解、召回条件清空，
@@ -255,6 +282,75 @@ func TestDuplicateSourceKeyInSameBatchIsRejected(t *testing.T) {
 	}
 	if len(store.cards) != 1 {
 		t.Fatalf("只该留下一张，实际 %d", len(store.cards))
+	}
+}
+
+func TestIngestReportsMissingSourceCardsWithoutMutatingThem(t *testing.T) {
+	svc, store := newTestService(t)
+	first, err := svc.Ingest(context.Background(), IngestInput{
+		TenantID: tenantA, SpaceID: spaceTeam, AuthorUserID: userA,
+		SourceName: "team-handbook", DetectMissing: true,
+		Documents: []Document{
+			doc("kept", "h1", "保留", "正文。"),
+			doc("gone", "h2", "已删除", "旧正文。"),
+		},
+	})
+	if err != nil || first.Created != 2 {
+		t.Fatalf("首次全量扫描失败: report=%+v err=%v", first, err)
+	}
+
+	var goneBefore Card
+	for _, card := range store.cards {
+		if card.SourceKey == "gone" {
+			goneBefore = card
+		}
+	}
+	report, err := svc.Ingest(context.Background(), IngestInput{
+		TenantID: tenantA, SpaceID: spaceTeam, AuthorUserID: userA,
+		SourceName: "team-handbook", DetectMissing: true,
+		Documents: []Document{doc("kept", "h1", "保留", "正文。")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Missing) != 1 || report.Missing[0].CardID != goneBefore.ID || report.Missing[0].SourcePath != "gone.md" {
+		t.Fatalf("应只报告本轮消失的源卡，实际 %+v", report.Missing)
+	}
+	if got := store.cards[goneBefore.ID]; got.Status != goneBefore.Status || got.Version != goneBefore.Version {
+		t.Fatalf("缺失检测不得自动废弃或修改卡片，before=%+v after=%+v", goneBefore, got)
+	}
+}
+
+func TestInvalidButPresentDocumentIsNotReportedMissing(t *testing.T) {
+	svc, _ := newTestService(t)
+	_, err := svc.Ingest(context.Background(), IngestInput{
+		TenantID: tenantA, SpaceID: spaceTeam, AuthorUserID: userA,
+		SourceName: "team-handbook", Documents: []Document{doc("present", "h1", "标题", "正文。")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bad := doc("present", "h2", "", "内容暂时写坏了")
+	report, err := svc.Ingest(context.Background(), IngestInput{
+		TenantID: tenantA, SpaceID: spaceTeam, AuthorUserID: userA,
+		SourceName: "team-handbook", DetectMissing: true, Documents: []Document{bad},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Failed) != 1 || len(report.Missing) != 0 {
+		t.Fatalf("存在但内容不合法的文件应进失败清单而非缺失清单，实际 %+v", report)
+	}
+}
+
+func TestMissingDetectionRequiresStableSourceName(t *testing.T) {
+	svc, _ := newTestService(t)
+	_, err := svc.Ingest(context.Background(), IngestInput{
+		TenantID: tenantA, SpaceID: spaceTeam, AuthorUserID: userA, DetectMissing: true,
+	})
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("缺失检测没有稳定来源名时必须拒绝，实际 %v", err)
 	}
 }
 

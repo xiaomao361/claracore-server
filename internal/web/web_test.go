@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
@@ -28,16 +32,21 @@ type fakeGov struct {
 	loginErr  error
 	sessions  map[string]governance.Principal
 
-	tokens     []governance.Token
-	users      []governance.User
-	lastReset  platform.ID
-	lastStatus struct {
+	tokens      []governance.Token
+	users       []governance.User
+	spaces      []governance.Space
+	permissions []governance.Permission
+	lastReset   platform.ID
+	lastStatus  struct {
 		user   platform.ID
 		status string
 	}
-	revoked platform.ID
-	created governance.CreateUserInput
-	calls   int
+	revoked      platform.ID
+	created      governance.CreateUserInput
+	createdSpace string
+	lastGrant    governance.Permission
+	lastRevoke   struct{ space, user platform.ID }
+	calls        int
 }
 
 const (
@@ -46,6 +55,7 @@ const (
 	userOther = platform.ID("01USEROTHERAAAAAAAAAAAAAAA")
 	spPers    = platform.ID("01SPACEPERSONALAAAAAAAAAAA")
 	spTeam    = platform.ID("01SPACETEAMAAAAAAAAAAAAAAA")
+	spProject = platform.ID("01SPACEPROJECTAAAAAAAAAAAA")
 	goodToken = "session-token-for-tests"
 )
 
@@ -55,12 +65,17 @@ func newFakeGov(role string, mustChange bool) *fakeGov {
 		Role: role, MustChangePassword: mustChange,
 		SessionExpiresAt: time.Now().Add(time.Hour),
 	}
+	owner := userMe
 	return &fakeGov{
 		principal: p,
 		sessions:  map[string]governance.Principal{goodToken: p},
 		users: []governance.User{
 			{ID: userMe, TenantID: tenantA, Username: "maozai", DisplayName: "毛仔", Role: role, Status: governance.StatusActive},
 			{ID: userOther, TenantID: tenantA, Username: "tongshi", DisplayName: "同事", Role: governance.RoleMember, Status: governance.StatusActive},
+		},
+		spaces: []governance.Space{
+			{ID: spTeam, TenantID: tenantA, Type: governance.SpaceTeam, Name: "团队"},
+			{ID: spProject, TenantID: tenantA, Type: governance.SpaceProject, Name: "项目", OwnerUserID: &owner},
 		},
 	}
 }
@@ -123,6 +138,34 @@ func (f *fakeGov) CreateUser(_ context.Context, in governance.CreateUserInput) (
 	return governance.User{ID: "01NEWUSERAAAAAAAAAAAAAAAAA", Username: in.Username}, governance.Space{}, nil
 }
 
+func (f *fakeGov) ListSpaces(_ context.Context, _ platform.ID) ([]governance.Space, error) {
+	return f.spaces, nil
+}
+
+func (f *fakeGov) ListSpacePermissions(_ context.Context, _ platform.ID) ([]governance.Permission, error) {
+	return f.permissions, nil
+}
+
+func (f *fakeGov) CreateProjectSpace(_ context.Context, tenantID, ownerUserID platform.ID, name string) (governance.Space, error) {
+	f.calls++
+	f.createdSpace = name
+	space := governance.Space{ID: "01NEWSPACEAAAAAAAAAAAAAAAA", TenantID: tenantID, Type: governance.SpaceProject, Name: name, OwnerUserID: &ownerUserID}
+	f.spaces = append(f.spaces, space)
+	return space, nil
+}
+
+func (f *fakeGov) GrantSpaceAccess(_ context.Context, _, spaceID, userID, grantedBy platform.ID, canRead, canWrite bool) error {
+	f.calls++
+	f.lastGrant = governance.Permission{SpaceID: spaceID, UserID: userID, GrantedBy: grantedBy, CanRead: canRead, CanWrite: canWrite}
+	return nil
+}
+
+func (f *fakeGov) RevokeSpaceAccess(_ context.Context, _, spaceID, userID platform.ID) error {
+	f.calls++
+	f.lastRevoke.space, f.lastRevoke.user = spaceID, userID
+	return nil
+}
+
 // Scope 给两个空间：个人（可读可写）与团队（隐含可读、写需授权而未授权）。
 //
 // 这个不对称是有意的——「可读集合」与「可写集合」在 Web 层是两条
@@ -160,15 +203,23 @@ func (f *fakeGov) RevokeToken(_ context.Context, _, tokenID platform.ID) error {
 }
 
 type fakeKnow struct {
-	items      []knowledge.ContentItem
-	total      int
-	card       knowledge.Card
-	memory     knowledge.Memory
-	lastList   knowledge.ListContentsInput
-	lastUpdate knowledge.UpdateCardInput
-	updateErr  error
-	getErr     error
-	calls      int
+	items        []knowledge.ContentItem
+	total        int
+	nextCursor   string
+	card         knowledge.Card
+	memory       knowledge.Memory
+	lastList     knowledge.ListContentsInput
+	lastUpdate   knowledge.UpdateCardInput
+	lastIngest   knowledge.IngestInput
+	ingestReport knowledge.IngestReport
+	ingestErr    error
+	embedHealth  knowledge.EmbeddingHealth
+	backfill     knowledge.BackfillReport
+	retried      int
+	updateErr    error
+	getErr       error
+	duplicates   []knowledge.CardDuplicateCandidate
+	calls        int
 }
 
 type fakeActivity struct {
@@ -182,6 +233,55 @@ type fakeActivity struct {
 	adminErr       error
 	listAdminCalls int
 	order          []string
+}
+
+type fakeContinuity struct {
+	lines      []continuity.LineSummary
+	lastInput  continuity.ListInput
+	lastGet    continuity.GetInput
+	lastStatus continuity.SetStatusInput
+	packet     continuity.ResumePacket
+	err        error
+}
+
+func newFakeContinuity() *fakeContinuity {
+	now := time.Date(2026, 8, 27, 11, 30, 0, 0, time.UTC)
+	line := continuity.Line{
+		ID: "01LINEAAAAAAAAAAAAAAAAAAAA", TenantID: tenantA, OwnerUserID: userMe, OwnerAgentID: "codex",
+		Title: "ClaraCore 联调收口", Status: continuity.LineActive, CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
+		Position: &continuity.Position{
+			ID: "01POSITIONAAAAAAAAAAAAAAAA", TenantID: tenantA, LineID: "01LINEAAAAAAAAAAAAAAAAAAAA",
+			Summary: "共同线 Web 入口与筛选交互正在验证。", InterpretationStatus: continuity.PositionConfirmed,
+			NextStep: "部署后人工刷新页面确认。", WriterUserID: userMe, WriterAgentID: "codex", Version: 2, UpdatedAt: now,
+		},
+	}
+	handoff := continuity.Handoff{
+		ID: "01HANDOFFAAAAAAAAAAAAAAAAAA", TenantID: tenantA, LineID: line.ID,
+		WriterUserID: userMe, WriterAgentID: "codex", Objective: "上线共同线治理页",
+		Completed: []string{"列表完成"}, OpenItems: []string{"人工验收"}, NextStep: "检查历史页", CreatedAt: now,
+	}
+	return &fakeContinuity{lines: []continuity.LineSummary{{
+		ID: "01LINEAAAAAAAAAAAAAAAAAAAA", OwnerAgentID: "codex", Title: "ClaraCore 联调收口",
+		Status: continuity.LineActive, Summary: "共同线 Web 入口与筛选交互正在验证。",
+		InterpretationStatus: continuity.PositionConfirmed, NextStep: "部署后人工刷新页面确认。",
+		UpdatedAt: now,
+	}}, packet: continuity.ResumePacket{Line: line, RecentHandoff: &handoff, PositionHistory: []continuity.Position{*line.Position}, HandoffHistory: []continuity.Handoff{handoff}}}
+}
+
+func (f *fakeContinuity) List(_ context.Context, in continuity.ListInput) ([]continuity.LineSummary, error) {
+	f.lastInput = in
+	return f.lines, f.err
+}
+
+func (f *fakeContinuity) Get(_ context.Context, in continuity.GetInput) (continuity.ResumePacket, error) {
+	f.lastGet = in
+	return f.packet, f.err
+}
+
+func (f *fakeContinuity) SetStatus(_ context.Context, in continuity.SetStatusInput) (continuity.ResumePacket, error) {
+	f.lastStatus = in
+	f.packet.Line.Status = in.Status
+	return f.packet, f.err
 }
 
 func (f *fakeActivity) Record(_ context.Context, in activity.RecordInput) (activity.Event, error) {
@@ -230,7 +330,7 @@ func newTestWeb(t *testing.T, role string, mustChange bool) (*httptest.Server, *
 			Title: "一条记忆", Body: "正文。", Status: knowledge.MemoryActive, Version: 1,
 		},
 	}
-	srv := httptest.NewServer(NewHost(gov, know, activity, logger, Options{
+	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), activity, logger, Options{
 		Version: "test", PublicMCPURL: "https://ccs.example.com/mcp",
 	}).Handler())
 	t.Cleanup(srv.Close)
@@ -253,7 +353,7 @@ func newContentWeb(t *testing.T, role string) (*httptest.Server, *fakeGov, *fake
 		},
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, know, &fakeActivity{}, logger, Options{Version: "test"}).Handler())
+	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), &fakeActivity{}, logger, Options{Version: "test"}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, gov, know
 }
@@ -270,7 +370,7 @@ func newActivityWeb(t *testing.T, role string) (*httptest.Server, *fakeGov, *fak
 	}
 	act := &fakeActivity{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, know, act, logger, Options{Version: "test"}).Handler())
+	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), act, logger, Options{Version: "test"}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, gov, know, act
 }
@@ -339,7 +439,7 @@ func body(t *testing.T, resp *http.Response) string {
 func TestUnauthenticatedIsRedirectedEverywhere(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, false)
 
-	for _, path := range []string{"/", "/tokens", "/password", "/activity", "/admin/members", "/admin/audit"} {
+	for _, path := range []string{"/", "/tokens", "/password", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit"} {
 		t.Run(path, func(t *testing.T) {
 			resp := get(t, srv, path, false)
 			defer resp.Body.Close()
@@ -356,7 +456,7 @@ func TestUnauthenticatedIsRedirectedEverywhere(t *testing.T) {
 func TestMemberCannotSeeAdminPages(t *testing.T) {
 	srv, gov := newTestWeb(t, governance.RoleMember, false)
 
-	for _, path := range []string{"/admin/members", "/admin/audit"} {
+	for _, path := range []string{"/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit"} {
 		resp := get(t, srv, path, true)
 		defer resp.Body.Close()
 		// 404 而不是 403：不确认「这个管理页存在」
@@ -372,7 +472,7 @@ func TestMemberCannotSeeAdminPages(t *testing.T) {
 func TestMemberCannotPostToAdminEndpoints(t *testing.T) {
 	srv, gov := newTestWeb(t, governance.RoleMember, false)
 
-	for _, path := range []string{"/admin/members", "/admin/members/status", "/admin/members/reset", "/admin/audit"} {
+	for _, path := range []string{"/admin/members", "/admin/members/status", "/admin/members/reset", "/admin/spaces", "/admin/spaces/grant", "/admin/spaces/revoke", "/admin/ingest", "/admin/indexing/backfill", "/admin/indexing/retry", "/admin/audit"} {
 		t.Run(path, func(t *testing.T) {
 			resp := post(t, srv, path, url.Values{"id": {string(userOther)}, "status": {"disabled"}}, true, true)
 			defer resp.Body.Close()
@@ -393,7 +493,7 @@ func TestMemberCannotPostToAdminEndpoints(t *testing.T) {
 func TestMustChangePasswordBlocksEverythingElse(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, true)
 
-	for _, path := range []string{"/", "/tokens", "/activity", "/admin/members", "/admin/audit"} {
+	for _, path := range []string{"/", "/tokens", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit"} {
 		resp := get(t, srv, path, true)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/password" {
@@ -428,6 +528,12 @@ func TestWritesRequireCSRF(t *testing.T) {
 		"/admin/members":                     {"username": {"newbie"}},
 		"/admin/members/status":              {"id": {string(userOther)}, "status": {"disabled"}},
 		"/admin/members/reset":               {"id": {string(userOther)}},
+		"/admin/spaces":                      {"name": {"新项目"}},
+		"/admin/spaces/grant":                {"space": {string(spProject)}, "user": {string(userOther)}, "access": {"write"}},
+		"/admin/spaces/revoke":               {"space": {string(spProject)}, "user": {string(userOther)}},
+		"/admin/ingest":                      {"space": {string(spPers)}, "source": {"team-handbook"}},
+		"/admin/indexing/backfill":           {},
+		"/admin/indexing/retry":              {},
 		"/admin/audit":                       {},
 	}
 	for path, form := range writes {
@@ -444,6 +550,39 @@ func TestWritesRequireCSRF(t *testing.T) {
 	}
 }
 
+func TestAdminCanManageProjectSpacesAndPermissions(t *testing.T) {
+	srv, gov := newTestWeb(t, governance.RoleAdmin, false)
+
+	page := body(t, get(t, srv, "/admin/spaces", true))
+	for _, want := range []string{"空间与权限", "团队", "项目", "同事", "默认只读"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("空间治理页缺少 %q: %.300s", want, page)
+		}
+	}
+
+	resp := post(t, srv, "/admin/spaces", url.Values{"name": {"新项目"}}, true, true)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || gov.createdSpace != "新项目" {
+		t.Fatalf("创建项目空间失败: status=%d name=%q", resp.StatusCode, gov.createdSpace)
+	}
+
+	resp = post(t, srv, "/admin/spaces/grant", url.Values{
+		"space": {string(spProject)}, "user": {string(userOther)}, "access": {"write"},
+	}, true, true)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || !gov.lastGrant.CanRead || !gov.lastGrant.CanWrite {
+		t.Fatalf("读写授权没有正确下沉到领域层: status=%d grant=%+v", resp.StatusCode, gov.lastGrant)
+	}
+
+	resp = post(t, srv, "/admin/spaces/revoke", url.Values{
+		"space": {string(spProject)}, "user": {string(userOther)},
+	}, true, true)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther || gov.lastRevoke.space != spProject || gov.lastRevoke.user != userOther {
+		t.Fatalf("撤销授权没有正确下沉到领域层: status=%d revoke=%+v", resp.StatusCode, gov.lastRevoke)
+	}
+}
+
 // TestCSRFTokenIsSessionBound 确认 CSRF token 不能跨会话复用。
 func TestCSRFTokenIsSessionBound(t *testing.T) {
 	if csrfToken("session-a") == csrfToken("session-b") {
@@ -452,6 +591,137 @@ func TestCSRFTokenIsSessionBound(t *testing.T) {
 	// 派生用 HMAC 而不是明文拼接：即使派生值泄露也推不回会话令牌
 	if strings.Contains(csrfToken(goodToken), goodToken) {
 		t.Fatal("CSRF token 里不该出现会话令牌本身")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Markdown 导入
+// ---------------------------------------------------------------------------
+
+func TestResolveIngestDirRejectsTraversalAndSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	inside := filepath.Join(root, "docs")
+	if err := os.Mkdir(inside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realInside, err := filepath.EvalSymlinks(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := resolveIngestDir(root, "docs"); err != nil || got != realInside {
+		t.Fatalf("根目录内的普通目录应允许: got=%q err=%v", got, err)
+	}
+	if _, err := resolveIngestDir(root, "../escape"); err == nil {
+		t.Fatal("相对路径穿越必须被拒绝")
+	}
+	link := filepath.Join(root, "outside-link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveIngestDir(root, "outside-link"); err == nil {
+		t.Fatal("指向根目录外的符号链接必须被拒绝")
+	}
+}
+
+func TestAdminIngestUsesWritableSpaceAndSafeMissingDetection(t *testing.T) {
+	root := t.TempDir()
+	docsDir := filepath.Join(root, "docs")
+	if err := os.Mkdir(docsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realDocsDir, err := filepath.EvalSymlinks(docsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gov := newFakeGov(governance.RoleAdmin, false)
+	know := &fakeKnow{ingestReport: knowledge.IngestReport{
+		Created: 1,
+		Missing: []knowledge.IngestMissing{{CardID: "01MISSINGCARDAAAAAAAAAAAAA", SourcePath: "old.md"}},
+	}}
+	act := &fakeActivity{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), act, logger, Options{
+		Version: "test", IngestRoot: root,
+		ScanMarkdown: func(_ context.Context, sourceName, scanRoot string) ([]knowledge.Document, error) {
+			if sourceName != "team-handbook" || scanRoot != realDocsDir {
+				t.Fatalf("扫描器收到错误边界: source=%q root=%q", sourceName, scanRoot)
+			}
+			return []knowledge.Document{docForWeb("k1", "h1")}, nil
+		},
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	resp := post(t, srv, "/admin/ingest", url.Values{
+		"space": {string(spPers)}, "source": {"team-handbook"}, "dir": {"docs"},
+	}, true, true)
+	page := body(t, resp)
+	if know.lastIngest.SpaceID != spPers || know.lastIngest.SourceName != "team-handbook" || !know.lastIngest.DetectMissing {
+		t.Fatalf("完整扫描应按可写空间执行并开启缺失检测，实际 %+v", know.lastIngest)
+	}
+	if !strings.Contains(page, "仅报告，未自动修改卡片") || !strings.Contains(page, "old.md") {
+		t.Fatalf("页面应明确展示非破坏性的缺失报告，实际 %.400s", page)
+	}
+	if len(act.records) != 1 || act.records[0].Action != "ingest.run" || act.records[0].SpaceID == nil || *act.records[0].SpaceID != spPers {
+		t.Fatalf("导入应留下只含稳定标识的治理记录，实际 %+v", act.records)
+	}
+}
+
+func TestPartialIngestScanDisablesMissingDetection(t *testing.T) {
+	root := t.TempDir()
+	gov := newFakeGov(governance.RoleAdmin, false)
+	know := &fakeKnow{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), &fakeActivity{}, logger, Options{
+		Version: "test", IngestRoot: root,
+		ScanMarkdown: func(context.Context, string, string) ([]knowledge.Document, error) {
+			return []knowledge.Document{docForWeb("k1", "h1")}, errors.New("one file unreadable")
+		},
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, post(t, srv, "/admin/ingest", url.Values{
+		"space": {string(spPers)}, "source": {"team-handbook"},
+	}, true, true))
+	if know.lastIngest.DetectMissing {
+		t.Fatal("部分扫描不能证明未出现的文件已删除")
+	}
+	if !strings.Contains(page, "本轮未执行缺失检测") {
+		t.Fatalf("页面应把降级讲清楚，实际 %.300s", page)
+	}
+}
+
+func docForWeb(key, hash string) knowledge.Document {
+	return knowledge.Document{SourceKey: key, SourcePath: key + ".md", ContentHash: hash, Title: "标题", Body: "正文。"}
+}
+
+func TestAdminCanObserveBackfillAndRetryEmbeddingFailures(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleAdmin)
+	know.embedHealth = knowledge.EmbeddingHealth{
+		Enabled: true, Model: "bge-m3",
+		Stats: knowledge.EmbeddingStats{Pending: 3, Ready: 9, Failed: 1, Exhausted: 1},
+		Failures: []knowledge.Embedding{{
+			Ref:      knowledge.Ref{Type: knowledge.EntityMemory, ID: "01FAILEDMEAaaaaaaaaaaaaaaa"},
+			Attempts: 5, LastError: "model unavailable", UpdatedAt: time.Now(),
+		}},
+	}
+	page := body(t, get(t, srv, "/admin/indexing", true))
+	for _, want := range []string{"bge-m3", "model unavailable", "已停止自动重试"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("索引页缺少 %q，实际 %.500s", want, page)
+		}
+	}
+
+	know.backfill = knowledge.BackfillReport{Enabled: true, Model: "bge-m3", Memories: 2, Cards: 1, Triggers: 3}
+	page = body(t, post(t, srv, "/admin/indexing/backfill", url.Values{}, true, true))
+	if !strings.Contains(page, "Memory 2") || !strings.Contains(page, "召回条件 3") {
+		t.Fatalf("回填结果应可见，实际 %.400s", page)
+	}
+
+	know.retried = 1
+	page = body(t, post(t, srv, "/admin/indexing/retry", url.Values{}, true, true))
+	if !strings.Contains(page, "重新入队 1 条") {
+		t.Fatalf("人工重试数量应可见，实际 %.400s", page)
 	}
 }
 
@@ -664,6 +934,38 @@ func TestOverviewShowsDraftBacklog(t *testing.T) {
 	}
 }
 
+func TestWorkspaceShellKeepsNavigationAndAccessibilityContracts(t *testing.T) {
+	srv, _ := newTestWeb(t, governance.RoleAdmin, false)
+	page := body(t, get(t, srv, "/", true))
+	for _, want := range []string{
+		`class="skip-link"`, `href="#main-content"`, `<aside class="sidebar">`,
+		`<nav aria-label="主导航">`, `aria-current="page"`, `id="main-content"`,
+		`role="status"`,
+	} {
+		if want == `role="status"` {
+			// Overview 没有 notice 时不会渲染 live region；该属性在 layout 的
+			// 条件分支里，由静态模板检查覆盖。
+			continue
+		}
+		if !strings.Contains(page, want) {
+			t.Errorf("工作区 shell 缺少 %s", want)
+		}
+	}
+	if strings.Count(page, "<h1>") != 1 {
+		t.Fatalf("页面应只有一个主标题，实际 %d", strings.Count(page, "<h1>"))
+	}
+
+	css := body(t, get(t, srv, "/static/app.css", false))
+	for _, want := range []string{"@media (max-width: 680px)", "prefers-reduced-motion", ":focus-visible", "min-width: 320px"} {
+		if !strings.Contains(css, want) {
+			t.Errorf("响应式/可访问样式缺少 %q", want)
+		}
+	}
+	if strings.Contains(css, "transition: all") || strings.Contains(css, "transition-property: all") {
+		t.Fatal("界面样式不得使用 transition: all")
+	}
+}
+
 // TestTemplatesEscapeUserInput 确认没人把 html/template 换成 text/template。
 func TestTemplatesEscapeUserInput(t *testing.T) {
 	srv, gov := newTestWeb(t, governance.RoleAdmin, false)
@@ -703,7 +1005,7 @@ func TestSecurityHeadersArePresent(t *testing.T) {
 func (f *fakeKnow) ListContents(_ context.Context, in knowledge.ListContentsInput) (knowledge.ListContentsResult, error) {
 	f.lastList = in
 	f.calls++
-	return knowledge.ListContentsResult{Items: f.items, Total: f.total}, nil
+	return knowledge.ListContentsResult{Items: f.items, Total: f.total, NextCursor: f.nextCursor}, nil
 }
 
 func (f *fakeKnow) GetCard(_ context.Context, _, _ platform.ID, spaces []platform.ID) (knowledge.Card, []knowledge.Link, error) {
@@ -724,6 +1026,10 @@ func (f *fakeKnow) GetMemory(_ context.Context, _, _ platform.ID, spaces []platf
 	return f.memory, nil, nil
 }
 
+func (f *fakeKnow) FindCardDuplicateCandidates(_ context.Context, _, _ platform.ID, _ []platform.ID) ([]knowledge.CardDuplicateCandidate, error) {
+	return f.duplicates, nil
+}
+
 func (f *fakeKnow) UpdateCard(_ context.Context, in knowledge.UpdateCardInput) (knowledge.Card, error) {
 	f.lastUpdate = in
 	f.calls++
@@ -731,6 +1037,27 @@ func (f *fakeKnow) UpdateCard(_ context.Context, in knowledge.UpdateCardInput) (
 		return knowledge.Card{}, f.updateErr
 	}
 	return f.card, nil
+}
+
+func (f *fakeKnow) Ingest(_ context.Context, in knowledge.IngestInput) (knowledge.IngestReport, error) {
+	f.lastIngest = in
+	f.calls++
+	return f.ingestReport, f.ingestErr
+}
+
+func (f *fakeKnow) EmbeddingHealth(_ context.Context, _ platform.ID, _ int) (knowledge.EmbeddingHealth, error) {
+	f.calls++
+	return f.embedHealth, f.ingestErr
+}
+
+func (f *fakeKnow) BackfillEmbeddings(_ context.Context, _ platform.ID, _ int) (knowledge.BackfillReport, error) {
+	f.calls++
+	return f.backfill, f.ingestErr
+}
+
+func (f *fakeKnow) RetryEmbeddingFailures(_ context.Context, _ platform.ID) (int, error) {
+	f.calls++
+	return f.retried, f.ingestErr
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +1231,134 @@ func TestBrowseHonoursFilters(t *testing.T) {
 	}
 }
 
+func TestBrowseFullTextQueryIsBoundedAndPreservedInPagination(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+	know.items = []knowledge.ContentItem{{Ref: knowledge.Ref{Type: knowledge.EntityCard, ID: "01CARDAAAAAAAAAAAAAAAAAAAA"}, Title: "部署回滚检查"}}
+	know.total = 1
+	know.nextCursor = "cursor+/="
+
+	page := body(t, get(t, srv, "/browse?q="+url.QueryEscape("部署 回滚"), true))
+	if know.lastList.Query != "部署 回滚" {
+		t.Fatalf("query should reach domain service: %q", know.lastList.Query)
+	}
+	if !strings.Contains(page, `type="search"`) || !strings.Contains(page, `maxlength="200"`) || !strings.Contains(page, `role="status"`) {
+		t.Fatalf("search form should have a visible label, bounded native control, and announced count: %s", page)
+	}
+	if !strings.Contains(page, `value="部署 回滚"`) {
+		t.Fatal("query should be preserved in the rendered form")
+	}
+	unescapedPage := html.UnescapeString(page)
+	if !strings.Contains(unescapedPage, `q=%E9%83%A8%E7%BD%B2+%E5%9B%9E%E6%BB%9A`) || !strings.Contains(unescapedPage, `cursor=cursor%2B%2F%3D`) {
+		t.Fatalf("pagination link should preserve and URL-encode query and cursor: %s", page)
+	}
+}
+
+func TestBrowseFilterFormAutoSubmitsWithoutInlineScript(t *testing.T) {
+	srv, _, _ := newContentWeb(t, governance.RoleMember)
+
+	page := body(t, get(t, srv, "/browse", true))
+	if strings.Contains(page, "onchange=") {
+		t.Fatal("筛选不能依赖被 CSP 禁止的内联脚本")
+	}
+	if !strings.Contains(page, `type="submit">应用筛选</button>`) {
+		t.Fatal("禁用 JavaScript 时仍必须提供可见的提交按钮")
+	}
+	if strings.Count(page, "data-auto-submit") < 3 || !strings.Contains(page, `<script src="/static/app.js" defer></script>`) {
+		t.Fatal("类型、空间、状态选择应由同源外部脚本立即提交")
+	}
+	script, err := os.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(script), `control.name === "kind"`) {
+		t.Fatal("switching content kind should clear the previous kind's incompatible status before auto-submit")
+	}
+}
+
+func TestReviewFilterFormWorksWithoutInlineScript(t *testing.T) {
+	srv, _, _ := newContentWeb(t, governance.RoleMember)
+
+	page := body(t, get(t, srv, "/review", true))
+	if strings.Contains(page, "onchange=") {
+		t.Fatal("审核队列筛选不能依赖被 CSP 禁止的内联脚本")
+	}
+	if !strings.Contains(page, `type="submit">应用筛选</button>`) {
+		t.Fatal("审核队列必须提供可见的提交按钮")
+	}
+	if !strings.Contains(page, "data-auto-submit") {
+		t.Fatal("审核队列选择空间后应立即提交")
+	}
+}
+
+func TestFilterEnhancementScriptIsServed(t *testing.T) {
+	srv, _ := newTestWeb(t, governance.RoleMember, false)
+	resp := get(t, srv, "/static/app.js", false)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("筛选脚本状态码 = %d", resp.StatusCode)
+	}
+	page := body(t, resp)
+	if !strings.Contains(page, "requestSubmit") || strings.Contains(page, "innerHTML") {
+		t.Fatalf("筛选脚本应只做表单提交，实际 %q", page)
+	}
+}
+
+func TestContinuityPageShowsSharedLinesAndFilters(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	lines := newFakeContinuity()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, lines, &fakeActivity{}, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/continuity?status=all", true))
+	for _, want := range []string{"共同线", "ClaraCore 联调收口", "共同线 Web 入口与筛选交互正在验证。", "部署后人工刷新页面确认。", "data-auto-submit", "/continuity/01LINEAAAAAAAAAAAAAAAAAAAA"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("共同线页面缺少 %q", want)
+		}
+	}
+	if lines.lastInput.TenantID != tenantA || !lines.lastInput.AllAgents || lines.lastInput.Status != "all" {
+		t.Fatalf("共同线查询边界错误: %+v", lines.lastInput)
+	}
+}
+
+func TestContinuityDetailShowsPositionAndHandoffHistory(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	lines := newFakeContinuity()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, lines, &fakeActivity{}, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/continuity/01LINEAAAAAAAAAAAAAAAAAAAA", true))
+	for _, want := range []string{"当前位置", "位置历史", "交接历史", "上线共同线治理页", "列表完成", "人工验收", "归档共同线"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("共同线详情缺少 %q", want)
+		}
+	}
+	if lines.lastGet.TenantID != tenantA || lines.lastGet.LineID != "01LINEAAAAAAAAAAAAAAAAAAAA" || lines.lastGet.AgentID != webContinuityAgentID {
+		t.Fatalf("共同线详情查询边界错误: %+v", lines.lastGet)
+	}
+}
+
+func TestContinuityStatusWriteUsesCSRFAndGovernanceAudit(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	lines := newFakeContinuity()
+	act := &fakeActivity{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, lines, act, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	resp := post(t, srv, "/continuity/01LINEAAAAAAAAAAAAAAAAAAAA/status", url.Values{"status": {continuity.LineArchived}}, true, true)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if lines.lastStatus.TenantID != tenantA || lines.lastStatus.LineID != "01LINEAAAAAAAAAAAAAAAAAAAA" || lines.lastStatus.Status != continuity.LineArchived {
+		t.Fatalf("status input boundary error: %+v", lines.lastStatus)
+	}
+	if len(act.records) != 1 || act.records[0].Action != "shared_line.status" || act.records[0].EntityID == nil || *act.records[0].EntityID != "01LINEAAAAAAAAAAAAAAAAAAAA" {
+		t.Fatalf("status write should leave a scoped governance audit: %+v", act.records)
+	}
+}
+
 func TestBrowseDetailWarnsAboutMissingTriggers(t *testing.T) {
 	srv, _, _ := newContentWeb(t, governance.RoleMember)
 
@@ -1009,9 +1464,13 @@ func TestAuthenticatedWebWritesAreAuditedWithoutSensitivePayloads(t *testing.T) 
 		{"token issue", "/tokens", "token.issue", url.Values{"agent": {"secret-agent-slug"}, "name": {"Secret Device"}}},
 		{"token revoke", "/tokens/revoke", "token.revoke", url.Values{"id": {"01TOKENAAAAAAAAAAAAAAAAAAA"}}},
 		{"review", "/review/01CARDAAAAAAAAAAAAAAAAAAAA", "card.review", url.Values{"action": {"reject"}, "title": {"secret-card-title"}}},
+		{"shared line status", "/continuity/01LINEAAAAAAAAAAAAAAAAAAAA/status", "shared_line.status", url.Values{"status": {continuity.LineArchived}}},
 		{"member create", "/admin/members", "member.create", url.Values{"username": {"secret-user"}, "display": {"Secret User"}, "role": {"member"}}},
 		{"member status", "/admin/members/status", "member.status", url.Values{"id": {string(userOther)}, "status": {"disabled"}}},
 		{"member reset", "/admin/members/reset", "member.password_reset", url.Values{"id": {string(userOther)}}},
+		{"space create", "/admin/spaces", "space.create", url.Values{"name": {"Secret Project"}}},
+		{"space grant", "/admin/spaces/grant", "space.permission.grant", url.Values{"space": {string(spProject)}, "user": {string(userOther)}, "access": {"write"}}},
+		{"space revoke", "/admin/spaces/revoke", "space.permission.revoke", url.Values{"space": {string(spProject)}, "user": {string(userOther)}}},
 	}
 
 	for _, tt := range tests {
@@ -1072,6 +1531,11 @@ func TestWebWriteAuditCapturesRenderedFailureAndCreatedTargets(t *testing.T) {
 			name: "created member", path: "/admin/members", entityType: "user",
 			form:     url.Values{"username": {"new-user"}, "display": {"New User"}, "role": {"member"}},
 			entityID: "01NEWUSERAAAAAAAAAAAAAAAAA",
+		},
+		{
+			name: "created project space", path: "/admin/spaces", entityType: "space",
+			form:     url.Values{"name": {"New Project"}},
+			entityID: "01NEWSPACEAAAAAAAAAAAAAAAA",
 		},
 	}
 	for _, tt := range tests {

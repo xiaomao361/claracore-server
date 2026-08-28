@@ -3,6 +3,7 @@ package web
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"claracore-server/internal/domain/governance"
@@ -82,9 +83,10 @@ func (h *Host) handleReviewList(w http.ResponseWriter, r *http.Request) {
 
 type reviewDetailData struct {
 	pageData
-	Card     knowledge.Card
-	Space    governance.Space
-	Triggers string
+	Card                knowledge.Card
+	Space               governance.Space
+	Triggers            string
+	DuplicateCandidates []knowledge.CardDuplicateCandidate
 }
 
 func (h *Host) handleReviewDetail(w http.ResponseWriter, r *http.Request) {
@@ -106,8 +108,13 @@ func (h *Host) handleReviewDetail(w http.ResponseWriter, r *http.Request) {
 		// 而审核时最常做的动作正是「加两三条触发条件」。
 		Triggers: triggerLines(card),
 	}
+	data.DuplicateCandidates, err = h.know.FindCardDuplicateCandidates(r.Context(), p.TenantID, card.ID, scope.Readable())
+	if err != nil {
+		h.logger.Warn("读取重复知识卡候选失败", "card_id", card.ID, "error", err)
+		data.Notice = "重复候选暂时不可用；你仍可继续审核这张卡。"
+	}
 	if card.Status != knowledge.CardDraft {
-		data.Notice = "这张卡已经不是待审状态了（当前：" + card.Status + "），下面的改动仍会生效。"
+		data.Notice = strings.TrimSpace(data.Notice + " 这张卡已经不是待审状态了（当前：" + card.Status + "），下面的改动仍会生效。")
 	}
 	_ = p
 	h.render(w, "review_detail.html", data)
@@ -206,8 +213,10 @@ type browseData struct {
 	Kind       string
 	SpaceID    string
 	Status     string
+	Query      string
 	Total      int
 	NextCursor string
+	NextURL    string
 }
 
 func (h *Host) handleBrowse(w http.ResponseWriter, r *http.Request) {
@@ -241,7 +250,7 @@ func (h *Host) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		// 而记忆量大、对别人基本无意义（04 §6 对动态页的同一判断）
 		data.Kind = knowledge.EntityCard
 	}
-	data.SpaceID, data.Status = q.Get("space"), q.Get("status")
+	data.SpaceID, data.Status, data.Query = q.Get("space"), q.Get("status"), strings.TrimSpace(q.Get("q"))
 
 	var statuses []string
 	if data.Status != "" {
@@ -254,6 +263,7 @@ func (h *Host) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		Kind:     data.Kind,
 		Statuses: statuses,
 		SpaceID:  platform.ID(data.SpaceID),
+		Query:    data.Query,
 		Cursor:   q.Get("cursor"),
 	})
 	if err != nil {
@@ -262,6 +272,19 @@ func (h *Host) handleBrowse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data.Items, data.Total, data.NextCursor = res.Items, res.Total, res.NextCursor
+	if data.NextCursor != "" {
+		params := url.Values{"kind": {data.Kind}, "cursor": {data.NextCursor}}
+		if data.SpaceID != "" {
+			params.Set("space", data.SpaceID)
+		}
+		if data.Status != "" {
+			params.Set("status", data.Status)
+		}
+		if data.Query != "" {
+			params.Set("q", data.Query)
+		}
+		data.NextURL = "/browse?" + params.Encode()
+	}
 	h.render(w, "browse.html", data)
 }
 
@@ -273,7 +296,8 @@ type browseDetailData struct {
 	Space  governance.Space
 	Links  []knowledge.Link
 	// Writable 决定要不要显示「去审核」的入口。
-	Writable bool
+	Writable            bool
+	DuplicateCandidates []knowledge.CardDuplicateCandidate
 }
 
 func (h *Host) handleBrowseDetail(w http.ResponseWriter, r *http.Request) {
@@ -310,6 +334,11 @@ func (h *Host) handleBrowseDetail(w http.ResponseWriter, r *http.Request) {
 		data.Space, _ = scope.Space(c.SpaceID)
 		data.Title = c.Title
 		data.Writable = scope.CanWrite(c.SpaceID)
+		data.DuplicateCandidates, err = h.know.FindCardDuplicateCandidates(r.Context(), p.TenantID, c.ID, readable)
+		if err != nil {
+			h.logger.Warn("读取重复知识卡候选失败", "card_id", c.ID, "error", err)
+			data.Notice = "重复候选暂时不可用；卡片正文仍可正常查看。"
+		}
 	}
 	h.render(w, "browse_detail.html", data)
 }

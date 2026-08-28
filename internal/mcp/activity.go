@@ -19,6 +19,7 @@ import (
 // 让新工具有一条安静漏记的路径。
 type activityService interface {
 	Record(context.Context, activity.RecordInput) (activity.Event, error)
+	ContextFeedbackQuality(context.Context, platform.ID, time.Duration) (activity.ContextFeedbackQuality, error)
 }
 
 const activityRecordTimeout = 2 * time.Second
@@ -173,6 +174,34 @@ func auditServerStatus(_ serverStatusInput, out serverStatusOut, err error) tool
 		return toolActivityDetails{}
 	}
 	return toolActivityDetails{metadata: map[string]any{"semanticSearch": out.SemanticSearch}}
+}
+
+func auditGatewayAutoContext(_ gatewayAutoContextInput, out gatewayAutoContextOut, err error) toolActivityDetails {
+	if err != nil {
+		return toolActivityDetails{}
+	}
+	return toolActivityDetails{metadata: map[string]any{"decision": out.Decision, "semanticAvailable": out.SemanticAvailable, "policyAvailable": out.PolicyAvailable}}
+}
+
+func auditGatewayContextFeedback(in gatewayContextFeedbackInput, out gatewayContextFeedbackOut, err error) toolActivityDetails {
+	if err != nil {
+		return toolActivityDetails{}
+	}
+	return entityDetails("card", in.CardID, "", map[string]any{"feedbackOutcome": out.Outcome})
+}
+
+func auditContextQualityStatus(_ contextQualityStatusInput, out contextQualityStatusOut, err error) toolActivityDetails {
+	if err != nil {
+		return toolActivityDetails{}
+	}
+	return toolActivityDetails{metadata: map[string]any{"submittedFeedbackCount": out.Submitted}}
+}
+
+func auditSharedLineStatus(in sharedLineStatusInput, _ resumePacketOut, err error) toolActivityDetails {
+	if err != nil {
+		return toolActivityDetails{}
+	}
+	return entityDetails("shared_line", in.LineID, "", map[string]any{"status": in.Status})
 }
 
 func auditMemoriaCreate(_ memoriaCreateInput, out memoryOut, err error) toolActivityDetails {
@@ -336,4 +365,45 @@ func auditSpaceStats(_ spaceStatsInput, out spaceStatsOut, err error) toolActivi
 		"spaceIds":   ids,
 		"spaceCount": len(out.Spaces),
 	}}
+}
+
+func auditSharedLineList(_ sharedLineListInput, out sharedLineListOut, err error) toolActivityDetails {
+	if err != nil {
+		return toolActivityDetails{}
+	}
+	ids := make([]string, 0, len(out.Lines))
+	for _, line := range out.Lines {
+		if id, ok := safeMetadataID(line.ID); ok {
+			ids = append(ids, id)
+		}
+	}
+	return toolActivityDetails{metadata: map[string]any{"lineIds": ids, "lineCount": len(out.Lines)}}
+}
+
+func auditSharedLineGet(in sharedLineGetInput, out resumePacketOut, err error) toolActivityDetails {
+	return auditSharedLinePacket(in.LineID, out, err)
+}
+
+func auditSharedLineUpdate(in sharedLineUpdateInput, out resumePacketOut, err error) toolActivityDetails {
+	return auditSharedLinePacket(in.LineID, out, err)
+}
+
+func auditSharedLineHandoff(in sharedLineHandoffInput, out resumePacketOut, err error) toolActivityDetails {
+	return auditSharedLinePacket(in.LineID, out, err)
+}
+
+func auditSharedLinePacket(requestedID string, out resumePacketOut, err error) toolActivityDetails {
+	id := out.Line.ID
+	if err != nil {
+		id = requestedID
+	}
+	metadata := map[string]any{}
+	if err == nil && out.Line.Position != nil {
+		metadata["positionVersion"] = out.Line.Position.Version
+		metadata["factCount"] = len(out.Line.Position.FactsUsed)
+	}
+	if err == nil {
+		metadata["hasHandoff"] = out.RecentHandoff != nil
+	}
+	return entityDetails("shared_line", id, "", metadata)
 }

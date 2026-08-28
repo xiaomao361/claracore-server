@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
@@ -43,6 +44,11 @@ type governanceService interface {
 	SetUserStatus(ctx context.Context, tenantID, userID platform.ID, status string) error
 	ListUsers(ctx context.Context, tenantID platform.ID) ([]governance.User, error)
 	CreateUser(ctx context.Context, in governance.CreateUserInput) (governance.User, governance.Space, error)
+	ListSpaces(ctx context.Context, tenantID platform.ID) ([]governance.Space, error)
+	ListSpacePermissions(ctx context.Context, tenantID platform.ID) ([]governance.Permission, error)
+	CreateProjectSpace(ctx context.Context, tenantID, ownerUserID platform.ID, name string) (governance.Space, error)
+	GrantSpaceAccess(ctx context.Context, tenantID, spaceID, userID, grantedBy platform.ID, canRead, canWrite bool) error
+	RevokeSpaceAccess(ctx context.Context, tenantID, spaceID, userID platform.ID) error
 
 	Scope(ctx context.Context, id governance.Identity) (governance.SpaceScope, error)
 	CreateAgent(ctx context.Context, tenantID, userID platform.ID, slug, displayName string) (governance.Agent, error)
@@ -65,11 +71,18 @@ type knowledgeService interface {
 
 	GetCard(ctx context.Context, tenantID, id platform.ID, spaces []platform.ID) (knowledge.Card, []knowledge.Link, error)
 	GetMemory(ctx context.Context, tenantID, id platform.ID, spaces []platform.ID) (knowledge.Memory, []knowledge.Link, error)
+	FindCardDuplicateCandidates(ctx context.Context, tenantID, cardID platform.ID, spaces []platform.ID) ([]knowledge.CardDuplicateCandidate, error)
 
 	// UpdateCard 是 Web 上**唯一**的内容写入口（审核页）。
 	// 复用 MCP 那侧同一个领域用例——「Web 专用的写入路径」是设计事故。
 	UpdateCard(ctx context.Context, in knowledge.UpdateCardInput) (knowledge.Card, error)
+	Ingest(ctx context.Context, in knowledge.IngestInput) (knowledge.IngestReport, error)
+	EmbeddingHealth(ctx context.Context, tenantID platform.ID, failureLimit int) (knowledge.EmbeddingHealth, error)
+	BackfillEmbeddings(ctx context.Context, tenantID platform.ID, limit int) (knowledge.BackfillReport, error)
+	RetryEmbeddingFailures(ctx context.Context, tenantID platform.ID) (int, error)
 }
+
+type markdownScanner func(ctx context.Context, sourceName, root string) ([]knowledge.Document, error)
 
 // activityService is the Web host's narrow view of the activity domain.
 // Ordinary visibility is already reduced to resolved shared-space IDs before
@@ -78,6 +91,14 @@ type activityService interface {
 	Record(ctx context.Context, in activity.RecordInput) (activity.Event, error)
 	ListVisible(ctx context.Context, in activity.ListVisibleInput) (activity.Page, error)
 	ListAdmin(ctx context.Context, in activity.ListAdminInput) (activity.Page, error)
+}
+
+// continuityService 是治理面读取共同线所需的最小能力。共同线与记忆、
+// 知识卡是并列领域，因此在 Web 中使用独立页面，不混进内容类型筛选。
+type continuityService interface {
+	List(ctx context.Context, in continuity.ListInput) ([]continuity.LineSummary, error)
+	Get(ctx context.Context, in continuity.GetInput) (continuity.ResumePacket, error)
+	SetStatus(ctx context.Context, in continuity.SetStatusInput) (continuity.ResumePacket, error)
 }
 
 type Options struct {
@@ -93,14 +114,19 @@ type Options struct {
 	// 生产必须为真（HTTPS）。本地开发走 http 时为真会让 cookie 根本存不下来，
 	// 表现是「登录成功但立刻又跳回登录页」——所以它是配置而不是常量。
 	SecureCookie bool
+	// IngestRoot 是管理员页面唯一允许扫描的文件树；空值关闭该能力。
+	IngestRoot string
+	// ScanMarkdown 在装配层注入文件系统 adapter，保持 Web 只依赖领域类型。
+	ScanMarkdown markdownScanner
 }
 
 type Host struct {
-	gov      governanceService
-	know     knowledgeService
-	activity activityService
-	logger   *slog.Logger
-	opts     Options
+	gov        governanceService
+	know       knowledgeService
+	continuity continuityService
+	activity   activityService
+	logger     *slog.Logger
+	opts       Options
 	// tmpl 是**每个页面一套模板**，不是一个大集合。
 	//
 	// 全部文件 ParseFS 进同一个 Template 时，各页面的 {{define "content"}}
@@ -110,13 +136,14 @@ type Host struct {
 	tmpl map[string]*template.Template
 }
 
-func NewHost(gov governanceService, know knowledgeService, activity activityService, logger *slog.Logger, opts Options) *Host {
+func NewHost(gov governanceService, know knowledgeService, continuity continuityService, activity activityService, logger *slog.Logger, opts Options) *Host {
 	return &Host{
-		gov:      gov,
-		know:     know,
-		activity: activity,
-		logger:   logger,
-		opts:     opts,
+		gov:        gov,
+		know:       know,
+		continuity: continuity,
+		activity:   activity,
+		logger:     logger,
+		opts:       opts,
 		// 模板在启动时一次性解析：解析失败是装配错误，该在启动时炸，
 		// 而不是等某个人点开某个页面时才 500。
 		tmpl: parseTemplates(),
@@ -127,7 +154,11 @@ func NewHost(gov governanceService, know knowledgeService, activity activityServ
 // 而不是等有人点开它才 500。
 var pages = []string{
 	"login.html", "password.html", "overview.html", "tokens.html", "members.html",
+	"spaces.html",
+	"ingest.html",
+	"indexing.html",
 	"review.html", "review_detail.html", "browse.html", "browse_detail.html",
+	"continuity.html", "continuity_detail.html",
 	"activity.html", "audit_confirm.html", "audit.html",
 }
 
@@ -181,12 +212,24 @@ func (h *Host) Handler() http.Handler {
 
 	mux.Handle("GET /browse", h.requirePasswordSet(http.HandlerFunc(h.handleBrowse)))
 	mux.Handle("GET /browse/{id}", h.requirePasswordSet(http.HandlerFunc(h.handleBrowseDetail)))
+	mux.Handle("GET /continuity", h.requirePasswordSet(http.HandlerFunc(h.handleContinuity)))
+	mux.Handle("GET /continuity/{id}", h.requirePasswordSet(http.HandlerFunc(h.handleContinuityDetail)))
+	mux.Handle("POST /continuity/{id}/status", h.requirePasswordSet(http.HandlerFunc(h.handleContinuityStatus)))
 	mux.Handle("GET /activity", h.requirePasswordSet(http.HandlerFunc(h.handleActivity)))
 
 	mux.Handle("GET /admin/members", h.requireAdmin(http.HandlerFunc(h.handleMembersPage)))
 	mux.Handle("POST /admin/members", h.requireAdmin(http.HandlerFunc(h.handleMemberCreate)))
 	mux.Handle("POST /admin/members/status", h.requireAdmin(http.HandlerFunc(h.handleMemberStatus)))
 	mux.Handle("POST /admin/members/reset", h.requireAdmin(http.HandlerFunc(h.handleMemberReset)))
+	mux.Handle("GET /admin/spaces", h.requireAdmin(http.HandlerFunc(h.handleSpacesPage)))
+	mux.Handle("POST /admin/spaces", h.requireAdmin(http.HandlerFunc(h.handleSpaceCreate)))
+	mux.Handle("POST /admin/spaces/grant", h.requireAdmin(http.HandlerFunc(h.handleSpaceGrant)))
+	mux.Handle("POST /admin/spaces/revoke", h.requireAdmin(http.HandlerFunc(h.handleSpaceRevoke)))
+	mux.Handle("GET /admin/ingest", h.requireAdmin(http.HandlerFunc(h.handleIngestPage)))
+	mux.Handle("POST /admin/ingest", h.requireAdmin(http.HandlerFunc(h.handleIngestRun)))
+	mux.Handle("GET /admin/indexing", h.requireAdmin(http.HandlerFunc(h.handleIndexingPage)))
+	mux.Handle("POST /admin/indexing/backfill", h.requireAdmin(http.HandlerFunc(h.handleIndexingBackfill)))
+	mux.Handle("POST /admin/indexing/retry", h.requireAdmin(http.HandlerFunc(h.handleIndexingRetry)))
 	mux.Handle("GET /admin/audit", h.requireAdmin(http.HandlerFunc(h.handleAuditConfirm)))
 	mux.Handle("POST /admin/audit", h.requireAdmin(http.HandlerFunc(h.handleAudit)))
 
@@ -210,6 +253,7 @@ func securityHeaders(next http.Handler) http.Handler {
 
 func templateFuncs() template.FuncMap {
 	return template.FuncMap{
+		"mul100": func(v float64) float64 { return v * 100 },
 		"stamp": func(t time.Time) string {
 			if t.IsZero() {
 				return "—"

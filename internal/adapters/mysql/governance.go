@@ -628,6 +628,68 @@ func (s *GovernanceStore) ListUsers(ctx context.Context, tenantID platform.ID) (
 	return out, nil
 }
 
+func (s *GovernanceStore) ListSpaces(ctx context.Context, tenantID platform.ID) ([]governance.Space, error) {
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT id, tenant_id, type, name, owner_user_id, created_at
+		 FROM spaces WHERE tenant_id = ? ORDER BY type, id`, string(tenantID))
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询空间列表: %w", err)
+	}
+	defer rows.Close()
+
+	var out []governance.Space
+	for rows.Next() {
+		var sp governance.Space
+		var id, tid string
+		var owner sql.NullString
+		var created time.Time
+		if err := rows.Scan(&id, &tid, &sp.Type, &sp.Name, &owner, &created); err != nil {
+			return nil, fmt.Errorf("mysql: 读取空间列表: %w", err)
+		}
+		sp.ID, sp.TenantID, sp.CreatedAt = platform.ID(id), platform.ID(tid), created.UTC()
+		if owner.Valid {
+			o := platform.ID(owner.String)
+			sp.OwnerUserID = &o
+		}
+		out = append(out, sp)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: 遍历空间列表: %w", err)
+	}
+	return out, nil
+}
+
+func (s *GovernanceStore) ListPermissions(ctx context.Context, tenantID platform.ID) ([]governance.Permission, error) {
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT p.space_id, p.user_id, p.can_read, p.can_write, p.granted_by, p.created_at
+		 FROM space_permissions p
+		 JOIN spaces s ON s.id = p.space_id
+		 JOIN users u ON u.id = p.user_id
+		 WHERE s.tenant_id = ? AND u.tenant_id = ?
+		 ORDER BY p.space_id, p.user_id`, string(tenantID), string(tenantID))
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询空间授权: %w", err)
+	}
+	defer rows.Close()
+
+	var out []governance.Permission
+	for rows.Next() {
+		var p governance.Permission
+		var spaceID, userID, grantedBy string
+		var created time.Time
+		if err := rows.Scan(&spaceID, &userID, &p.CanRead, &p.CanWrite, &grantedBy, &created); err != nil {
+			return nil, fmt.Errorf("mysql: 读取空间授权: %w", err)
+		}
+		p.SpaceID, p.UserID = platform.ID(spaceID), platform.ID(userID)
+		p.GrantedBy, p.CreatedAt = platform.ID(grantedBy), created.UTC()
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: 遍历空间授权: %w", err)
+	}
+	return out, nil
+}
+
 func (s *GovernanceStore) UpdateUserPassword(ctx context.Context, tenantID, userID platform.ID, hash string, mustChange bool, _ time.Time) error {
 	res, err := s.ex.ExecContext(ctx,
 		`UPDATE users SET password_hash = ?, must_change_pw = ? WHERE tenant_id = ? AND id = ?`,

@@ -179,16 +179,28 @@ type serverStatusOut struct {
 	// agent 需要它才能理解 card_recall 的行为：没接的时候召回退化成
 	// 中文全文匹配，精度会明显下降但不是失灵。没有这个字段的话，
 	// 「召回质量差」和「服务配错了」在 agent 眼里是同一件事。
-	SemanticSearch bool `json:"semanticSearch"`
+	SemanticSearch bool                 `json:"semanticSearch"`
+	EmbeddingCache embeddingCacheStatus `json:"embeddingCache"`
+}
+
+type embeddingCacheStatus struct {
+	Enabled bool   `json:"enabled"`
+	Hits    uint64 `json:"hits"`
+	Misses  uint64 `json:"misses"`
 }
 
 // handleServerStatus 不需要身份：它回答的是「这个服务是什么」，
 // 不涉及任何租户数据。认证仍然发生在中间件里——只是这个 handler
 // 不再去解析身份。
 func (h *Host) handleServerStatus(_ context.Context, _ *sdk.CallToolRequest, _ serverStatusInput) (*sdk.CallToolResult, serverStatusOut, error) {
+	cache := embeddingCacheStatus{}
+	if h.embeddingCacheStats != nil {
+		cache.Hits, cache.Misses, cache.Enabled = h.embeddingCacheStats()
+	}
 	return nil, serverStatusOut{
 		Name:           serverName,
 		Version:        h.version,
 		SemanticSearch: h.semanticSearch,
+		EmbeddingCache: cache,
 	}, nil
 }

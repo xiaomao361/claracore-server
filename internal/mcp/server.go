@@ -18,16 +18,18 @@ const serverName = "claracore-server"
 // 它持有领域服务与日志，不持有数据库连接——存储对这一层不可见
 // （test/arch_test.go 会拦住 internal/mcp → internal/adapters 的 import）。
 type Host struct {
-	gov      governanceService
-	know     knowledgeService
-	activity activityService
-	logger   *slog.Logger
-	version  string
+	gov        governanceService
+	know       knowledgeService
+	continuity continuityService
+	activity   activityService
+	logger     *slog.Logger
+	version    string
 
 	// semanticSearch 只用于 server_status 的自述，不影响任何行为。
 	// 检索该不该用向量由 knowledge.Service 自己知道（它持有 Embedder），
 	// Host 在这里放一个副本纯粹是为了能对外说清楚这个部署是什么形态。
-	semanticSearch bool
+	semanticSearch      bool
+	embeddingCacheStats func() (hits, misses uint64, enabled bool)
 
 	srv *sdk.Server
 }
@@ -36,16 +38,23 @@ type HostOptions struct {
 	Version string
 	// SemanticSearch 表示这个部署接了 embedding 服务。
 	SemanticSearch bool
+	// EmbeddingCacheStats returns process-local query/content cache counters.
+	// Nil means this deployment has no cache decorator.
+	EmbeddingCacheStats func() (hits, misses uint64, enabled bool)
 }
 
-func NewHost(gov governanceService, know knowledgeService, activities activityService, logger *slog.Logger, opts HostOptions) *Host {
+func NewHost(gov governanceService, know knowledgeService, continuity continuityService, activities activityService, logger *slog.Logger, opts HostOptions) *Host {
+	if continuity == nil {
+		panic("mcp: continuityService 不能为空")
+	}
 	if activities == nil {
 		panic("mcp: activityService 不能为空")
 	}
 	h := &Host{
-		gov: gov, know: know, activity: activities, logger: logger,
-		version:        opts.Version,
-		semanticSearch: opts.SemanticSearch,
+		gov: gov, know: know, continuity: continuity, activity: activities, logger: logger,
+		version:             opts.Version,
+		semanticSearch:      opts.SemanticSearch,
+		embeddingCacheStats: opts.EmbeddingCacheStats,
 	}
 	h.srv = h.newServer()
 	return h
@@ -62,7 +71,7 @@ func (h *Host) newServer() *sdk.Server {
 		Version: h.version,
 	}, nil)
 
-	// 工具数量刻意控制在 20 以内（docs/03-mcp-contract.md §1）：
+	// 工具数量刻意控制在 24 以内（docs/03-mcp-contract.md §1）：
 	// 每个工具的 schema 都占 agent 的上下文预算，工具越多选错的概率越高。
 	// 维护类操作（导入导出、合并建议、休眠归档、标签别名）**一律不进这里**，
 	// 它们是人的运维动作，归 Web 治理面。
@@ -77,6 +86,18 @@ func (h *Host) newServer() *sdk.Server {
 		Name:        "server_status",
 		Description: "服务版本，以及这个部署是否接了语义检索（没接时 card_recall 退化为中文全文匹配）。",
 	}, activity.KindTrace, activity.AccessRead, auditServerStatus, h.handleServerStatus)
+	addAuditedTool(h, s, &sdk.Tool{
+		Name:        "gateway_auto_context",
+		Description: "对当前情境做保守的知识卡自动召回。最多交付一张；低相关、歧义、模型不可用时 abstain。selected 只表示选中，调用方实际放入上下文后才算 delivered/used。",
+	}, activity.KindTrace, activity.AccessRead, auditGatewayAutoContext, h.handleGatewayAutoContext)
+	addAuditedTool(h, s, &sdk.Tool{
+		Name:        "gateway_context_feedback",
+		Description: "记录自动上下文是否被交付、使用、忽略或判错。只写治理活动，不修改知识卡正文。",
+	}, activity.KindGovernance, activity.AccessWrite, auditGatewayContextFeedback, h.handleGatewayContextFeedback)
+	addAuditedTool(h, s, &sdk.Tool{
+		Name:        "context_quality_status",
+		Description: "汇总当前租户近 30 天已提交的自动上下文反馈。只返回 outcome 计数，不暴露内容或 actor；这是反馈覆盖情况，不等同于准确率。",
+	}, activity.KindTrace, activity.AccessRead, auditContextQualityStatus, h.handleContextQualityStatus)
 
 	// --- Memory ---
 	addAuditedTool(h, s, &sdk.Tool{
@@ -146,6 +167,29 @@ func (h *Host) newServer() *sdk.Server {
 		Name:        "space_stats",
 		Description: "空间内容统计。unqualifiedCards 是「理解」栏为空、只算摘要的卡片数；draftCards 是等人过目的摄取产物。",
 	}, activity.KindTrace, activity.AccessRead, auditSpaceStats, h.handleSpaceStats)
+
+	// --- Shared Line / Continuity ---
+	addAuditedTool(h, s, &sdk.Tool{
+		Name: "shared_line_list",
+		Description: "列出 Shared Line 摘要目录。默认只列当前 agent 拥有的 active line；allAgents=true 可查看同租户团队目录。" +
+			"列表只用于选择，不是恢复上下文；恢复请再调用 shared_line_get。",
+	}, activity.KindTrace, activity.AccessRead, auditSharedLineList, h.handleSharedLineList)
+	addAuditedTool(h, s, &sdk.Tool{
+		Name:        "shared_line_get",
+		Description: "读取一条 Shared Line 的完整恢复包（当前位置 + 最近交接）。不传 lineId 时仅在当前 agent 恰有一条 active line 时自动选择；多条时会要求明确 ID。",
+	}, activity.KindTrace, activity.AccessRead, auditSharedLineGet, h.handleSharedLineGet)
+	addAuditedTool(h, s, &sdk.Tool{
+		Name:        "shared_line_update",
+		Description: "更新 Shared Line 的当前工作位置。不传 lineId 时：没有则创建、一条则更新、多条则拒绝并返回候选；显式更新同租户他人 line 只记录本次 writer，不转移 owner。",
+	}, activity.KindTrace, activity.AccessWrite, auditSharedLineUpdate, h.handleSharedLineUpdate)
+	addAuditedTool(h, s, &sdk.Tool{
+		Name:        "shared_line_handoff",
+		Description: "为一条 Shared Line 写入阶段性交接，并返回该 exact line 的完整恢复包。多条 active line 时应传 lineId。",
+	}, activity.KindTrace, activity.AccessWrite, auditSharedLineHandoff, h.handleSharedLineHandoff)
+	addAuditedTool(h, s, &sdk.Tool{
+		Name:        "shared_line_status",
+		Description: "归档或重新激活一条 Shared Line；历史与当前位置保留，不做删除。",
+	}, activity.KindTrace, activity.AccessWrite, auditSharedLineStatus, h.handleSharedLineStatus)
 
 	return s
 }

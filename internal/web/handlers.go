@@ -455,6 +455,142 @@ func (h *Host) handleMemberReset(w http.ResponseWriter, r *http.Request) {
 	h.renderMembers(w, r, data)
 }
 
+// ---------------------------------------------------------------------------
+// 空间与权限（管理员）
+// ---------------------------------------------------------------------------
+
+type spaceGrantView struct {
+	User       governance.User
+	Permission *governance.Permission
+}
+
+type adminSpaceView struct {
+	Space     governance.Space
+	OwnerName string
+	Grants    []spaceGrantView
+}
+
+type spacesPageData struct {
+	pageData
+	Spaces []adminSpaceView
+}
+
+func (h *Host) handleSpacesPage(w http.ResponseWriter, r *http.Request) {
+	h.renderSpaces(w, r, spacesPageData{pageData: h.page(r, "空间与权限", "spaces")})
+}
+
+func (h *Host) renderSpaces(w http.ResponseWriter, r *http.Request, data spacesPageData) {
+	p, _ := principalFrom(r.Context())
+	spaces, err := h.gov.ListSpaces(r.Context(), p.TenantID)
+	if err != nil {
+		h.logger.Error("查询空间失败", "error", err)
+		data.Error = "读取空间列表失败"
+		h.render(w, "spaces.html", data)
+		return
+	}
+	users, err := h.gov.ListUsers(r.Context(), p.TenantID)
+	if err != nil {
+		h.logger.Error("查询空间成员失败", "error", err)
+		data.Error = "读取成员列表失败"
+		h.render(w, "spaces.html", data)
+		return
+	}
+	permissions, err := h.gov.ListSpacePermissions(r.Context(), p.TenantID)
+	if err != nil {
+		h.logger.Error("查询空间授权失败", "error", err)
+		data.Error = "读取权限列表失败"
+		h.render(w, "spaces.html", data)
+		return
+	}
+
+	userByID := make(map[platform.ID]governance.User, len(users))
+	for _, user := range users {
+		userByID[user.ID] = user
+	}
+	permByPair := make(map[[2]platform.ID]governance.Permission, len(permissions))
+	for _, permission := range permissions {
+		permByPair[[2]platform.ID{permission.SpaceID, permission.UserID}] = permission
+	}
+	for _, space := range spaces {
+		// 个人空间的封闭性不可配置，不出现在管理员授权面。
+		if space.Type == governance.SpacePersonal {
+			continue
+		}
+		view := adminSpaceView{Space: space}
+		if space.OwnerUserID != nil {
+			view.OwnerName = userByID[*space.OwnerUserID].DisplayName
+		}
+		for _, user := range users {
+			if space.IsOwnedBy(user.ID) {
+				continue
+			}
+			grant := spaceGrantView{User: user}
+			if permission, ok := permByPair[[2]platform.ID{space.ID, user.ID}]; ok {
+				cp := permission
+				grant.Permission = &cp
+			}
+			view.Grants = append(view.Grants, grant)
+		}
+		data.Spaces = append(data.Spaces, view)
+	}
+	h.render(w, "spaces.html", data)
+}
+
+func (h *Host) handleSpaceCreate(w http.ResponseWriter, r *http.Request) {
+	p, _ := principalFrom(r.Context())
+	space, err := h.gov.CreateProjectSpace(r.Context(), p.TenantID, p.UserID, r.FormValue("name"))
+	if err != nil {
+		markWebAuditFailed(r)
+		data := spacesPageData{pageData: h.page(r, "空间与权限", "spaces")}
+		data.Error = userFacing(err, "创建项目空间失败")
+		h.renderSpaces(w, r, data)
+		return
+	}
+	setWebAuditTarget(r, "space", space.ID, space.ID)
+	http.Redirect(w, r, "/admin/spaces", http.StatusSeeOther)
+}
+
+func (h *Host) handleSpaceGrant(w http.ResponseWriter, r *http.Request) {
+	p, _ := principalFrom(r.Context())
+	spaceID, userID := platform.ID(r.FormValue("space")), platform.ID(r.FormValue("user"))
+	var canRead, canWrite bool
+	switch r.FormValue("access") {
+	case "read":
+		canRead = true
+	case "write":
+		canRead, canWrite = true, true
+	default:
+		markWebAuditFailed(r)
+		data := spacesPageData{pageData: h.page(r, "空间与权限", "spaces")}
+		data.Error = "权限只能选择只读或读写"
+		h.renderSpaces(w, r, data)
+		return
+	}
+	if err := h.gov.GrantSpaceAccess(r.Context(), p.TenantID, spaceID, userID, p.UserID, canRead, canWrite); err != nil {
+		markWebAuditFailed(r)
+		data := spacesPageData{pageData: h.page(r, "空间与权限", "spaces")}
+		data.Error = userFacing(err, "保存空间权限失败")
+		h.renderSpaces(w, r, data)
+		return
+	}
+	setWebAuditTarget(r, "space", spaceID, spaceID)
+	http.Redirect(w, r, "/admin/spaces", http.StatusSeeOther)
+}
+
+func (h *Host) handleSpaceRevoke(w http.ResponseWriter, r *http.Request) {
+	p, _ := principalFrom(r.Context())
+	spaceID, userID := platform.ID(r.FormValue("space")), platform.ID(r.FormValue("user"))
+	if err := h.gov.RevokeSpaceAccess(r.Context(), p.TenantID, spaceID, userID); err != nil {
+		markWebAuditFailed(r)
+		data := spacesPageData{pageData: h.page(r, "空间与权限", "spaces")}
+		data.Error = userFacing(err, "撤销空间权限失败")
+		h.renderSpaces(w, r, data)
+		return
+	}
+	setWebAuditTarget(r, "space", spaceID, spaceID)
+	http.Redirect(w, r, "/admin/spaces", http.StatusSeeOther)
+}
+
 // userFacing 决定错误信息能不能直接给人看。
 //
 // ErrInvalidArgument 描述的是调用方自己填的东西（密码太短、角色非法），

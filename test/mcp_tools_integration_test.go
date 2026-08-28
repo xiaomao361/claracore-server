@@ -28,6 +28,7 @@ import (
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
 	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	mcphost "claracore-server/internal/mcp"
@@ -81,6 +82,10 @@ func newToolEnv(t *testing.T) toolEnv {
 	t.Cleanup(func() {
 		bg := context.Background()
 		for _, stmt := range []string{
+			`DELETE FROM continuity_handoffs WHERE tenant_id = ?`,
+			`DELETE FROM continuity_position_history WHERE tenant_id = ?`,
+			`DELETE FROM continuity_positions WHERE tenant_id = ?`,
+			`DELETE FROM continuity_lines WHERE tenant_id = ?`,
 			`DELETE FROM audit_logs WHERE tenant_id = ?`,
 			`DELETE FROM embeddings WHERE tenant_id = ?`,
 			`DELETE FROM card_recall_triggers WHERE tenant_id = ?`,
@@ -128,7 +133,8 @@ func newToolEnv(t *testing.T) toolEnv {
 	know := knowledge.NewService(mysql.NewKnowledgeStore(db), clock, ids, embedder)
 	activityService := activity.NewService(mysql.NewActivityStore(db), clock, ids)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(mcphost.NewHost(gov, know, activityService, logger, mcphost.HostOptions{
+	continuityService := continuity.NewService(mysql.NewContinuityStore(db), clock, ids)
+	srv := httptest.NewServer(mcphost.NewHost(gov, know, continuityService, activityService, logger, mcphost.HostOptions{
 		Version: "tools-e2e", SemanticSearch: embedder != nil,
 	}).Handler())
 	t.Cleanup(srv.Close)
@@ -214,6 +220,25 @@ type e2eSearch struct {
 	Hits              []e2eContent `json:"hits"`
 	SemanticAvailable bool         `json:"semanticAvailable"`
 	CardMatches       int          `json:"cardMatches"`
+}
+
+type e2eResumePacket struct {
+	Line struct {
+		ID           string `json:"id"`
+		OwnerAgentID string `json:"ownerAgentId"`
+		Title        string `json:"title"`
+		Position     *struct {
+			Summary       string   `json:"summary"`
+			FactsUsed     []string `json:"factsUsed"`
+			WriterAgentID string   `json:"writerAgentId"`
+			Version       int      `json:"version"`
+		} `json:"position"`
+	} `json:"line"`
+	RecentHandoff *struct {
+		Objective string   `json:"objective"`
+		Completed []string `json:"completed"`
+		NextStep  string   `json:"nextStep"`
+	} `json:"recentHandoff"`
 }
 
 // TestMCPToolsEndToEnd 走一遍真实的工作流。
@@ -421,6 +446,44 @@ func TestMCPToolsEndToEnd(t *testing.T) {
 		// 这张卡写了「理解」，所以不该被算成"只是摘要"
 		if personal.UnqualifiedCards != 0 {
 			t.Fatalf("合格卡片不该被数进 unqualifiedCards，实际 %d", personal.UnqualifiedCards)
+		}
+	})
+
+	t.Run("Shared Line 创建更新交接返回同一条恢复包", func(t *testing.T) {
+		var created e2eResumePacket
+		if msg := env.tool(t, "shared_line_update", map[string]any{
+			"summary": "公共记忆库前四项已完成", "interpretationStatus": "active",
+			"factsUsed": []string{card.ID}, "nextStep": "部署到本地服务器验证",
+		}, &created); msg != "" {
+			t.Fatal(msg)
+		}
+		if created.Line.ID == "" || created.Line.Position == nil || created.Line.Position.Version != 1 {
+			t.Fatalf("首次 update 应创建 line 并返回 version=1 的恢复包，实际 %+v", created)
+		}
+		if created.Line.Position.WriterAgentID == "" || created.Line.OwnerAgentID != created.Line.Position.WriterAgentID {
+			t.Fatalf("首次写入 owner/writer 应来自同一个认证 agent，实际 %+v", created)
+		}
+		if len(created.Line.Position.FactsUsed) != 1 || created.Line.Position.FactsUsed[0] != card.ID {
+			t.Fatalf("factsUsed 应原样回读，实际 %+v", created.Line.Position.FactsUsed)
+		}
+
+		var got e2eResumePacket
+		if msg := env.tool(t, "shared_line_get", map[string]any{"lineId": created.Line.ID}, &got); msg != "" {
+			t.Fatal(msg)
+		}
+		if got.Line.ID != created.Line.ID || got.Line.Position == nil || got.Line.Position.Summary != "公共记忆库前四项已完成" {
+			t.Fatalf("get 应返回 exact line 的当前位置，实际 %+v", got)
+		}
+
+		var handed e2eResumePacket
+		if msg := env.tool(t, "shared_line_handoff", map[string]any{
+			"lineId": created.Line.ID, "objective": "进入本地部署验证",
+			"completed": []string{"MCP 接入", "MySQL 持久化"}, "nextStep": "运行部署探针",
+		}, &handed); msg != "" {
+			t.Fatal(msg)
+		}
+		if handed.Line.ID != created.Line.ID || handed.RecentHandoff == nil || handed.RecentHandoff.Objective != "进入本地部署验证" {
+			t.Fatalf("handoff 确认必须回同一个 line 的完整包，实际 %+v", handed)
 		}
 	})
 

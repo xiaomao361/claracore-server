@@ -66,6 +66,48 @@ func TestListContentsPushesFiltersIntoSQL(t *testing.T) {
 	}
 }
 
+func TestListContentsFullTextFilterKeepsDraftsAndTenantScope(t *testing.T) {
+	db := openTestDB(t)
+	store := mysql.NewKnowledgeStore(db)
+	ctx := context.Background()
+	ids := platform.NewIDGenerator(platform.SystemClock{})
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	f := newKFixture(ids)
+	cleanupTenant(t, db, f.tenant, f.foreign)
+
+	active := f.card(ids, f.spaceMine, now)
+	active.Title = "部署回滚检查"
+	draft := f.card(ids, f.spaceMine, now.Add(time.Millisecond))
+	draft.Title, draft.Status = "部署回滚原料", knowledge.CardDraft
+	hidden := f.card(ids, f.spaceHid, now)
+	hidden.Title = "部署回滚隐藏"
+	foreign := f.card(ids, f.spaceMine, now)
+	foreign.Title, foreign.TenantID = "部署回滚外租户", f.foreign
+	unmatched := f.card(ids, f.spaceMine, now)
+	unmatched.Title = "连接池调优"
+	for _, card := range []knowledge.Card{active, draft, hidden, foreign, unmatched} {
+		if err := store.CreateCard(ctx, card); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	query := knowledge.ListQuery{TenantID: f.tenant, SpaceIDs: f.visible(), Kind: knowledge.EntityCard, Query: "部署回滚", Limit: 50}
+	items, err := store.ListContents(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("应命中可读范围内 active + draft 两张，实际 %+v", items)
+	}
+	count, err := store.CountContents(ctx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != len(items) {
+		t.Fatalf("filtered count=%d items=%d", count, len(items))
+	}
+}
+
 // TestCursorPaginationOnRealDB 验的是 SQL 里那个复合比较。
 //
 // `updated_at < ? OR (updated_at = ? AND id < ?)` 写错一个分支，

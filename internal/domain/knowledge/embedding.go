@@ -79,6 +79,32 @@ type Embedding struct {
 	UpdatedAt time.Time
 }
 
+// EmbeddingStats 是治理面使用的队列口径。Exhausted 是 Failed 中已达到
+// 自动重试上限的子集，不与 Failed 相加。
+type EmbeddingStats struct {
+	Pending   int
+	Ready     int
+	Failed    int
+	Exhausted int
+}
+
+type EmbeddingHealth struct {
+	Enabled  bool
+	Model    string
+	Stats    EmbeddingStats
+	Failures []Embedding
+}
+
+type BackfillReport struct {
+	Enabled  bool
+	Model    string
+	Memories int
+	Cards    int
+	Triggers int
+}
+
+func (r BackfillReport) Total() int { return r.Memories + r.Cards + r.Triggers }
+
 // validEmbedTarget 限定哪些实体可以有向量。
 //
 // 与 Ref.Validate() 不同：那里问的是「能不能被打标签、被关联」，
@@ -293,4 +319,93 @@ func clampBatch(n int) int {
 		return maxIndexBatch
 	}
 	return n
+}
+
+// BackfillEmbeddings 为“后来才启用模型”或“切换模型”的存量可检索内容补队列。
+// 它只补不存在的 (entity, model)，不会重置已经 ready 或已失败的行。
+func (s *Service) BackfillEmbeddings(ctx context.Context, tenantID platform.ID, limit int) (BackfillReport, error) {
+	if tenantID == "" {
+		return BackfillReport{}, fmt.Errorf("%w: 缺少租户", ErrInvalidArgument)
+	}
+	if s.embedder == nil {
+		return BackfillReport{}, nil
+	}
+	limit = clampBatch(limit)
+	report := BackfillReport{Enabled: true, Model: s.embedder.Model()}
+	now := s.clock.Now()
+	err := s.store.Atomically(ctx, func(st Store) error {
+		remaining := limit
+		memories, err := st.ListMemoriesMissingEmbedding(ctx, tenantID, report.Model, remaining)
+		if err != nil {
+			return err
+		}
+		for _, m := range memories {
+			if err := s.enqueueEmbedding(ctx, st, tenantID, Ref{EntityMemory, m.ID}, memoryEmbedText(m), now); err != nil {
+				return err
+			}
+			report.Memories++
+		}
+		remaining -= len(memories)
+		if remaining == 0 {
+			return nil
+		}
+		cards, err := st.ListCardsMissingEmbedding(ctx, tenantID, report.Model, remaining)
+		if err != nil {
+			return err
+		}
+		for _, c := range cards {
+			if err := s.enqueueEmbedding(ctx, st, tenantID, Ref{EntityCard, c.ID}, cardEmbedText(c), now); err != nil {
+				return err
+			}
+			report.Cards++
+		}
+		remaining -= len(cards)
+		if remaining == 0 {
+			return nil
+		}
+		triggers, err := st.ListTriggersMissingEmbedding(ctx, tenantID, report.Model, remaining)
+		if err != nil {
+			return err
+		}
+		for _, trigger := range triggers {
+			if err := s.enqueueEmbedding(ctx, st, tenantID, Ref{EntityCardTrigger, trigger.ID}, triggerEmbedText(trigger), now); err != nil {
+				return err
+			}
+			report.Triggers++
+		}
+		return nil
+	})
+	return report, err
+}
+
+func (s *Service) EmbeddingHealth(ctx context.Context, tenantID platform.ID, failureLimit int) (EmbeddingHealth, error) {
+	if tenantID == "" {
+		return EmbeddingHealth{}, fmt.Errorf("%w: 缺少租户", ErrInvalidArgument)
+	}
+	if s.embedder == nil {
+		return EmbeddingHealth{}, nil
+	}
+	model := s.embedder.Model()
+	stats, err := s.store.EmbeddingStats(ctx, tenantID, model, maxEmbedAttempts)
+	if err != nil {
+		return EmbeddingHealth{}, err
+	}
+	if failureLimit <= 0 || failureLimit > 100 {
+		failureLimit = 20
+	}
+	failures, err := s.store.ListEmbeddingFailures(ctx, tenantID, model, failureLimit)
+	if err != nil {
+		return EmbeddingHealth{}, err
+	}
+	return EmbeddingHealth{Enabled: true, Model: model, Stats: stats, Failures: failures}, nil
+}
+
+func (s *Service) RetryEmbeddingFailures(ctx context.Context, tenantID platform.ID) (int, error) {
+	if tenantID == "" {
+		return 0, fmt.Errorf("%w: 缺少租户", ErrInvalidArgument)
+	}
+	if s.embedder == nil {
+		return 0, nil
+	}
+	return s.store.RetryEmbeddingFailures(ctx, tenantID, s.embedder.Model(), s.clock.Now())
 }

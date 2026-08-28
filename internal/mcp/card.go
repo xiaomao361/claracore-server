@@ -34,6 +34,7 @@ type cardCreateInput struct {
 	Labels         []string `json:"labels,omitempty" jsonschema:"标签"`
 	Status         string   `json:"status,omitempty" jsonschema:"draft | active | deprecated。不传即 active（手写默认，作者自管）；摄取产生的内容应显式传 draft，它不进默认检索"`
 	Space          string   `json:"space,omitempty" jsonschema:"目标空间 ID。不传即写入个人空间"`
+	EvolvesFrom    string   `json:"evolvesFrom,omitempty" jsonschema:"被这张新卡替代的旧卡 ID；创建、旧卡 deprecated、evolved-from 关联原子提交"`
 }
 
 func (h *Host) handleCardCreate(ctx context.Context, _ *sdk.CallToolRequest, in cardCreateInput) (*sdk.CallToolResult, cardOut, error) {
@@ -65,6 +66,8 @@ func (h *Host) handleCardCreate(ctx context.Context, _ *sdk.CallToolRequest, in 
 		Status:         in.Status,
 		RecallTriggers: in.RecallTriggers,
 		Labels:         in.Labels,
+		EvolvesFromID:  platform.ID(in.EvolvesFrom),
+		WritableSpaces: r.writableSpaces(),
 	})
 	if err != nil {
 		return nil, cardOut{}, toolError(h.logger, "card_create", err)

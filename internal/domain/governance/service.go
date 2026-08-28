@@ -152,6 +152,29 @@ type ProvisionTenantResult struct {
 	Personal  Space
 }
 
+// BootstrapTenant 只允许在空部署单元中创建第一个租户。
+//
+// 检查与创建放在同一个 Store 原子单元里，避免一次失败留下半套租户数据。
+// 这不是日常的“再建一个租户”入口：当前产品约束是一个团队一套部署单元，
+// 已经存在任何租户时都明确拒绝。
+func (s *Service) BootstrapTenant(ctx context.Context, in ProvisionTenantInput) (result ProvisionTenantResult, err error) {
+	err = s.store.Atomically(ctx, func(st Store) error {
+		tenants, err := st.ListTenants(ctx)
+		if err != nil {
+			return err
+		}
+		if len(tenants) != 0 {
+			return ErrAlreadyProvisioned
+		}
+
+		txService := *s
+		txService.store = st
+		result, err = txService.ProvisionTenant(ctx, in)
+		return err
+	})
+	return result, err
+}
+
 // ProvisionTenant 开一个租户：租户 + 团队空间 + 管理员 + 管理员的个人空间。
 //
 // 四件事必须原子完成。任一半途失败留下的残缺状态都没有自愈路径：
@@ -373,6 +396,20 @@ func (s *Service) ListTokens(ctx context.Context, tenantID, userID platform.ID) 
 	return s.store.ListTokens(ctx, tenantID, userID)
 }
 
+func (s *Service) ListSpaces(ctx context.Context, tenantID platform.ID) ([]Space, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("%w: 缺少租户", ErrInvalidArgument)
+	}
+	return s.store.ListSpaces(ctx, tenantID)
+}
+
+func (s *Service) ListSpacePermissions(ctx context.Context, tenantID platform.ID) ([]Permission, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("%w: 缺少租户", ErrInvalidArgument)
+	}
+	return s.store.ListPermissions(ctx, tenantID)
+}
+
 // GrantSpaceAccess 授予某人对某空间的读写权限。
 //
 // 个人空间不可授权他人：它的封闭性是设计约束而非默认值，是用户敢于随手
@@ -380,6 +417,9 @@ func (s *Service) ListTokens(ctx context.Context, tenantID, userID platform.ID) 
 func (s *Service) GrantSpaceAccess(ctx context.Context, tenantID, spaceID, userID, grantedBy platform.ID, canRead, canWrite bool) error {
 	space, err := s.store.FindSpace(ctx, tenantID, spaceID)
 	if err != nil {
+		return err
+	}
+	if _, err := s.store.FindUserByID(ctx, tenantID, userID); err != nil {
 		return err
 	}
 	if space.Type == SpacePersonal {
@@ -404,7 +444,13 @@ func (s *Service) GrantSpaceAccess(ctx context.Context, tenantID, spaceID, userI
 	})
 }
 
-func (s *Service) RevokeSpaceAccess(ctx context.Context, spaceID, userID platform.ID) error {
+func (s *Service) RevokeSpaceAccess(ctx context.Context, tenantID, spaceID, userID platform.ID) error {
+	if _, err := s.store.FindSpace(ctx, tenantID, spaceID); err != nil {
+		return err
+	}
+	if _, err := s.store.FindUserByID(ctx, tenantID, userID); err != nil {
+		return err
+	}
 	return s.store.RevokePermission(ctx, spaceID, userID)
 }
 

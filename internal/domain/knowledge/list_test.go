@@ -3,6 +3,7 @@ package knowledge
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"claracore-server/internal/platform"
@@ -61,6 +62,28 @@ func TestListSeesDraftAndDeprecated(t *testing.T) {
 	}
 	if drafts.Total != 1 {
 		t.Fatalf("总数应与筛选条件一致，实际 %d", drafts.Total)
+	}
+}
+
+func TestListQueryFiltersAcrossLifecycleStatesAndCount(t *testing.T) {
+	svc, _ := newTestService(t)
+	seedCard(t, svc, spacePriv, withCard("部署回滚检查清单"))
+	other := seedCard(t, svc, spacePriv, withCard("数据库连接池"))
+	if _, err := svc.UpdateCard(context.Background(), UpdateCardInput{
+		TenantID: tenantA, ID: other.ID, WritableSpaces: mySpaces(), Status: ptr(CardDeprecated),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res := listCards(t, svc, ListContentsInput{Query: "部署回滚"})
+	if len(res.Items) != 1 || res.Items[0].Title != "部署回滚检查清单" || res.Total != 1 {
+		t.Fatalf("query should filter rows and count consistently: %+v", res)
+	}
+	if _, err := svc.ListContents(context.Background(), ListContentsInput{
+		TenantID: tenantA, Spaces: mySpaces(), Kind: EntityCard,
+		Query: strings.Repeat("查", MaxListQueryLen+1),
+	}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized query should fail: %v", err)
 	}
 }
 

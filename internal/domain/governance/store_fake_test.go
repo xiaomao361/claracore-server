@@ -277,6 +277,35 @@ func (f *fakeStore) ListUsers(_ context.Context, tenantID platform.ID) ([]User, 
 	return out, nil
 }
 
+func (f *fakeStore) ListSpaces(_ context.Context, tenantID platform.ID) ([]Space, error) {
+	var out []Space
+	for _, s := range f.spaces {
+		if s.TenantID == tenantID {
+			out = append(out, s)
+		}
+	}
+	slices.SortFunc(out, func(a, b Space) int { return strings.Compare(string(a.ID), string(b.ID)) })
+	return out, nil
+}
+
+func (f *fakeStore) ListPermissions(_ context.Context, tenantID platform.ID) ([]Permission, error) {
+	var out []Permission
+	for _, p := range f.perms {
+		space, spaceOK := f.spaces[p.SpaceID]
+		user, userOK := f.users[p.UserID]
+		if spaceOK && userOK && space.TenantID == tenantID && user.TenantID == tenantID {
+			out = append(out, p)
+		}
+	}
+	slices.SortFunc(out, func(a, b Permission) int {
+		if cmp := strings.Compare(string(a.SpaceID), string(b.SpaceID)); cmp != 0 {
+			return cmp
+		}
+		return strings.Compare(string(a.UserID), string(b.UserID))
+	})
+	return out, nil
+}
+
 func (f *fakeStore) UpdateUserPassword(_ context.Context, tenantID, userID platform.ID, hash string, mustChange bool, _ time.Time) error {
 	u, ok := f.users[userID]
 	if !ok || u.TenantID != tenantID {

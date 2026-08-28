@@ -124,6 +124,19 @@ func (s *Service) ListAdmin(ctx context.Context, in ListAdminInput) (Page, error
 	return makePage(events, limit), nil
 }
 
+// ContextFeedbackQuality returns aggregate submitted feedback since the given
+// instant. Governance rows are retained independently from short-lived traces.
+func (s *Service) ContextFeedbackQuality(ctx context.Context, tenantID platform.ID, window time.Duration) (ContextFeedbackQuality, error) {
+	if tenantID == "" || window <= 0 {
+		return ContextFeedbackQuality{}, fmt.Errorf("%w: 缺少租户或统计窗口", ErrInvalidArgument)
+	}
+	since := s.clock.Now().UTC().Add(-window)
+	return s.store.CountContextFeedback(ctx, ContextFeedbackQuery{
+		TenantID: tenantID,
+		Since:    since,
+	})
+}
+
 // DeleteTracesBefore removes one bounded batch of expired trace rows.
 // Governance and meta-audit rows are never eligible for this path.
 func (s *Service) DeleteTracesBefore(ctx context.Context, before time.Time, limit int) (int, error) {

@@ -200,6 +200,42 @@ func TestActivityAdminAndKeysetPaginationStayTenantScoped(t *testing.T) {
 	}
 }
 
+func TestCountContextFeedbackIsTenantWindowAndOutcomeScoped(t *testing.T) {
+	store, _ := openActivityTestStore(t)
+	f := newActivityFixture()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	since := now.Add(-30 * 24 * time.Hour)
+
+	feedback := func(tenant platform.ID, outcome string, at time.Time) activity.Event {
+		event := f.event(f.me, at)
+		event.TenantID = tenant
+		event.Kind = activity.KindGovernance
+		event.Access = activity.AccessWrite
+		event.Action = "gateway_context_feedback"
+		event.Metadata = json.RawMessage(`{"feedbackOutcome":"` + outcome + `"}`)
+		return event
+	}
+	recordActivity(t, store,
+		feedback(f.tenant, "used", now.Add(-time.Hour)),
+		feedback(f.tenant, "used", now.Add(-2*time.Hour)),
+		feedback(f.tenant, "wrong", now.Add(-3*time.Hour)),
+		feedback(f.tenant, "corrected", now.Add(-4*time.Hour)),
+		feedback(f.tenant, "ignored", since.Add(-time.Millisecond)),
+		feedback(f.foreign, "wrong", now.Add(-time.Hour)),
+	)
+	failed := feedback(f.tenant, "wrong", now.Add(-time.Hour))
+	failed.Outcome = activity.OutcomeError
+	recordActivity(t, store, failed)
+
+	quality, err := store.CountContextFeedback(context.Background(), activity.ContextFeedbackQuery{TenantID: f.tenant, Since: since})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quality.Total() != 4 || quality.Used != 2 || quality.Wrong != 1 || quality.Corrected != 1 || quality.Ignored != 0 {
+		t.Fatalf("feedback histogram leaked scope or window: %+v", quality)
+	}
+}
+
 func TestDeleteTracesBeforeKeepsPermanentAuditKinds(t *testing.T) {
 	store, _ := openActivityTestStore(t)
 	f := newActivityFixture()

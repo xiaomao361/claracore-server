@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"claracore-server/internal/platform"
@@ -136,6 +137,17 @@ func (f *fakeStore) FindCard(_ context.Context, tenantID, id platform.ID, spaces
 	c.Labels = slices.Clone(f.labels[Ref{EntityCard, id}.String()])
 	c.RecallTriggers = slices.Clone(f.triggers[id])
 	return &c, nil
+}
+
+func (f *fakeStore) ListCardsBySource(_ context.Context, tenantID, spaceID platform.ID, sourceName string) ([]Card, error) {
+	var out []Card
+	for _, c := range f.cards {
+		if c.TenantID == tenantID && c.SpaceID == spaceID && c.SourceName == sourceName {
+			out = append(out, c)
+		}
+	}
+	slices.SortFunc(out, func(a, b Card) int { return strings.Compare(string(a.ID), string(b.ID)) })
+	return out, nil
 }
 
 func (f *fakeStore) UpdateCard(_ context.Context, c Card, expectedVersion int) error {

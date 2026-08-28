@@ -26,10 +26,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type memoriaCreateInput struct {
-	Title  string   `json:"title" jsonschema:"记忆标题，一句话说清这是什么"`
-	Body   string   `json:"body" jsonschema:"记忆正文"`
-	Labels []string `json:"labels,omitempty" jsonschema:"标签，用于按主题收窄检索"`
-	Space  string   `json:"space,omitempty" jsonschema:"目标空间 ID。不传即写入个人空间（whoami 的 defaultSpaceId）"`
+	Title      string   `json:"title" jsonschema:"记忆标题，一句话说清这是什么"`
+	Body       string   `json:"body" jsonschema:"记忆正文"`
+	Labels     []string `json:"labels,omitempty" jsonschema:"标签，用于按主题收窄检索"`
+	Space      string   `json:"space,omitempty" jsonschema:"目标空间 ID。不传即写入个人空间（whoami 的 defaultSpaceId）"`
+	Supersedes string   `json:"supersedes,omitempty" jsonschema:"被这条新事实替代的旧 Memory ID。创建新记忆、旧记忆转 historical、建立 supersedes 链会原子提交"`
 }
 
 func (h *Host) handleMemoriaCreate(ctx context.Context, _ *sdk.CallToolRequest, in memoriaCreateInput) (*sdk.CallToolResult, memoryOut, error) {
@@ -43,13 +44,15 @@ func (h *Host) handleMemoriaCreate(ctx context.Context, _ *sdk.CallToolRequest, 
 	}
 
 	m, err := h.know.CreateMemory(ctx, knowledge.CreateMemoryInput{
-		TenantID:      r.identity.TenantID,
-		SpaceID:       space.ID,
-		AuthorUserID:  r.identity.UserID,
-		AuthorAgentID: r.agentID(),
-		Title:         in.Title,
-		Body:          in.Body,
-		Labels:        in.Labels,
+		TenantID:       r.identity.TenantID,
+		SpaceID:        space.ID,
+		AuthorUserID:   r.identity.UserID,
+		AuthorAgentID:  r.agentID(),
+		Title:          in.Title,
+		Body:           in.Body,
+		Labels:         in.Labels,
+		SupersedesID:   platform.ID(in.Supersedes),
+		WritableSpaces: r.writableSpaces(),
 	})
 	if err != nil {
 		return nil, memoryOut{}, toolError(h.logger, "memoria_create", err)
@@ -162,10 +165,11 @@ func (h *Host) handleMemoriaDelete(ctx context.Context, _ *sdk.CallToolRequest, 
 // ---------------------------------------------------------------------------
 
 type memoriaSearchInput struct {
-	Query  string   `json:"query" jsonschema:"检索词或一句自然语言描述"`
-	Labels []string `json:"labels,omitempty" jsonschema:"标签过滤，多个标签取交集（必须同时具备）"`
-	Spaces []string `json:"spaces,omitempty" jsonschema:"限定空间 ID。不传即覆盖全部可读空间；传了其中一个不可读会报错而不是静默跳过"`
-	Limit  int      `json:"limit,omitempty" jsonschema:"返回条数，默认 10，上限 50"`
+	Query    string   `json:"query" jsonschema:"检索词或一句自然语言描述"`
+	Labels   []string `json:"labels,omitempty" jsonschema:"标签过滤，多个标签取交集（必须同时具备）"`
+	Spaces   []string `json:"spaces,omitempty" jsonschema:"限定空间 ID。不传即覆盖全部可读空间；传了其中一个不可读会报错而不是静默跳过"`
+	Limit    int      `json:"limit,omitempty" jsonschema:"返回条数，默认 10，上限 50"`
+	TimeView string   `json:"timeView,omitempty" jsonschema:"current | historical | all。默认 current；historical 只看被替代事实"`
 }
 
 type memoryHitOut struct {
@@ -207,6 +211,7 @@ func (h *Host) handleMemoriaSearch(ctx context.Context, _ *sdk.CallToolRequest, 
 		Query:    in.Query,
 		Labels:   in.Labels,
 		Limit:    in.Limit,
+		TimeView: in.TimeView,
 	})
 	if err != nil {
 		return nil, memoriaSearchOut{}, toolError(h.logger, "memoria_search", err)

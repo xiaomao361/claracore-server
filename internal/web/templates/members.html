@@ -19,7 +19,7 @@
   <button type="submit">创建账号</button>
 </form>
 
-<table class="grid">
+<div class="table-scroll"><table class="grid">
   <thead><tr><th>账号</th><th>显示名</th><th>角色</th><th>状态</th><th>创建</th><th></th></tr></thead>
   <tbody>
   {{range .Members}}
@@ -45,6 +45,6 @@
     </tr>
   {{end}}
   </tbody>
-</table>
+</table></div>
 <p class="hint">停用会立即废掉此人全部 Web 会话；他的 MCP token 也会在下一次调用时失效。</p>
 {{end}}

@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+const MaxSourceNameLen = 120
+
 // Document 是一份等待被摄取的源文档。
 //
 // 它刻意**只有原文，没有提炼**：标题 + 正文 + 来源，仅此而已。

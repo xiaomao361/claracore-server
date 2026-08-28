@@ -176,6 +176,150 @@ func (s *KnowledgeStore) MarkEmbeddingsFailed(ctx context.Context, ids []platfor
 	return nil
 }
 
+func (s *KnowledgeStore) ListMemoriesMissingEmbedding(ctx context.Context, tenantID platform.ID, model string, limit int) ([]knowledge.Memory, error) {
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT m.id, m.tenant_id, m.title, m.body, m.status
+		 FROM memories m
+		 LEFT JOIN embeddings e
+		   ON e.tenant_id = m.tenant_id AND e.entity_type = ? AND e.entity_id = m.id AND e.model = ?
+		 WHERE m.tenant_id = ? AND m.status = ? AND e.id IS NULL
+		 ORDER BY m.id ASC LIMIT ?`,
+		knowledge.EntityMemory, model, string(tenantID), knowledge.MemoryActive, limit)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询未索引记忆: %w", err)
+	}
+	defer rows.Close()
+	var out []knowledge.Memory
+	for rows.Next() {
+		var m knowledge.Memory
+		var id, tid string
+		if err := rows.Scan(&id, &tid, &m.Title, &m.Body, &m.Status); err != nil {
+			return nil, fmt.Errorf("mysql: 读取未索引记忆: %w", err)
+		}
+		m.ID, m.TenantID = platform.ID(id), platform.ID(tid)
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *KnowledgeStore) ListCardsMissingEmbedding(ctx context.Context, tenantID platform.ID, model string, limit int) ([]knowledge.Card, error) {
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT c.id, c.tenant_id, c.title, c.body_distilled, c.body_understanding, c.status
+		 FROM cards c
+		 LEFT JOIN embeddings e
+		   ON e.tenant_id = c.tenant_id AND e.entity_type = ? AND e.entity_id = c.id AND e.model = ?
+		 WHERE c.tenant_id = ? AND c.status = ? AND e.id IS NULL
+		 ORDER BY c.id ASC LIMIT ?`,
+		knowledge.EntityCard, model, string(tenantID), knowledge.CardActive, limit)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询未索引卡片: %w", err)
+	}
+	defer rows.Close()
+	var out []knowledge.Card
+	for rows.Next() {
+		var c knowledge.Card
+		var id, tid string
+		var distilled, understanding sql.NullString
+		if err := rows.Scan(&id, &tid, &c.Title, &distilled, &understanding, &c.Status); err != nil {
+			return nil, fmt.Errorf("mysql: 读取未索引卡片: %w", err)
+		}
+		c.ID, c.TenantID = platform.ID(id), platform.ID(tid)
+		c.Distilled, c.Understanding = distilled.String, understanding.String
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *KnowledgeStore) ListTriggersMissingEmbedding(ctx context.Context, tenantID platform.ID, model string, limit int) ([]knowledge.RecallTrigger, error) {
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT t.id, t.tenant_id, t.card_id, t.space_id, t.trigger_text, t.sort_order, t.created_at
+		 FROM card_recall_triggers t
+		 JOIN cards c ON c.tenant_id = t.tenant_id AND c.id = t.card_id
+		 LEFT JOIN embeddings e
+		   ON e.tenant_id = t.tenant_id AND e.entity_type = ? AND e.entity_id = t.id AND e.model = ?
+		 WHERE t.tenant_id = ? AND c.status = ? AND e.id IS NULL
+		 ORDER BY t.id ASC LIMIT ?`,
+		knowledge.EntityCardTrigger, model, string(tenantID), knowledge.CardActive, limit)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询未索引召回条件: %w", err)
+	}
+	defer rows.Close()
+	var out []knowledge.RecallTrigger
+	for rows.Next() {
+		var trigger knowledge.RecallTrigger
+		var id, tid, cardID, spaceID string
+		var created time.Time
+		if err := rows.Scan(&id, &tid, &cardID, &spaceID, &trigger.Text, &trigger.SortOrder, &created); err != nil {
+			return nil, fmt.Errorf("mysql: 读取未索引召回条件: %w", err)
+		}
+		trigger.ID, trigger.TenantID = platform.ID(id), platform.ID(tid)
+		trigger.CardID, trigger.SpaceID, trigger.CreatedAt = platform.ID(cardID), platform.ID(spaceID), created.UTC()
+		out = append(out, trigger)
+	}
+	return out, rows.Err()
+}
+
+func (s *KnowledgeStore) EmbeddingStats(ctx context.Context, tenantID platform.ID, model string, maxAttempts int) (knowledge.EmbeddingStats, error) {
+	var stats knowledge.EmbeddingStats
+	err := s.ex.QueryRowContext(ctx,
+		`SELECT
+		   COALESCE(SUM(status = ?), 0),
+		   COALESCE(SUM(status = ?), 0),
+		   COALESCE(SUM(status = ?), 0),
+		   COALESCE(SUM(status = ? AND attempts >= ?), 0)
+		 FROM embeddings WHERE tenant_id = ? AND model = ?`,
+		knowledge.EmbedPending, knowledge.EmbedReady, knowledge.EmbedFailed,
+		knowledge.EmbedFailed, maxAttempts, string(tenantID), model,
+	).Scan(&stats.Pending, &stats.Ready, &stats.Failed, &stats.Exhausted)
+	if err != nil {
+		return knowledge.EmbeddingStats{}, fmt.Errorf("mysql: 统计 embedding: %w", err)
+	}
+	return stats, nil
+}
+
+func (s *KnowledgeStore) ListEmbeddingFailures(ctx context.Context, tenantID platform.ID, model string, limit int) ([]knowledge.Embedding, error) {
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT id, entity_type, entity_id, attempts, last_error, updated_at
+		 FROM embeddings
+		 WHERE tenant_id = ? AND model = ? AND status = ?
+		 ORDER BY updated_at DESC, id DESC LIMIT ?`,
+		string(tenantID), model, knowledge.EmbedFailed, limit)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询 embedding 失败项: %w", err)
+	}
+	defer rows.Close()
+	var out []knowledge.Embedding
+	for rows.Next() {
+		var e knowledge.Embedding
+		var id, entityID string
+		var lastError sql.NullString
+		var updated time.Time
+		if err := rows.Scan(&id, &e.Ref.Type, &entityID, &e.Attempts, &lastError, &updated); err != nil {
+			return nil, fmt.Errorf("mysql: 读取 embedding 失败项: %w", err)
+		}
+		e.ID, e.TenantID, e.Ref.ID, e.Model = platform.ID(id), tenantID, platform.ID(entityID), model
+		e.Status, e.LastError, e.UpdatedAt = knowledge.EmbedFailed, lastError.String, updated.UTC()
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *KnowledgeStore) RetryEmbeddingFailures(ctx context.Context, tenantID platform.ID, model string, at time.Time) (int, error) {
+	res, err := s.ex.ExecContext(ctx,
+		`UPDATE embeddings
+		 SET status = ?, attempts = 0, last_error = NULL, updated_at = ?
+		 WHERE tenant_id = ? AND model = ? AND status = ?`,
+		knowledge.EmbedPending, at.UTC(), string(tenantID), model, knowledge.EmbedFailed)
+	if err != nil {
+		return 0, fmt.Errorf("mysql: 重试 embedding 失败项: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mysql: 读取 embedding 重试数量: %w", err)
+	}
+	return int(n), nil
+}
+
 // LoadVectors 批量取已算好的向量（两段式检索的第二段）。
 //
 // 按 entity_type 分组查询，让每条 SQL 都能走 uk_emb (entity_type, entity_id, model)

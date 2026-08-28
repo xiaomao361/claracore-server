@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make check
+
+  mysql-integration:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test-root-password
+          MYSQL_DATABASE: claracore_server
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ptest-root-password"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      CCS_ENV: test
+      CCS_MYSQL_HOST: 127.0.0.1
+      CCS_MYSQL_PORT: 3306
+      CCS_MYSQL_USER: root
+      CCS_MYSQL_PASSWORD: test-root-password
+      CCS_MYSQL_DATABASE: claracore_server
+      CCS_EMBEDDING_PROVIDER: disabled
+      CCS_REDIS_ADDR: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Apply migrations
+        run: make migrate
+      - name: Run MySQL integration suite
+        run: make itest

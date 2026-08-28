@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	"claracore-server/internal/platform"
 )
 
 // pendingCount 数队列里还有多少条没算完。
@@ -356,5 +359,74 @@ func TestIndexPendingBatchIsClamped(t *testing.T) {
 	}
 	if clampBatch(7) != 7 {
 		t.Fatal("正常值应原样通过")
+	}
+}
+
+func TestBackfillQueuesVisibleContentForNewModel(t *testing.T) {
+	disabled, store := newTestService(t)
+	seedMemory(t, disabled, spacePriv)
+	seedCard(t, disabled, spacePriv, withCard("备份", "准备删数据时", "准备恢复数据时"))
+	if len(store.embeddings) != 0 {
+		t.Fatal("夹具必须模拟先无模型运行")
+	}
+
+	clock := &platform.OffsetClock{Base: time.Date(2026, 8, 12, 9, 0, 0, 0, time.UTC), Step: time.Minute}
+	emb := newFakeEmbedder("备份", "数据")
+	enabled := NewService(store, clock, platform.NewIDGenerator(clock), emb)
+	report, err := enabled.BackfillEmbeddings(context.Background(), tenantA, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Enabled || report.Memories != 1 || report.Cards != 1 || report.Triggers != 2 || report.Total() != 4 {
+		t.Fatalf("新模型应补齐可检索内容及每条召回条件，实际 %+v", report)
+	}
+	if store.pendingCount(emb.Model()) != 4 {
+		t.Fatalf("应有 4 条待算，实际 %d", store.pendingCount(emb.Model()))
+	}
+
+	again, err := enabled.BackfillEmbeddings(context.Background(), tenantA, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Total() != 0 {
+		t.Fatalf("回填必须幂等，第二次不应重置已有队列，实际 %+v", again)
+	}
+}
+
+func TestEmbeddingHealthAndManualRetryAreTenantScoped(t *testing.T) {
+	svc, store, emb := newSearchService(t, "连接池")
+	m := seedMemory(t, svc, spacePriv)
+	e, _ := store.embeddingOf(Ref{EntityMemory, m.ID}, emb.Model())
+	for i := 0; i < maxEmbedAttempts; i++ {
+		if err := store.MarkEmbeddingsFailed(context.Background(), []platform.ID{e.ID}, "模型不可用", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.embeddings["foreign"] = Embedding{
+		ID: "01FOREIGNEMBEDDINGAAAAAAAA", TenantID: tenantB,
+		Ref: Ref{EntityMemory, "01FOREIGNMEMORYAAAAAAAAAA"}, Model: emb.Model(),
+		Status: EmbedFailed, Attempts: maxEmbedAttempts, LastError: "别的租户",
+	}
+
+	health, err := svc.EmbeddingHealth(context.Background(), tenantA, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !health.Enabled || health.Stats.Failed != 1 || health.Stats.Exhausted != 1 || len(health.Failures) != 1 {
+		t.Fatalf("应显示本租户失败与耗尽数量，实际 %+v", health)
+	}
+	n, err := svc.RetryEmbeddingFailures(context.Background(), tenantA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("只应重试本租户的一条，实际 %d", n)
+	}
+	got, _ := store.embeddingOf(Ref{EntityMemory, m.ID}, emb.Model())
+	if got.Status != EmbedPending || got.Attempts != 0 || got.LastError != "" {
+		t.Fatalf("人工重试应重置队列状态，实际 %+v", got)
+	}
+	if store.embeddings["foreign"].Status != EmbedFailed {
+		t.Fatal("人工重试不得跨租户")
 	}
 }

@@ -129,10 +129,33 @@ type AdminQuery struct {
 	Limit          int
 }
 
+// ContextFeedbackQuery selects durable automatic-context feedback. Results are
+// aggregate-only: callers never receive card IDs, actor IDs, or content.
+type ContextFeedbackQuery struct {
+	TenantID platform.ID
+	Since    time.Time
+}
+
+// ContextFeedbackQuality is an outcome histogram, not an accuracy score.
+// Missing feedback means "unknown", never "correct".
+type ContextFeedbackQuality struct {
+	Since     time.Time
+	Delivered int
+	Used      int
+	Ignored   int
+	Wrong     int
+	Corrected int
+}
+
+func (q ContextFeedbackQuality) Total() int {
+	return q.Delivered + q.Used + q.Ignored + q.Wrong + q.Corrected
+}
+
 // Store is the activity domain's persistence outlet.
 type Store interface {
 	Record(ctx context.Context, event Event) error
 	ListVisible(ctx context.Context, query VisibleQuery) ([]Event, error)
 	ListAdmin(ctx context.Context, query AdminQuery) ([]Event, error)
+	CountContextFeedback(ctx context.Context, query ContextFeedbackQuery) (ContextFeedbackQuality, error)
 	DeleteTracesBefore(ctx context.Context, before time.Time, limit int) (int, error)
 }

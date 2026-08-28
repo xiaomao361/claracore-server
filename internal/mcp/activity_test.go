@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/knowledge"
@@ -21,9 +22,12 @@ import (
 )
 
 type fakeActivity struct {
-	mu      sync.Mutex
-	records []activity.RecordInput
-	err     error
+	mu            sync.Mutex
+	records       []activity.RecordInput
+	err           error
+	quality       activity.ContextFeedbackQuality
+	qualityTenant platform.ID
+	qualityWindow time.Duration
 }
 
 func newFakeActivity() *fakeActivity { return &fakeActivity{} }
@@ -37,6 +41,13 @@ func (f *fakeActivity) Record(_ context.Context, in activity.RecordInput) (activ
 	in.Metadata = append(json.RawMessage(nil), in.Metadata...)
 	f.records = append(f.records, in)
 	return activity.Event{}, f.err
+}
+
+func (f *fakeActivity) ContextFeedbackQuality(_ context.Context, tenantID platform.ID, window time.Duration) (activity.ContextFeedbackQuality, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.qualityTenant, f.qualityWindow = tenantID, window
+	return f.quality, f.err
 }
 
 func (f *fakeActivity) snapshot() []activity.RecordInput {
@@ -86,6 +97,9 @@ func TestEveryRegisteredToolIsAuditedWithClassification(t *testing.T) {
 	}{
 		{"whoami", nil},
 		{"server_status", nil},
+		{"gateway_auto_context", map[string]any{"prompt": "准备修改连接池"}},
+		{"gateway_context_feedback", map[string]any{"cardId": "01CARDAAAAAAAAAAAAAAAAAAAA", "outcome": "used"}},
+		{"context_quality_status", nil},
 		{"memoria_create", map[string]any{"title": "标题", "body": "正文"}},
 		{"memoria_search", map[string]any{"query": "连接池"}},
 		{"memoria_get", map[string]any{"id": "01MEMORYAAAAAAAAAAAAAAAAAA"}},
@@ -109,6 +123,11 @@ func TestEveryRegisteredToolIsAuditedWithClassification(t *testing.T) {
 			"toSpace":    spProj,
 		}},
 		{"space_stats", nil},
+		{"shared_line_list", nil},
+		{"shared_line_get", map[string]any{"lineId": "01LINEAAAAAAAAAAAAAAAAAAAA"}},
+		{"shared_line_update", map[string]any{"lineId": "01LINEAAAAAAAAAAAAAAAAAAAA", "summary": "当前进展"}},
+		{"shared_line_handoff", map[string]any{"lineId": "01LINEAAAAAAAAAAAAAAAAAAAA", "nextStep": "继续验证"}},
+		{"shared_line_status", map[string]any{"lineId": "01LINEAAAAAAAAAAAAAAAAAAAA", "status": "archived"}},
 	}
 
 	for _, call := range calls {
@@ -119,17 +138,21 @@ func TestEveryRegisteredToolIsAuditedWithClassification(t *testing.T) {
 
 	records := activities.snapshot()
 	if len(records) != len(calls) {
-		t.Fatalf("16 个工具应各记一次活动，实际 calls=%d records=%d", len(calls), len(records))
+		t.Fatalf("24 个工具应各记一次活动，实际 calls=%d records=%d", len(calls), len(records))
 	}
 
 	writes := map[string]bool{
-		"memoria_create": true,
-		"memoria_update": true,
-		"memoria_delete": true,
-		"memoria_link":   true,
-		"card_create":    true,
-		"card_update":    true,
-		"promote":        true,
+		"memoria_create":           true,
+		"memoria_update":           true,
+		"memoria_delete":           true,
+		"memoria_link":             true,
+		"card_create":              true,
+		"card_update":              true,
+		"promote":                  true,
+		"shared_line_update":       true,
+		"shared_line_handoff":      true,
+		"shared_line_status":       true,
+		"gateway_context_feedback": true,
 	}
 	seen := make(map[string]bool, len(records))
 	for _, record := range records {
@@ -138,7 +161,7 @@ func TestEveryRegisteredToolIsAuditedWithClassification(t *testing.T) {
 		}
 		seen[record.Action] = true
 		wantKind := activity.KindTrace
-		if record.Action == "promote" {
+		if record.Action == "promote" || record.Action == "gateway_context_feedback" {
 			wantKind = activity.KindGovernance
 		}
 		if record.Source != activity.SourceMCP || record.Kind != wantKind {
@@ -346,6 +369,34 @@ func TestSearchAndRecallAuditOnlyResultIDsCountsAndSemanticFlags(t *testing.T) {
 		if bytes := string(record.Metadata); strings.Contains(bytes, "私密") || strings.Contains(bytes, "不应进入活动流") {
 			t.Errorf("%s 的 metadata 带入了 query/situation/trigger: %s", action, bytes)
 		}
+	}
+}
+
+func TestSharedLineAuditOmitsWorkContent(t *testing.T) {
+	activities := newFakeActivity()
+	srv, _, _ := newToolHostWithActivityAndContinuity(t, activities)
+	secret := "PRIVATE_SHARED_LINE_CONTENT_29f1"
+	if _, errMsg := callTool(t, srv, "ccs_valid_clara", "shared_line_update", map[string]any{
+		"lineId":  "01LINEAAAAAAAAAAAAAAAAAAAA",
+		"summary": secret, "nextStep": secret, "factsUsed": []string{"01MEMORYAAAAAAAAAAAAAAAAAA"},
+	}); errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	record := recordForAction(t, activities.snapshot(), "shared_line_update")
+	if record.EntityType != "shared_line" || record.EntityID == nil || *record.EntityID != "01LINEAAAAAAAAAAAAAAAAAAAA" {
+		t.Fatalf("Shared Line 活动应记录实体 ID，实际 type=%q id=%v", record.EntityType, record.EntityID)
+	}
+	if strings.Contains(string(record.Metadata), secret) {
+		t.Fatalf("Shared Line 摘要/下一步不得进入活动元数据: %s", record.Metadata)
+	}
+	var metadata struct {
+		PositionVersion int  `json:"positionVersion"`
+		FactCount       int  `json:"factCount"`
+		HasHandoff      bool `json:"hasHandoff"`
+	}
+	decodeActivityMetadata(t, record, &metadata)
+	if metadata.PositionVersion != 1 || metadata.FactCount != 0 {
+		t.Fatalf("活动只应保留输出版本和计数，实际 %+v", metadata)
 	}
 }
 

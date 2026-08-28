@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
 	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/ingest"
@@ -40,6 +42,12 @@ var version = "0.1.0-dev"
 
 func main() {
 	migrateOnly := flag.Bool("migrate", false, "应用数据库迁移后退出，不启动服务")
+	bootstrap := flag.Bool("bootstrap", false, "在空数据库中初始化首个租户与管理员后退出")
+	bootstrapTenant := flag.String("bootstrap-tenant", "ClaraCore 团队", "首次初始化的租户名")
+	bootstrapTeamSpace := flag.String("bootstrap-team-space", "团队记忆", "首次初始化的团队空间名")
+	bootstrapAdmin := flag.String("bootstrap-admin", "admin", "首次初始化的管理员账号")
+	bootstrapAdminDisplay := flag.String("bootstrap-admin-display", "管理员", "首次初始化的管理员显示名")
+	bootstrapPasswordFile := flag.String("bootstrap-password-file", "", "保存初始管理员密码的绝对路径（必须为 0600）")
 	ingestDir := flag.String("ingest", "", "摄取一个 Markdown 目录后退出（需同时给 -ingest-space 与 -ingest-source）")
 	ingestSpace := flag.String("ingest-space", "", "摄取的目标空间 ID")
 	ingestSource := flag.String("ingest-source", "", "源名，跨机器稳定（如 clara-docs）。它参与 source_key，改了等于换了一个源")
@@ -106,14 +114,38 @@ func main() {
 
 	govStore := mysql.NewGovernanceStore(db)
 	govService := governance.NewService(govStore, clock, ids, hasher, sessions)
+	if *bootstrap {
+		err := runBootstrap(context.Background(), govService, bootstrapArgs{
+			Tenant:       *bootstrapTenant,
+			TeamSpace:    *bootstrapTeamSpace,
+			Admin:        *bootstrapAdmin,
+			AdminDisplay: *bootstrapAdminDisplay,
+			PasswordFile: *bootstrapPasswordFile,
+		})
+		if err != nil {
+			logger.Error("初始化失败", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("初始化完成；管理员首次登录后必须修改密码",
+			"tenant", *bootstrapTenant, "admin", *bootstrapAdmin)
+		return
+	}
 
 	// embedder 为 nil 是**降级形态而非异常形态**：不入索引队列，
 	// 检索退化成中文全文匹配，系统功能保持完整（01-architecture.md §6.1）。
 	embedder := newEmbedder(cfg.Embedding)
+	var embeddingCache *embedding.Cached
+	if embedder != nil && cfg.Embedding.CacheEntries > 0 {
+		embeddingCache = embedding.NewCached(embedder, cfg.Embedding.CacheEntries, cfg.Embedding.CacheTTL)
+		embedder = embeddingCache
+	}
 	knowStore := mysql.NewKnowledgeStore(db)
-	knowService := knowledge.NewService(knowStore, clock, ids, embedder)
+	knowService := knowledge.NewService(knowStore, clock, ids, embedder).WithAutomaticRecallPolicy(knowledge.AutomaticRecallPolicy{
+		MinScore: cfg.AutoContext.MinScore, MinMargin: cfg.AutoContext.MinMargin,
+	})
 	activityStore := mysql.NewActivityStore(db)
 	activityService := activity.NewService(activityStore, clock, ids)
+	continuityService := continuity.NewService(mysql.NewContinuityStore(db), clock, ids)
 
 	// 摄取是显式动作，与 -migrate 同一形态：跑完就退，不启动服务。
 	// 它天生幂等，可以反复跑——「源文档更新了要重扫」就是常态。
@@ -127,17 +159,28 @@ func main() {
 		return
 	}
 
-	mcpHost := mcphost.NewHost(govService, knowService, activityService, logger, mcphost.HostOptions{
+	mcpHost := mcphost.NewHost(govService, knowService, continuityService, activityService, logger, mcphost.HostOptions{
 		Version:        version,
 		SemanticSearch: cfg.Embedding.Enabled(),
+		EmbeddingCacheStats: func() (uint64, uint64, bool) {
+			if embeddingCache == nil {
+				return 0, 0, false
+			}
+			hits, misses := embeddingCache.Stats()
+			return hits, misses, true
+		},
 	})
 
 	// Host B：治理面。与 MCP Host 并列，共用同一套领域服务——
 	// 「Web 专用的写入路径」是设计事故（docs/04-web-scope.md §1.4）。
-	webHost := web.NewHost(govService, knowService, activityService, logger, web.Options{
+	webHost := web.NewHost(govService, knowService, continuityService, activityService, logger, web.Options{
 		Version:      version,
 		PublicMCPURL: cfg.Web.PublicMCPURL,
 		SecureCookie: cfg.Web.SecureCookie,
+		IngestRoot:   cfg.Web.IngestRoot,
+		ScanMarkdown: func(ctx context.Context, sourceName, root string) ([]knowledge.Document, error) {
+			return ingest.NewMarkdownDir(sourceName, root).Scan(ctx)
+		},
 	})
 
 	mux := http.NewServeMux()
@@ -187,6 +230,11 @@ func main() {
 	traceCleanupDone := make(chan struct{})
 	go runTraceCleanup(ctx, activityService, clock, logger, traceCleanupDone)
 
+	// 数据库会话负责即时吊销与滑动过期；独立 worker 回收已经失效的行，
+	// 避免长期运行后 sessions 表只增不减。
+	sessionCleanupDone := make(chan struct{})
+	go runSessionCleanup(ctx, govService.CleanupSessions, logger, sessionCleanupDone)
+
 	go func() {
 		logger.Info("服务启动", "addr", cfg.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -205,6 +253,7 @@ func main() {
 	}
 	<-indexerDone
 	<-traceCleanupDone
+	<-sessionCleanupDone
 	logger.Info("已退出")
 }
 
@@ -226,6 +275,56 @@ func newEmbedder(cfg config.Embedding) ports.Embedder {
 
 type ingestArgs struct {
 	Dir, Space, Source, User string
+}
+
+type bootstrapArgs struct {
+	Tenant, TeamSpace, Admin, AdminDisplay, PasswordFile string
+}
+
+func runBootstrap(ctx context.Context, gov *governance.Service, args bootstrapArgs) error {
+	password, err := readBootstrapPassword(args.PasswordFile)
+	if err != nil {
+		return err
+	}
+	_, err = gov.BootstrapTenant(ctx, governance.ProvisionTenantInput{
+		TenantName:    args.Tenant,
+		TeamSpaceName: args.TeamSpace,
+		AdminUsername: args.Admin,
+		AdminDisplay:  args.AdminDisplay,
+		AdminPassword: password,
+	})
+	return err
+}
+
+func readBootstrapPassword(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("缺少 -bootstrap-password-file")
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("-bootstrap-password-file 必须是绝对路径")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("读取初始密码文件: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("初始密码文件必须是普通文件")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("初始密码文件权限必须为 0600（当前 %04o）", info.Mode().Perm())
+	}
+	if info.Size() > 4096 {
+		return "", fmt.Errorf("初始密码文件过大")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("读取初始密码文件: %w", err)
+	}
+	password := strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r")
+	if strings.ContainsAny(password, "\r\n") {
+		return "", fmt.Errorf("初始密码文件只能包含一行")
+	}
+	return password, nil
 }
 
 // runIngest 把一个目录摄进指定空间。
@@ -252,6 +351,7 @@ func runIngest(ctx context.Context, gov *governance.Service, know *knowledge.Ser
 	logger.Info("开始扫描", "source", source.Name(), "dir", args.Dir)
 
 	docs, err := source.Scan(ctx)
+	scanComplete := err == nil
 	if err != nil {
 		// 扫描出问题也可能带回了一批好文档——先把问题说出来，再摄那一批。
 		// 直接退出的话，一个坏文件会挡住其余几千份。
@@ -270,10 +370,12 @@ func runIngest(ctx context.Context, gov *governance.Service, know *knowledge.Ser
 	}
 
 	report, err := know.Ingest(ctx, knowledge.IngestInput{
-		TenantID:     tenant.ID,
-		SpaceID:      platform.ID(args.Space),
-		AuthorUserID: platform.ID(args.User),
-		Documents:    docs,
+		TenantID:      tenant.ID,
+		SpaceID:       platform.ID(args.Space),
+		AuthorUserID:  platform.ID(args.User),
+		SourceName:    args.Source,
+		DetectMissing: scanComplete,
+		Documents:     docs,
 	})
 	if err != nil {
 		return err
@@ -283,6 +385,9 @@ func runIngest(ctx context.Context, gov *governance.Service, know *knowledge.Ser
 		"scanned", len(docs),
 		"created", report.Created, "updated", report.Updated,
 		"unchanged", report.Unchanged, "failed", len(report.Failed))
+	for _, missing := range report.Missing {
+		logger.Warn("源文件已缺失（未自动修改卡片）", "card_id", missing.CardID, "source", missing.SourcePath)
+	}
 	for _, f := range report.Failed {
 		// 失败清单要逐条打出来：只说「失败 3 条」等于没说，
 		// 人得能照着去修那一份

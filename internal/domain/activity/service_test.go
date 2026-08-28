@@ -19,9 +19,11 @@ type fakeStore struct {
 	visibleQueries []VisibleQuery
 	adminQueries   []AdminQuery
 
-	deleteBefore time.Time
-	deleteLimit  int
-	deleteCount  int
+	deleteBefore  time.Time
+	deleteLimit   int
+	deleteCount   int
+	feedbackQuery ContextFeedbackQuery
+	feedback      ContextFeedbackQuality
 
 	err error
 }
@@ -56,6 +58,14 @@ func (f *fakeStore) DeleteTracesBefore(_ context.Context, before time.Time, limi
 	}
 	f.deleteBefore, f.deleteLimit = before, limit
 	return f.deleteCount, nil
+}
+
+func (f *fakeStore) CountContextFeedback(_ context.Context, query ContextFeedbackQuery) (ContextFeedbackQuality, error) {
+	if f.err != nil {
+		return ContextFeedbackQuality{}, f.err
+	}
+	f.feedbackQuery = query
+	return f.feedback, nil
 }
 
 func newTestService(store Store) (*Service, time.Time) {
@@ -189,6 +199,29 @@ func TestRecordPropagatesStoreError(t *testing.T) {
 	svc, _ := newTestService(&fakeStore{err: want})
 	if _, err := svc.Record(context.Background(), validRecordInput()); !errors.Is(err, want) {
 		t.Fatalf("应原样返回 Store 错误，实际 %v", err)
+	}
+}
+
+func TestContextFeedbackQualityBuildsTenantScopedUTCQuery(t *testing.T) {
+	store := &fakeStore{feedback: ContextFeedbackQuality{Used: 3, Wrong: 1}}
+	svc, _ := newTestService(store)
+
+	quality, err := svc.ContextFeedbackQuality(context.Background(), "tenant-1", 30*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quality.Total() != 4 {
+		t.Fatalf("total = %d, want 4", quality.Total())
+	}
+	wantSince := time.Date(2026, 7, 12, 1, 30, 0, 123456789, time.UTC)
+	if store.feedbackQuery.TenantID != "tenant-1" || !store.feedbackQuery.Since.Equal(wantSince) || store.feedbackQuery.Since.Location() != time.UTC {
+		t.Fatalf("query should be tenant-scoped and UTC: %+v", store.feedbackQuery)
+	}
+	if _, err := svc.ContextFeedbackQuality(context.Background(), "", time.Hour); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("missing tenant should fail: %v", err)
+	}
+	if _, err := svc.ContextFeedbackQuality(context.Background(), "tenant-1", 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("missing window should fail: %v", err)
 	}
 }
 

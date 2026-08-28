@@ -327,6 +327,36 @@ func TestGovernanceStoreContract(t *testing.T) {
 			}
 		})
 
+		t.Run("空间治理列表按租户隔离", func(t *testing.T) {
+			spaces, err := st.ListSpaces(ctx, f.tenant.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotSpaces := make(map[platform.ID]bool, len(spaces))
+			for _, space := range spaces {
+				gotSpaces[space.ID] = true
+				if space.TenantID != f.tenant.ID {
+					t.Fatalf("空间列表泄露其他租户: %+v", space)
+				}
+			}
+			for _, want := range []governance.Space{f.personal, f.otherPer, f.team, f.owned, f.granted, f.hidden} {
+				if !gotSpaces[want.ID] {
+					t.Errorf("租户空间列表缺少 %s", want.Name)
+				}
+			}
+			if gotSpaces[f.foreignTeam.ID] || gotSpaces[f.foreignOwned.ID] {
+				t.Fatal("空间治理列表跨租户泄露")
+			}
+
+			permissions, err := st.ListPermissions(ctx, f.tenant.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(permissions) != 1 || permissions[0].SpaceID != f.granted.ID || permissions[0].UserID != f.user.ID {
+				t.Fatalf("空间授权列表不对: %+v", permissions)
+			}
+		})
+
 		t.Run("FindUserByUsername 与 FindSpace 的租户隔离", func(t *testing.T) {
 			u, err := st.FindUserByUsername(ctx, f.tenant.ID, f.user.Username)
 			if err != nil {

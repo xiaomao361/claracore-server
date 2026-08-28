@@ -1,6 +1,19 @@
 {{define "content"}}
 <p class="hint"><a href="/review">← 回到待审队列</a>　空间：{{.Space.Name}}　状态：{{.Card.Status}}{{if .Card.Source}}　来源：<code>{{.Card.Source}}</code>{{end}}</p>
 
+{{if .DuplicateCandidates}}
+<section class="card alert notice" aria-labelledby="duplicate-heading">
+  <h2 id="duplicate-heading">可能已存在的知识卡</h2>
+  <p>请先比较再发布。系统只提供候选，不会自动合并或删除内容。</p>
+  <ul>
+    {{range .DuplicateCandidates}}
+      <li><a href="/browse/{{.Card.ID}}?kind=card">{{.Card.Title}}</a>　{{if .Exact}}<strong>内容相同</strong>{{else}}语义相似 {{printf "%.0f%%" (mul100 .Score)}}{{end}}　<span class="tag">{{.Card.Status}}</span></li>
+    {{end}}
+  </ul>
+  <p class="hint">如果当前卡是重复项，可使用下方“标记不需要”；历史记录会保留，但退出默认检索。</p>
+</section>
+{{end}}
+
 <form method="post" action="/review/{{.Card.ID}}" class="review">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
 

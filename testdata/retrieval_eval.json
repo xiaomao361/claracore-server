@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "irreversible-delete",
+      "situation": "用户说这个目录没用了让我整个删掉，但里面可能有不可再生的历史",
+      "expected": {
+        "title": "备份成功不等于数据可恢复",
+        "distilled": "归档路径与校验和不能证明不可再生的数据真的可恢复。",
+        "understanding": "删除前要验证备份包含目标文件，并做隔离恢复抽查。",
+        "trigger": "准备执行不可逆的数据清除动作之前"
+      },
+      "decoy": {
+        "title": "目录命名规范",
+        "distilled": "目录使用小写连字符。",
+        "understanding": "统一命名减少跨平台差异。",
+        "trigger": "整理目录结构与目录命名时"
+      }
+    },
+    {
+      "id": "temporary-production-config",
+      "situation": "为了验证线上问题，我临时把客户端切到了生产服务地址，测试结束准备提交代码",
+      "expected": {
+        "title": "临时环境切换必须恢复",
+        "distilled": "测试期间临时修改的运行环境与服务地址不能进入提交。",
+        "understanding": "环境切换是验证手段，不是产品改动，提交前必须恢复并检查差异。",
+        "trigger": "为了测试临时修改运行环境或服务地址之后"
+      },
+      "decoy": {
+        "title": "生产接口字段命名",
+        "distilled": "生产接口配置字段统一使用 endpoint。",
+        "understanding": "一致的字段名便于客户端读取。",
+        "trigger": "为生产接口和客户端配置字段命名时"
+      }
+    },
+    {
+      "id": "sql-join-grain",
+      "situation": "要统计每个理赔案件的支付总额，一张案件表会关联多条支付和多条费用明细",
+      "expected": {
+        "title": "先选聚合粒度再关联",
+        "distilled": "一对多表直接同时关联会造成乘法膨胀与重复计数。",
+        "understanding": "先分别聚合到案件粒度，再关联案件主表。",
+        "trigger": "编写一对多关联的统计 SQL 之前"
+      },
+      "decoy": {
+        "title": "理赔案件字段命名",
+        "distilled": "案件号字段统一使用 claim_number。",
+        "understanding": "字段一致便于关联支付表。",
+        "trigger": "查询理赔案件字段与支付表关联关系时"
+      }
+    },
+    {
+      "id": "partial-source-scan",
+      "situation": "知识源目录这次有一个文件读不出来，扫描结果里也少了几份旧文档，是否应该把旧卡片删掉",
+      "expected": {
+        "title": "部分扫描不能判定源文件删除",
+        "distilled": "扫描存在读取错误时，未出现的文件不能被当成已经删除。",
+        "understanding": "只有完整扫描成功才具备删除检测的证据，缺失也应先报告而非自动改卡。",
+        "trigger": "批量同步外部知识源出现读取失败时"
+      },
+      "decoy": {
+        "title": "Markdown 目录命名",
+        "distilled": "知识源目录按产品线命名。",
+        "understanding": "稳定目录名方便扫描旧文档。",
+        "trigger": "整理知识源目录与 Markdown 文件命名时"
+      }
+    }
+  ]
+}

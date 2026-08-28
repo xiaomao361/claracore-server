@@ -85,7 +85,11 @@ func (f *fakeStore) SearchMemories(_ context.Context, q CandidateQuery) ([]Memor
 		if m.TenantID != q.TenantID || !slices.Contains(q.SpaceIDs, m.SpaceID) {
 			continue
 		}
-		if !m.IsVisible() {
+		statuses := q.MemoryStatuses
+		if len(statuses) == 0 {
+			statuses = []string{MemoryActive}
+		}
+		if !slices.Contains(statuses, m.Status) {
 			continue
 		}
 		if !f.hasAllLabels(Ref{EntityMemory, m.ID}, q.Labels) {
@@ -314,6 +318,114 @@ func (f *fakeStore) MarkEmbeddingsFailed(_ context.Context, ids []platform.ID, r
 	return nil
 }
 
+func (f *fakeStore) ListMemoriesMissingEmbedding(_ context.Context, tenantID platform.ID, model string, limit int) ([]Memory, error) {
+	var out []Memory
+	for _, m := range f.memories {
+		if m.TenantID == tenantID && m.IsVisible() {
+			if _, exists := f.embeddings[embKey(Ref{EntityMemory, m.ID}, model)]; !exists {
+				out = append(out, m)
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b Memory) int { return compareID(a.ID, b.ID) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStore) ListCardsMissingEmbedding(_ context.Context, tenantID platform.ID, model string, limit int) ([]Card, error) {
+	var out []Card
+	for _, c := range f.cards {
+		if c.TenantID == tenantID && c.IsVisible() {
+			if _, exists := f.embeddings[embKey(Ref{EntityCard, c.ID}, model)]; !exists {
+				out = append(out, c)
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b Card) int { return compareID(a.ID, b.ID) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStore) ListTriggersMissingEmbedding(_ context.Context, tenantID platform.ID, model string, limit int) ([]RecallTrigger, error) {
+	var out []RecallTrigger
+	for cardID, triggers := range f.triggers {
+		card, ok := f.cards[cardID]
+		if !ok || card.TenantID != tenantID || !card.IsVisible() {
+			continue
+		}
+		for _, trigger := range triggers {
+			if _, exists := f.embeddings[embKey(Ref{EntityCardTrigger, trigger.ID}, model)]; !exists {
+				out = append(out, trigger)
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b RecallTrigger) int { return compareID(a.ID, b.ID) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStore) EmbeddingStats(_ context.Context, tenantID platform.ID, model string, maxAttempts int) (EmbeddingStats, error) {
+	var stats EmbeddingStats
+	for _, e := range f.embeddings {
+		if e.TenantID != tenantID || e.Model != model {
+			continue
+		}
+		switch e.Status {
+		case EmbedPending:
+			stats.Pending++
+		case EmbedReady:
+			stats.Ready++
+		case EmbedFailed:
+			stats.Failed++
+			if e.Attempts >= maxAttempts {
+				stats.Exhausted++
+			}
+		}
+	}
+	return stats, nil
+}
+
+func (f *fakeStore) ListEmbeddingFailures(_ context.Context, tenantID platform.ID, model string, limit int) ([]Embedding, error) {
+	var out []Embedding
+	for _, e := range f.embeddings {
+		if e.TenantID == tenantID && e.Model == model && e.Status == EmbedFailed {
+			out = append(out, e)
+		}
+	}
+	slices.SortFunc(out, func(a, b Embedding) int {
+		if !a.UpdatedAt.Equal(b.UpdatedAt) {
+			if a.UpdatedAt.After(b.UpdatedAt) {
+				return -1
+			}
+			return 1
+		}
+		return compareID(a.ID, b.ID)
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStore) RetryEmbeddingFailures(_ context.Context, tenantID platform.ID, model string, at time.Time) (int, error) {
+	n := 0
+	for key, e := range f.embeddings {
+		if e.TenantID != tenantID || e.Model != model || e.Status != EmbedFailed {
+			continue
+		}
+		e.Status, e.Attempts, e.LastError, e.UpdatedAt = EmbedPending, 0, "", at
+		f.embeddings[key] = e
+		n++
+	}
+	return n, nil
+}
+
 // --- 测试用 Embedder ---
 
 // fakeEmbedder 把文本映射成一个确定的向量，让相似度可预期。
@@ -446,6 +558,9 @@ func (f *fakeStore) listMatches(q ListQuery) []ContentItem {
 			if m.TenantID != q.TenantID {
 				continue
 			}
+			if q.Query != "" && !strings.Contains(strings.ToLower(m.Title+"\n"+m.Body), strings.ToLower(q.Query)) {
+				continue
+			}
 			add(ContentItem{
 				Ref: Ref{EntityMemory, m.ID}, SpaceID: m.SpaceID, Title: m.Title,
 				Status: m.Status, AuthorUserID: m.AuthorUserID, AuthorAgentID: m.AuthorAgentID,
@@ -455,6 +570,9 @@ func (f *fakeStore) listMatches(q ListQuery) []ContentItem {
 	} else {
 		for _, c := range f.cards {
 			if c.TenantID != q.TenantID {
+				continue
+			}
+			if q.Query != "" && !strings.Contains(strings.ToLower(c.Title+"\n"+c.Distilled+"\n"+c.Understanding), strings.ToLower(q.Query)) {
 				continue
 			}
 			add(ContentItem{

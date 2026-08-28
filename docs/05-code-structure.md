@@ -23,10 +23,11 @@
 
 | 已知变化点（留接口） | 未知变化（不留） |
 |---|---|
-| 数据库：MySQL / SQLite 都要支持 | "将来可能做插件系统" |
+| 数据库：当前明确使用 MySQL Store | "将来可能做插件系统" |
 | 缓存：有无 Redis 两种形态 | "将来可能支持多种协议" |
 | Embedding：Ollama / OpenAI-compatible | "将来可能换 Web 框架" |
-| 外部知识源：多种 MCP 源 | "将来可能多语言" |
+| 自动上下文 Stage B：确定性 score / margin 预筛 | "再跑一个本地大模型复核" |
+| 外部知识源：受控 Markdown，未来活源连接 | "将来可能换数据库" |
 
 只有一个实现、且看不到第二个实现的东西，**直接写具体类型**。抽象等到第二个实现真的出现时再提取——那时你才知道抽象边界该划在哪。
 
@@ -44,15 +45,15 @@ claracore-server/
 │   │   ├── governance/         # 身份、token、空间权限、登录会话
 │   │   ├── knowledge/          # memory / card / 检索 / 索引队列 / 摄取 / 列表
 │   │   ├── activity/           # 活动分类、记录、可见性分页、trace 清理契约
-│   │   └── continuity/         # ← 尚未开工（shared_line）
+│   │   └── continuity/         # Shared Line owner / position / history / handoff
 │   ├── ports/                  # 纯基础设施接口（embedder / hasher / sessionstore）
 │   ├── adapters/               # mysql/（含 activity Store）+ embedding/ + crypto/
-│   ├── mcp/                    # Host A：16 个工具 + 统一活动装饰器
+│   ├── mcp/                    # Host A：24 个工具 + 统一活动装饰器
 │   ├── web/                    # Host B：治理、内容、活动流与完整审计
 │   ├── ingest/                 # Markdown 目录源（不提炼）
 │   └── platform/               # 横切：ID / 时钟
 ├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时
-│                               # 0004 会话 / 0005 摄取 / 0006 活动与审计日志
+│                               # 0004 会话 / 0005 摄取 / 0006 活动 / 0007 来源 / 0008 Continuity
 ├── docs/                       # 01–05 设计文档
 ├── test/                       # 架构测试、schema 测试、端到端集成测试
 ├── Makefile
@@ -236,7 +237,7 @@ internal/mcp/（已落地）          internal/web/（已落地）
 类型**（`mcp.identityKey` / `web.principalKey`），外部包无法伪造——拆子包就得导出它。
 目录分层的收益远小于这条安全属性。
 
-`continuity.go` 等 `domain/continuity` 先落地。
+`continuity.go` 对接已落地的 `domain/continuity`；恢复包包含当前位置、最近交接以及有界的位置/交接历史。
 
 **铁律（`04-web-scope.md` §1.4）：两个 Host 都只调用 `domain/`，不允许任何一方持有对方的业务逻辑，也不允许 Host 直接触碰 `adapters/`。**
 

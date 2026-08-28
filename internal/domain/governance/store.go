@@ -71,6 +71,12 @@ type Store interface {
 	// ListUsers 返回租户下的全部账号（成员管理页）。
 	ListUsers(ctx context.Context, tenantID platform.ID) ([]User, error)
 
+	// ListSpaces / ListPermissions 给空间治理页提供租户内的完整事实。
+	// 权限结论仍由 ResolveScope 负责；这里不把 can_read/can_write 解释成
+	// 业务规则，只列出原始空间与显式授权行。
+	ListSpaces(ctx context.Context, tenantID platform.ID) ([]Space, error)
+	ListPermissions(ctx context.Context, tenantID platform.ID) ([]Permission, error)
+
 	// UpdateUserPassword 写新哈希并设置 must_change_pw。
 	// mustChange 为真表示这是管理员重置的临时密码，本人登录后必须改掉。
 	UpdateUserPassword(ctx context.Context, tenantID, userID platform.ID, hash string, mustChange bool, at time.Time) error

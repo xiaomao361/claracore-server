@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"claracore-server/internal/platform"
 )
@@ -20,6 +21,10 @@ type IngestInput struct {
 	SpaceID       platform.ID
 	AuthorUserID  platform.ID
 	AuthorAgentID *platform.ID
+	// SourceName 是跨机器稳定的可枚举源名。非空时写进每张摄取卡，
+	// DetectMissing 为真时可据此判断哪些旧来源已经不在本轮全量扫描中。
+	SourceName    string
+	DetectMissing bool
 
 	Documents []Document
 }
@@ -34,6 +39,12 @@ type IngestReport struct {
 	Updated   int
 	Unchanged int
 	Failed    []IngestFailure
+	Missing   []IngestMissing
+}
+
+type IngestMissing struct {
+	CardID     platform.ID
+	SourcePath string
 }
 
 // IngestFailure 带上源路径与原因，让人能照着去修那一份。
@@ -70,11 +81,25 @@ func (s *Service) Ingest(ctx context.Context, in IngestInput) (IngestReport, err
 	if err := requireScope(in.TenantID, in.SpaceID, in.AuthorUserID); err != nil {
 		return IngestReport{}, err
 	}
+	in.SourceName = strings.TrimSpace(in.SourceName)
+	if len([]rune(in.SourceName)) > MaxSourceNameLen {
+		return IngestReport{}, fmt.Errorf("%w: 来源名称超过 %d 字", ErrInvalidArgument, MaxSourceNameLen)
+	}
+	if in.DetectMissing && in.SourceName == "" {
+		return IngestReport{}, fmt.Errorf("%w: 删除检测需要稳定的来源名称", ErrInvalidArgument)
+	}
 
 	var report IngestReport
 	seen := make(map[string]bool, len(in.Documents))
+	present := make(map[string]bool, len(in.Documents))
 
 	for _, doc := range in.Documents {
+		// 文件即使内容暂时不合法，也仍然“存在”。缺失检测回答的是源里
+		// 还有没有这份文件，不是它本轮能不能成功摄取；把两者混在一起会
+		// 在一份文档临时写坏时误报成已删除。
+		if strings.TrimSpace(doc.SourceKey) != "" {
+			present[doc.SourceKey] = true
+		}
 		if err := doc.validate(); err != nil {
 			report.Failed = append(report.Failed, IngestFailure{
 				SourcePath: doc.SourcePath, Reason: err.Error(),
@@ -110,6 +135,18 @@ func (s *Service) Ingest(ctx context.Context, in IngestInput) (IngestReport, err
 			report.Unchanged++
 		}
 	}
+
+	if in.DetectMissing && in.SourceName != "" {
+		existing, err := s.store.ListCardsBySource(ctx, in.TenantID, in.SpaceID, in.SourceName)
+		if err != nil {
+			return report, err
+		}
+		for _, card := range existing {
+			if !present[card.SourceKey] {
+				report.Missing = append(report.Missing, IngestMissing{CardID: card.ID, SourcePath: card.Source})
+			}
+		}
+	}
 	return report, nil
 }
 
@@ -133,8 +170,10 @@ func (s *Service) ingestOne(ctx context.Context, in IngestInput, doc Document) (
 		return ingestUnchanged, err
 	}
 
-	// 源没变就一步都不走：不推 version、不重算向量、不碰更新时间
-	if existing.SourceHash == doc.ContentHash {
+	contentChanged := existing.SourceHash != doc.ContentHash
+	sourceNameChanged := existing.SourceName != in.SourceName
+	// 源没变、来源元数据也没变就一步都不走。
+	if !contentChanged && !sourceNameChanged {
 		return ingestUnchanged, nil
 	}
 
@@ -144,6 +183,7 @@ func (s *Service) ingestOne(ctx context.Context, in IngestInput, doc Document) (
 	next.Original = body
 	next.SourceHash = doc.ContentHash
 	next.Source = doc.SourcePath
+	next.SourceName = in.SourceName
 	next.Version = existing.Version + 1
 	next.UpdatedAt = s.clock.Now()
 
@@ -153,6 +193,9 @@ func (s *Service) ingestOne(ctx context.Context, in IngestInput, doc Document) (
 	err = s.store.Atomically(ctx, func(st Store) error {
 		if err := st.UpdateCard(ctx, next, existing.Version); err != nil {
 			return err
+		}
+		if !contentChanged {
+			return nil
 		}
 		// 正文变了，向量要重算。走的是与手写更新完全同一条入队路径——
 		// 摄取绝不自己写第二份 embedding 逻辑。
@@ -179,6 +222,7 @@ func (s *Service) createIngestedCard(ctx context.Context, in IngestInput, doc Do
 		// 一张没有召回条件的卡片进了检索只会稀释结果。
 		Status:     CardDraft,
 		Source:     doc.SourcePath,
+		SourceName: in.SourceName,
 		SourceKey:  doc.SourceKey,
 		SourceHash: doc.ContentHash,
 		// 原文进 Original，其余 section 留空。提炼是 agent 的活。

@@ -458,6 +458,79 @@ func TestVectorRoundTripsThroughBlob(t *testing.T) {
 	}
 }
 
+func TestEmbeddingBackfillAndHealthQueriesStayTenantScoped(t *testing.T) {
+	db := openTestDB(t)
+	store := mysql.NewKnowledgeStore(db)
+	ctx := context.Background()
+	ids := platform.NewIDGenerator(platform.SystemClock{})
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	f := newKFixture(ids)
+	cleanupTenant(t, db, f.tenant, f.foreign)
+	const model = "backfill-contract-model"
+
+	memory := f.memory(ids, f.spaceMine, now)
+	card := f.card(ids, f.spaceMine, now)
+	trigger := knowledge.RecallTrigger{
+		ID: ids.New(), TenantID: f.tenant, CardID: card.ID, SpaceID: card.SpaceID,
+		Text: "准备删除数据时", CreatedAt: now,
+	}
+	foreign := f.memory(ids, f.spaceMine, now)
+	foreign.TenantID = f.foreign
+	for _, m := range []knowledge.Memory{memory, foreign} {
+		if err := store.CreateMemory(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.CreateCard(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceRecallTriggers(ctx, f.tenant, card.ID, []knowledge.RecallTrigger{trigger}); err != nil {
+		t.Fatal(err)
+	}
+
+	memories, err := store.ListMemoriesMissingEmbedding(ctx, f.tenant, model, 10)
+	if err != nil || len(memories) != 1 || memories[0].ID != memory.ID {
+		t.Fatalf("未索引记忆查询越过租户或漏项: rows=%+v err=%v", memories, err)
+	}
+	cards, err := store.ListCardsMissingEmbedding(ctx, f.tenant, model, 10)
+	if err != nil || len(cards) != 1 || cards[0].ID != card.ID {
+		t.Fatalf("未索引卡片查询不符: rows=%+v err=%v", cards, err)
+	}
+	triggers, err := store.ListTriggersMissingEmbedding(ctx, f.tenant, model, 10)
+	if err != nil || len(triggers) != 1 || triggers[0].ID != trigger.ID {
+		t.Fatalf("未索引召回条件查询不符: rows=%+v err=%v", triggers, err)
+	}
+
+	e := pendingEmbedding(ids, f, knowledge.Ref{Type: knowledge.EntityMemory, ID: memory.ID}, "正文", "hash", now)
+	e.Model = model
+	if err := store.EnqueueEmbedding(ctx, e); err != nil {
+		t.Fatal(err)
+	}
+	memories, err = store.ListMemoriesMissingEmbedding(ctx, f.tenant, model, 10)
+	if err != nil || len(memories) != 0 {
+		t.Fatalf("已有模型行后不应继续回填: rows=%+v err=%v", memories, err)
+	}
+	if err := store.MarkEmbeddingsFailed(ctx, []platform.ID{e.ID}, "模型不可用", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := store.EmbeddingStats(ctx, f.tenant, model, 1)
+	if err != nil || stats.Failed != 1 || stats.Exhausted != 1 {
+		t.Fatalf("失败统计不符: stats=%+v err=%v", stats, err)
+	}
+	failures, err := store.ListEmbeddingFailures(ctx, f.tenant, model, 10)
+	if err != nil || len(failures) != 1 || failures[0].LastError != "模型不可用" {
+		t.Fatalf("失败清单不符: rows=%+v err=%v", failures, err)
+	}
+	n, err := store.RetryEmbeddingFailures(ctx, f.tenant, model, now.Add(2*time.Minute))
+	if err != nil || n != 1 {
+		t.Fatalf("人工重试失败: n=%d err=%v", n, err)
+	}
+	stats, err = store.EmbeddingStats(ctx, f.tenant, model, 1)
+	if err != nil || stats.Pending != 1 || stats.Failed != 0 {
+		t.Fatalf("重试后应回 pending: stats=%+v err=%v", stats, err)
+	}
+}
+
 func TestLoadVectorsSkipsPendingAndOtherTenants(t *testing.T) {
 	db := openTestDB(t)
 	store := mysql.NewKnowledgeStore(db)

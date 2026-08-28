@@ -1,7 +1,7 @@
 # ClaraCore Server MCP 工具契约
 
 > 创建日期：2026-08-05
-> 状态：**16/20 已落地**（缺 Continuity 4 个）。落地状态与两处形态偏差见 §4 末尾
+> 状态：**24/24 已落地**。Memory / Card / 空间 / Continuity / 自动上下文 / 系统工具均已接入统一认证、错误映射与活动审计；真库链路见 `test/mcp_tools_integration_test.go`。
 > 前置文档：`01-architecture.md`、`02-data-model.md`
 >
 > **本文档是两条产品线的共同基准**：Desktop（JS）与 Server（Go）各自实现，工具名称、参数、语义保持一致。
@@ -16,7 +16,7 @@ Desktop 当前对外暴露 **80+ 个 MCP 工具**（`memoria_*` 约 35 个、`sh
 - 工具越多，agent 选错工具的概率越高
 - 大量工具是低频维护操作，却与高频工作工具混在同一个命名空间里
 
-**Server 版目标：对 agent 暴露的工具控制在 20 个以内。**
+**Server 版目标：对 agent 暴露的工具控制在 24 个以内。**
 
 ### 1.1 精简方法：工作面 / 治理面切分
 
@@ -92,20 +92,20 @@ agent 据此判断权威性：`team` = 已达成共识的约定，`personal` = �
 
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
-| `memoria_create` | 创建记忆 | `title`, `body`, `labels[]`, `space?` |
-| `memoria_search` | 语义 + 标签检索 | `query`, `labels[]?`, `spaces[]?`, `limit?` |
+| `memoria_create` | 创建记忆；可原子替代旧事实 | `title`, `body`, `labels[]`, `space?`, `supersedes?` |
+| `memoria_search` | 语义 + 标签检索；可切当前/历史视图 | `query`, `labels[]?`, `spaces[]?`, `limit?`, `timeView?` |
 | `memoria_get` | 按 id 取单条（含关联） | `id` |
 | `memoria_update` | 更新内容 / 标签 / 状态 | `id`, `version?`, 各字段 |
 | `memoria_delete` | 软删除 | `id` |
 | `memoria_link` | 建立/删除关联 | `fromId`, `toId`, `kind`, `note?`, `remove?` |
 
-**合并说明**：Desktop 的 `archive` / `restore` / `restrict` / `unrestrict` / `supersede` / `tag` 全部并入 `memoria_update`（通过 `status`、`labels`、`supersedes` 字段表达）。语义不丢失，工具数从 8 降到 1。
+**合并说明**：Desktop 的 `archive` / `restore` / `restrict` / `unrestrict` / `tag` 并入 `memoria_update`；替代事实由 `memoria_create.supersedes` 原子表达。语义不丢失，也不为每个状态动作增加工具。
 
 ### 4.2 Card（5 个）
 
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
-| `card_create` | 创建知识卡片 | `title`, `cardType`, 各 section, `recallTriggers[]`, `space?` |
+| `card_create` | 创建知识卡片；可原子演进旧卡 | `title`, `cardType`, 各 section, `recallTriggers[]`, `space?`, `evolvesFrom?` |
 | `card_recall` | **按当前情境召回** | `situation`, `spaces[]?`, `limit?` |
 | `card_search` | 按内容检索卡片 | `query`, `cardType?`, `spaces[]?` |
 | `card_get` | 取完整卡片 | `id` |
@@ -156,37 +156,43 @@ agent 据此判断权威性：`team` = 已达成共识的约定，`personal` = �
 
 `promote` 对 Memory 和 Card 通用，行为见 `02-data-model.md` §4：复制而非移动，记录 `copied_from`，不做自动同步。
 
-### 4.4 Continuity（4 个）
+### 4.4 Continuity（5 个）
 
 | 工具 | 用途 |
 |---|---|
-| `shared_line_list` | 列出线 |
-| `shared_line_get` | 取线的 resume packet |
-| `shared_line_update` | 更新位置 / 摘要 / 下一步 |
-| `shared_line_handoff` | 里程碑交接 |
+| `shared_line_list` | 摘要目录；默认当前 agent 所有线，`allAgents=true` 可列同租户团队目录 |
+| `shared_line_get` | 取 exact line 的 resume packet；多条 active line 时必须明确 `lineId` |
+| `shared_line_update` | 更新当前位置；无 owned line 时创建，一条时自动选择，多条时 fail closed |
+| `shared_line_handoff` | 里程碑交接，并返回 exact line 的 resume packet |
+| `shared_line_status` | 归档或重新激活 exact line；当前位置、快照和交接历史均保留 |
 
-Desktop 的 17 个 `shared_line_*` 中，`compact` / `archive` / `restore` / `rename` / `model_adjustment_*` 归入治理面（Web）。
+Desktop 的低频 `compact` / `rename` / `model_adjustment_*` 仍归治理面；生命周期所需的 archive / restore 已收敛成 `shared_line_status`，避免让调用方通过普通 update 猜状态语义。
 
-### 4.5 系统（2 个）
+Shared Line 的共享边界是 tenant，不虚构 `space_id`。`owner_user_id` / `owner_agent_id` 创建后保持稳定；同租户 agent 显式传 `lineId` 可协作更新，但只改变当前位置的 `writer_user_id` / `writer_agent_id`，不转移 owner。`version` 提供乐观锁；多线歧义返回 `SHARED_LINE_ID_REQUIRED` 与最多 3 条候选，不猜目标。事实正文仍属于 Memoria/Card，Shared Line 的 `factsUsed` 只保存不透明 ID。
+
+### 4.5 系统与上下文（5 个）
 
 | 工具 | 用途 |
 |---|---|
 | `whoami` | 返回当前 token 解析出的身份与权限概览 |
 | `server_status` | 服务健康与版本 |
+| `gateway_auto_context` | 对当前情境做确定性 score / margin 预筛，最多交付一张只读知识卡；终端 Agent 最终判断是否使用 |
+| `gateway_context_feedback` | 记录 delivered / used / ignored / wrong / corrected，供治理评估 |
+| `context_quality_status` | 汇总当前租户近 30 天已提交的反馈 outcome；不暴露正文或 actor，也不把反馈计数冒充准确率 |
 
 `whoami` 在 Server 版是必需品：agent 需要知道自己是谁、能写哪些空间，才能正确选择 `space` 参数。
 
 ---
 
-**工具总数：20 个**（Memory 6 + Card 5 + 空间 3 + Continuity 4 + 系统 2），对比 Desktop 的 80+。
+**工具总数：24 个**（Memory 6 + Card 5 + 空间 3 + Continuity 5 + 系统/上下文 5），对比 Desktop 的 80+。
 
-> **2026-08-10 实现状态**：Memory 6 + Card 5 + 空间 3 + 系统 2 = **16 个已落地**并在真库真模型上跑通（`test/mcp_tools_integration_test.go`）。Continuity 那 4 个还没做——它们需要 `internal/domain/continuity`，那个包目前是空的。
+> **2026-08-28 实现状态**：24 个工具已落地。自动上下文经确定性 Stage B 最多选择一张卡，弱相关、歧义或无语义证据时放弃；终端 Agent 决定是否实际使用，反馈进入统一治理活动流并可按租户查看近 30 天 outcome 汇总。Continuity 支持归档/恢复，恢复包带最近位置与交接历史。
 >
 > 落地时确认的两处形态：
 >
 > **① `VERSION_CONFLICT` 不是 JSON 对象。** §3.4 写的是 `{"error": {"code": ..., "currentVersion": 7}}`，但 MCP SDK 的错误通道只能传字符串（tool 返回 error → `isError` + 文本）。实际形态是一句格式稳定的话：`VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后基于最新内容再改`。版本号仍然必须带上——只说「撞车了」的话，agent 得再发一次 get 才能重试，而那次 get 之后可能再撞一次，重试就不收敛。
 >
-> **② `memoria_update` 暂时没有 `supersedes` 字段。** §4.1 说 Desktop 的 `supersede` 并入 update，但那是两次写（旧的置 `superseded` + 建一条 `evolved-from` 关联）且必须原子完成——那是一个领域用例，不是 Host 层能编排的。`archive` / `restore` / `tag` 都已经并进来了（通过 `status` 与 `labels`）。
+> **② supersede 在创建当前事实时表达。** `memoria_create.supersedes` 会在一个事务内创建当前事实、把旧事实置为 `superseded`，并建立 `current -> historical` 的 `supersedes` 链。`memoria_search.timeView` 可选 `current / historical / all`。
 
 ---
 
@@ -194,11 +200,11 @@ Desktop 的 17 个 `shared_line_*` 中，`compact` / `archive` / `restore` / `re
 
 | 维度 | Desktop | Server | 原因 |
 |---|---|---|---|
-| 工具数量 | 80+ | 20 | §1，工作面/治理面切分 |
+| 工具数量 | 80+ | 24 | §1，工作面/治理面切分 |
 | 身份传递 | header 声明 `X-ClaraCore-Agent-ID` | token 反查，不接受身份参数 | §3.3，可伪造 |
 | 空间概念 | 无 | 三层空间 + 结果标注来源 | 团队场景必需 |
 | 内容类型 | 仅 Memory（Card 靠"文件+指针"变通） | Memory + Card 双一等公民 | Card 原生落库 |
-| 情境召回 | 无 | `card_recall` | 核心能力 |
+| 情境召回 | Memory Controller | `card_recall` + `gateway_auto_context` | 自动路径经过可放弃的确定性 Stage B，终端 Agent 最终判断 |
 | 并发 | 无（单进程） | `version` 乐观锁 + `VERSION_CONFLICT` | 多实例必需 |
 | InnerLife | 25 个工具 | **无** | 已砍，且 stateless 下无法主动推送 |
 | Records（时序） | `memoria_record_*` | **无** | 生理时序是个人版特性。团队场景若真需要「事件时间线」（部署记录、故障时间线），那是另一个需求，不拿这套表结构硬套 |
@@ -209,6 +215,6 @@ Desktop 的 17 个 `shared_line_*` 中，`compact` / `archive` / `restore` / `re
 ## 6. 待确认
 
 - [x] **`memoria_search` 是否同时返回 Card 命中**：**分离，但返回信号**（2026-08-06 定）。内容不混排（memory 的「相关性」与 Card 的「该不该现在想起它」不是一个量纲，通约出来的排序是假的），但 `memoria_search` 的返回里带一个「另有 N 条卡片命中，用 `card_search` 查看」的计数。解决的是真实风险：agent 搜一次 memory 没找到就以为没有，而 Card 才是产品的核心载体。与「检索为空 ≠ 无权检索」同一哲学。实现上可只在 memory 命中少于阈值时才做这次 count（ngram 索引上的 count 不算白给）。
-- [x] **`card_recall` 是否应由服务端自动注入触发**：**二期再说，第一版显式调用**（2026-08-06 定）。stateless 下服务端拿不到对话上下文，实现受限；且在召回质量被数据验证之前就自动往上下文里塞东西，错一次就会让人永久关掉它。先把显式调用的命中率跑出数据。
+- [x] **`card_recall` 是否应由服务端自动注入触发**：调用方每轮把真实 prompt 交给 `gateway_auto_context`；Server 用语义候选 + 最低分/差值门槛做确定性预筛，最多返回一张只读证据块。终端 Agent 配置的大模型负责最终相关性判断；无语义、弱相关、歧义或超时时均 abstain，显式 `card_recall` 不受自动策略影响。
 - [x] **`promote` 的权限校验点**：**两端都校**（2026-08-06 定）——源空间可读 + 目标空间可写。见 `02-data-model.md` §9。
 - [x] **Records（时序数据）是否进 Server**：**不进**（2026-08-06 定）。Desktop 的 record 是步数/体重/用药这类生理时序，团队知识库里放它没有意义——与「InnerLife 不进团队版」是同一类判断。**但必须在本文档显式标注这个缺口**（见 §5 对照表），而不是默默没有：两边共享契约，agent 得知道缺口在哪，否则它会在 Server 上试着调 `memoria_record_*` 然后拿到一个莫名其妙的错。

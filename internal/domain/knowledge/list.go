@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"claracore-server/internal/platform"
 )
@@ -15,6 +16,7 @@ import (
 const (
 	defaultListLimit = 30
 	maxListLimit     = 100
+	MaxListQueryLen  = 200
 )
 
 // ListContentsInput 是「按条件翻一页内容」，不是检索。
@@ -52,6 +54,11 @@ type ListContentsInput struct {
 	// SpaceID 非空时只看这一个空间（页面上的空间筛选）。
 	// 它仍然必须在 Spaces 里——权限不因为多了一个筛选参数而放宽。
 	SpaceID platform.ID
+
+	// Query is an optional literal/full-text filter within the governance list.
+	// Unlike agent search, it keeps all explicitly requested lifecycle states
+	// and deterministic keyset pagination; it does not run semantic reranking.
+	Query string
 
 	// Cursor 来自上一页的 NextCursor，空表示第一页。
 	Cursor string
@@ -110,6 +117,7 @@ type ListQuery struct {
 	SpaceIDs []platform.ID
 	Kind     string
 	Statuses []string
+	Query    string
 
 	// After 是 keyset 分页的锚点，零值表示第一页。
 	//
@@ -137,6 +145,10 @@ func (s *Service) ListContents(ctx context.Context, in ListContentsInput) (ListC
 			return ListContentsResult{}, fmt.Errorf("%w: %s 不接受状态 %q", ErrInvalidArgument, in.Kind, st)
 		}
 	}
+	query := strings.TrimSpace(in.Query)
+	if utf8.RuneCountInString(query) > MaxListQueryLen {
+		return ListContentsResult{}, fmt.Errorf("%w: 查询超过 %d 字", ErrInvalidArgument, MaxListQueryLen)
+	}
 
 	spaces := in.Spaces
 	if in.SpaceID != "" {
@@ -161,6 +173,7 @@ func (s *Service) ListContents(ctx context.Context, in ListContentsInput) (ListC
 		SpaceIDs: spaces,
 		Kind:     in.Kind,
 		Statuses: in.Statuses,
+		Query:    query,
 		// 多取一条用来判断「还有没有下一页」，返回时再切掉。
 		// 比另发一次 COUNT 便宜，也比"取满 limit 就假设还有下一页"诚实——
 		// 后者会在正好取满时给出一个点进去是空的下一页。

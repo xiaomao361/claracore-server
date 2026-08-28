@@ -122,6 +122,10 @@ func (s *traceCleanupStore) ListAdmin(context.Context, activity.AdminQuery) ([]a
 	panic("unexpected ListAdmin call")
 }
 
+func (s *traceCleanupStore) CountContextFeedback(context.Context, activity.ContextFeedbackQuery) (activity.ContextFeedbackQuality, error) {
+	panic("unexpected CountContextFeedback call")
+}
+
 func (s *traceCleanupStore) DeleteTracesBefore(_ context.Context, before time.Time, limit int) (int, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, traceDeleteCall{before: before, limit: limit})

@@ -5,31 +5,52 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{{.Title}} · ClaraCore</title>
 <link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
 </head>
-<body>
+<body class="{{if .Principal.UserID}}app-authenticated{{else}}auth-shell{{end}}">
+<a class="skip-link" href="#main-content">跳到主要内容</a>
 {{if .Principal.UserID}}
-<header class="topbar">
-  <a class="brand" href="/">ClaraCore</a>
-  <nav>
-    <a href="/" class="{{if eq .Nav "overview"}}on{{end}}">概览</a>
-    <a href="/browse" class="{{if eq .Nav "browse"}}on{{end}}">内容</a>
-    <a href="/review" class="{{if eq .Nav "review"}}on{{end}}">审核</a>
-    <a href="/activity" class="{{if eq .Nav "activity"}}on{{end}}">活动</a>
-    <a href="/tokens" class="{{if eq .Nav "tokens"}}on{{end}}">我的接入</a>
-    {{if .Principal.IsAdmin}}<a href="/admin/members" class="{{if eq .Nav "members"}}on{{end}}">成员管理</a><a href="/admin/audit" class="{{if eq .Nav "audit"}}on{{end}}">完整审计</a>{{end}}
+<aside class="sidebar">
+  <a class="brand" href="/" aria-label="ClaraCore 概览"><span class="brand-mark" aria-hidden="true">C</span><span><strong>ClaraCore</strong><small>Team Memory</small></span></a>
+  <nav aria-label="主导航">
+    <p class="nav-label">工作区</p>
+    <a href="/" class="{{if eq .Nav "overview"}}on{{end}}" {{if eq .Nav "overview"}}aria-current="page"{{end}}>概览</a>
+    <a href="/browse" class="{{if eq .Nav "browse"}}on{{end}}" {{if eq .Nav "browse"}}aria-current="page"{{end}}>内容库</a>
+    <a href="/continuity" class="{{if eq .Nav "continuity"}}on{{end}}" {{if eq .Nav "continuity"}}aria-current="page"{{end}}>共同线</a>
+    <a href="/review" class="{{if eq .Nav "review"}}on{{end}}" {{if eq .Nav "review"}}aria-current="page"{{end}}>审核队列</a>
+    <a href="/activity" class="{{if eq .Nav "activity"}}on{{end}}" {{if eq .Nav "activity"}}aria-current="page"{{end}}>团队活动</a>
+    <a href="/tokens" class="{{if eq .Nav "tokens"}}on{{end}}" {{if eq .Nav "tokens"}}aria-current="page"{{end}}>我的接入</a>
+    {{if .Principal.IsAdmin}}
+    <p class="nav-label">管理</p>
+    <a href="/admin/members" class="{{if eq .Nav "members"}}on{{end}}" {{if eq .Nav "members"}}aria-current="page"{{end}}>成员</a>
+    <a href="/admin/spaces" class="{{if eq .Nav "spaces"}}on{{end}}" {{if eq .Nav "spaces"}}aria-current="page"{{end}}>空间与权限</a>
+    <a href="/admin/ingest" class="{{if eq .Nav "ingest"}}on{{end}}" {{if eq .Nav "ingest"}}aria-current="page"{{end}}>知识导入</a>
+    <a href="/admin/indexing" class="{{if eq .Nav "indexing"}}on{{end}}" {{if eq .Nav "indexing"}}aria-current="page"{{end}}>语义索引</a>
+    <a href="/admin/audit" class="{{if eq .Nav "audit"}}on{{end}}" {{if eq .Nav "audit"}}aria-current="page"{{end}}>完整审计</a>
+    {{end}}
+    <a class="mobile-only {{if eq .Nav "password"}}on{{end}}" href="/password" {{if eq .Nav "password"}}aria-current="page"{{end}}>账号</a>
+    <form class="mobile-only" method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit" class="nav-action">登出</button></form>
   </nav>
-  <div class="who">
-    <a href="/password" class="{{if eq .Nav "password"}}on{{end}}">{{.Principal.DisplayName}}</a>
-    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="linkish">登出</button></form>
+  <div class="sidebar-account">
+    <span class="avatar" aria-hidden="true">C</span>
+    <div><a href="/password" class="{{if eq .Nav "password"}}on{{end}}">{{.Principal.DisplayName}}</a><small>{{if .Principal.IsAdmin}}管理员{{else}}成员{{end}}</small></div>
+    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="linkish" aria-label="登出 ClaraCore">登出</button></form>
   </div>
-</header>
+</aside>
 {{end}}
-<main>
-  <h1>{{.Title}}</h1>
-  {{if .Error}}<p class="alert error">{{.Error}}</p>{{end}}
-  {{if .Notice}}<p class="alert notice">{{.Notice}}</p>{{end}}
-  {{block "content" .}}{{end}}
-</main>
-<footer>ClaraCore Server {{.Version}}</footer>
+<div class="workspace">
+  <header class="workspace-header">
+    <div><p class="eyebrow">{{if .Principal.UserID}}团队记忆工作台{{else}}安全接入{{end}}</p><h1>{{.Title}}</h1></div>
+    {{if .Principal.UserID}}<div class="environment"><span aria-hidden="true"></span>Server 在线 <code>{{.Version}}</code></div>{{end}}
+  </header>
+  <main id="main-content" tabindex="-1">
+    <div class="content-frame">
+      {{if .Error}}<p class="alert error" role="alert">{{.Error}}</p>{{end}}
+      {{if .Notice}}<p class="alert notice" role="status">{{.Notice}}</p>{{end}}
+      {{block "content" .}}{{end}}
+    </div>
+  </main>
+  <footer>ClaraCore Server {{.Version}}</footer>
+</div>
 </body>
 </html>{{end}}

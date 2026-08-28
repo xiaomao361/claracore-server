@@ -26,6 +26,7 @@ import (
 	"claracore-server/internal/adapters/crypto"
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	mcphost "claracore-server/internal/mcp"
@@ -87,7 +88,8 @@ func TestMCPWhoAmIEndToEnd(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	activityService := activity.NewService(mysql.NewActivityStore(db), clock, ids)
-	srv := httptest.NewServer(mcphost.NewHost(svc, knowledge.NewService(mysql.NewKnowledgeStore(db), clock, ids, nil), activityService, logger, mcphost.HostOptions{Version: "e2e"}).Handler())
+	continuityService := continuity.NewService(mysql.NewContinuityStore(db), clock, ids)
+	srv := httptest.NewServer(mcphost.NewHost(svc, knowledge.NewService(mysql.NewKnowledgeStore(db), clock, ids, nil), continuityService, activityService, logger, mcphost.HostOptions{Version: "e2e"}).Handler())
 	t.Cleanup(srv.Close)
 
 	t.Run("真实 token 换到真实身份与空间", func(t *testing.T) {

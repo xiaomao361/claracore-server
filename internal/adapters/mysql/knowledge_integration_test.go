@@ -200,6 +200,7 @@ func TestKnowledgeStoreContract(t *testing.T) {
 
 		t.Run("卡片写入后可原样回读", func(t *testing.T) {
 			c := f.card(ids, f.spaceMine, now)
+			c.SourceName = "ops-retrospectives"
 			if err := st.CreateCard(ctx, c); err != nil {
 				t.Fatal(err)
 			}
@@ -217,7 +218,7 @@ func TestKnowledgeStoreContract(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.Title != c.Title || got.CardType != c.CardType || got.Source != c.Source {
+			if got.Title != c.Title || got.CardType != c.CardType || got.Source != c.Source || got.SourceName != c.SourceName {
 				t.Errorf("标量字段回读不一致: %+v", got)
 			}
 			if got.Distilled != c.Distilled || got.Understanding != c.Understanding {
@@ -240,6 +241,28 @@ func TestKnowledgeStoreContract(t *testing.T) {
 			}
 			if got.RecallTriggers[0].SpaceID != c.SpaceID {
 				t.Errorf("召回条件的 space_id 冗余列没写对: %q", got.RecallTriggers[0].SpaceID)
+			}
+		})
+
+		t.Run("来源卡片枚举按租户和空间隔离", func(t *testing.T) {
+			const sourceName = "team-handbook-contract"
+			wanted := f.card(ids, f.spaceMine, now)
+			wanted.SourceName, wanted.SourceKey = sourceName, "wanted-key"
+			hidden := f.card(ids, f.spaceHid, now)
+			hidden.SourceName, hidden.SourceKey = sourceName, "hidden-key"
+			foreign := f.card(ids, f.spaceMine, now)
+			foreign.TenantID, foreign.SourceName, foreign.SourceKey = f.foreign, sourceName, "foreign-key"
+			for _, card := range []knowledge.Card{wanted, hidden, foreign} {
+				if err := st.CreateCard(ctx, card); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := st.ListCardsBySource(ctx, f.tenant, f.spaceMine, sourceName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || got[0].ID != wanted.ID || got[0].SourceKey != wanted.SourceKey {
+				t.Fatalf("来源枚举越过了租户或空间边界: %+v", got)
 			}
 		})
 
@@ -451,15 +474,10 @@ func TestKnowledgeStoreAtomicallyRollsBack(t *testing.T) {
 	}
 }
 
-// TestChineseFullTextSearchTokenizes 是 schema 规则 7 在真库上的复验。
-//
-// 没有 `WITH PARSER ngram`，默认分词器会把整段中文当成一个词——
-// 索引建得好好的，MATCH 也能跑，只是永远返回空。这种静默失效
-// 不可能在代码评审里被看出来，只能靠一次真实的检索。
-//
-// 必须真提交：InnoDB 的 FULLTEXT 索引在事务提交时才更新，
-// 同事务内 MATCH 查不到自己刚插入的行。所以本用例自己清理。
-func TestChineseFullTextSearchTokenizes(t *testing.T) {
+// TestChineseSearchWorksImmediatelyAfterCommit 验证用户真正依赖的保证：
+// 中文内容刚提交后立刻可搜。FULLTEXT 的 ngram 结构由 schema 集成测试检查；
+// 这里走正式 Store 路径，同时覆盖 InnoDB FTS 刚提交后短暂不可见时的字面兜底。
+func TestChineseSearchWorksImmediatelyAfterCommit(t *testing.T) {
 	db := openTestDB(t)
 	store := mysql.NewKnowledgeStore(db)
 	ctx := context.Background()
@@ -480,21 +498,17 @@ func TestChineseFullTextSearchTokenizes(t *testing.T) {
 		}
 	})
 
-	// 「连接池」是标题中间的一个子串，中间没有空格。
-	// 默认分词器切不出它，ngram（token_size=2）可以。
+	// 三个词都在中文句子的中间，没有空格分隔。
 	for _, keyword := range []string{"连接池", "调优", "超时"} {
 		t.Run(keyword, func(t *testing.T) {
-			var found int
-			err := db.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM memories
-				 WHERE id = ? AND MATCH(title, body) AGAINST (? IN BOOLEAN MODE)`,
-				string(m.ID), keyword).Scan(&found)
+			got, err := store.SearchMemories(ctx, knowledge.CandidateQuery{
+				TenantID: f.tenant, SpaceIDs: f.visible(), Query: keyword, Limit: 10,
+			})
 			if err != nil {
-				t.Fatalf("全文检索查询失败: %v", err)
+				t.Fatal(err)
 			}
-			if found != 1 {
-				t.Errorf("中文关键词 %q 没能命中——ngram 分词器可能没生效。"+
-					"检查 migrations/0002 的 FULLTEXT 索引是否带 WITH PARSER ngram", keyword)
+			if len(got) != 1 || got[0].Memory.ID != m.ID || got[0].TextScore <= 0 {
+				t.Fatalf("中文关键词 %q 刚提交后不可搜: %+v", keyword, got)
 			}
 		})
 	}

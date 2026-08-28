@@ -1,13 +1,17 @@
 # ClaraCore Server — 接手指南
 
-> 最后更新：2026-08-11
+> 最后更新：2026-08-28
 > 给下一次接手的人或 agent（Clara / Codex / 其他）
 
 ---
 
 ## 一句话状态
 
-**现在是一个能交付给团队的东西了**：管理员能在浏览器里开账号、发 token、复制配置片段；agent 拿着那个 token 通过 MCP 记经验、提炼卡片、在对的情境下被召回。工作面（16 个 MCP 工具）与治理面（Web 登录/成员/token/内容/活动）都通了。
+**团队测试实例已部署**：`http://192.168.3.200:51891` 由 `/home/gbjk/nginx` 的独立端口反代到 Supervisor 管理的 ClaraCore Server，应用目录是 `/home/gbjk/zhouwei/claracore-server`。管理员能在浏览器里管理账号、项目空间与权限、摄取源、索引和 token；agent 通过 24 个 MCP 工具管理 Memory、Card、自动上下文与 Shared Line。当前运行版本见本文「当前最远证据」。自动部署探针已从服务器内外通过；尚未完成的是登录后的人工视觉与完整业务验收。
+
+首次部署使用 `claracore-server -bootstrap -bootstrap-password-file <0600绝对路径>` 原子创建首个租户、管理员、团队空间和管理员个人空间；非空部署单元会明确拒绝重复初始化，管理员首次登录必须改密。
+
+`192.168.3.200` 已完成首次初始化：租户 `ClaraCore 团队`、管理员账号 `admin`、团队空间 `团队记忆`。临时密码只保存在服务器的 `/home/gbjk/zhouwei/claracore-server/.initial-admin-password`（0600），未写入配置或日志；首次登录强制进入改密页，改密交付完成后应删除该临时文件。
 
 **整条链路闭环了**（0810 第六刀）。这是这个产品的一句话价值，第一次真的跑通：
 
@@ -23,7 +27,7 @@ docs/06-poc-findings.md → 摄取成 draft
 
 0.7515 比之前那个对抗性构造的 0.6195 高得多——因为这次的召回条件是**人照着原文写的**，不是测试数据。
 
-**活动流与完整审计已在 0811 落地到代码**：`0006_audit_logs.sql`、独立的 `domain/activity` 与 MySQL Store、16 个 MCP 工具的统一装饰器、Web 写中间件、`/activity`，以及需要二次确认且先写 meta-audit 才能查询的 `/admin/audit`。普通成员可见性在 SQL 中收紧为「自己的全部活动 + 自己可读共享空间里的他人写入」，不是把租户全量读进应用后再过滤；活动元数据只允许 ID、计数和语义标志，不落 query、situation、正文、密码或 token。
+**活动流与完整审计已落地到代码**：`0006_audit_logs.sql`、独立的 `domain/activity` 与 MySQL Store、24 个 MCP 工具的统一装饰器、Web 写中间件、`/activity`，以及需要二次确认且先写 meta-audit 才能查询的 `/admin/audit`。Shared Line 审计只保留 line ID、版本和计数，不落摘要、下一步或交接正文；自动上下文反馈只记录卡 ID 与 outcome，并可按租户汇总近 30 天 outcome。
 
 **0811 这一刀已收到真库 + 真浏览器层**：`make check` 通过（domain 87.1%）；`0006` 已应用到 `development` MySQL；完整 `make itest` 通过，包括活动 SQL 可见性、租户隔离、keyset 分页、保留期删除与 MCP 真实写入。浏览器用隔离的临时租户走了登录 → `/activity` → `/admin/audit` 二次确认 → meta-audit 出现的完整链路，并补测 390px 窄屏。这些是开发环境验收，不是部署或生产验收。
 
@@ -36,9 +40,11 @@ docs/06-poc-findings.md → 摄取成 draft
 
 Web 那条链路 0810 在真浏览器会话里手跑过一遍：未登录访问首页 303 → 登录 → 被强制赶去改密页 → 改密后进概览（看到空间与权限）→ 签发 token 拿到明文与可直接粘贴的 MCP 配置块 → 建同事账号拿到生成的初始密码 → 不带 CSRF 的 POST 得到 403。0811 又在真浏览器补验了活动流与完整审计：普通时间线只显示自己全部 + 共享写入，管理员确认后能看到全量，且首条就是本次 `admin.audit.query` meta-audit。
 
-**Web 生产视觉已在 0811 完成 Figma 验收**：文件是 [ClaraCore Server — Product Direction 01](https://www.figma.com/design/6ObFIgv8rQVrZnEX5WdaMr)。`03 · Web Workspace` 是基准，`04 · Activity Feed`、`05 · Card Review`、`06 · Content Browse` 是生产页，`07 · Responsive & States` 覆盖 390px 窄屏和关键反馈状态。方向是桌面浏览器治理工作台，不是独立 App；14 个组件/组件集覆盖 61 个形态，生产页与组件已通过命名、变量绑定、字体、焦点态、对比度和横向溢出检查。**设计已完成，但尚未同步进 Go 模板/CSS**。
+**Web 生产视觉已在 0827 同步进 SSR**：沿用已验收的 Figma 工作台方向，`layout.html` 与嵌入 CSS 已收敛为持久桌面侧栏、工作区页头、紧凑卡片/表格、活动流与审核双栏；680px 以下降级为可横向滚动的底部导航。跳到主要内容、单一 H1、`aria-current`、可见焦点、40px 控件、减弱动态与局部表格滚动均有静态/模板测试。尚待用户在目标服务器用真浏览器验 1440 与 390px。
 
-**还缺的是 Continuity**：`shared_line_*` 那 4 个工具要先有 `internal/domain/continuity`（仍是空目录）。
+**Continuity 已在 0827 落地**：`0008_continuity.sql`、领域 Service、MySQL Store 与 `shared_line_list/get/update/handoff/status` 五个工具均已实现。owner 稳定、跨 agent writer provenance、多线歧义 fail closed、位置乐观锁、归档/恢复、最近 10 条位置/交接历史和 exact resume packet 都有领域/MCP/真库测试。
+
+**0827–0828 体验数据、共同线 Web、筛选与上下文能力已部署**：三个空间均有带 `[演示]` 前缀和 `demo-seed-20260827-v1` / `demo-seed` 标签的 Memory / Card，覆盖 active、archived、superseded、deleted、draft、deprecated、事实替代、卡片演进、跨实体关联与提升来源；另有一条 `ClaraCore Server 体验数据与筛选验收` Shared Line。它们是明确标记的拟真测试数据，不是业务事实。共同线现为左侧导航中的独立页面，按进行中/已归档/全部查看租户内各 agent；详情展示当前位置、位置历史和交接历史，可归档/恢复且经过 CSRF 与治理审计。内容浏览支持在类型、空间、状态范围内全文查找，查询与游标会安全编码并跨页保留；下拉筛选由同源 `/static/app.js` 选择即提交，切换类型会清除不兼容状态，并保留“应用筛选”作为无 JavaScript 兜底。自动 Card 上下文已与 Desktop 对齐为确定性 Stage B 预筛，终端 Agent 的模型做最终判断；服务端不再运行第二个大模型。Memory 原子 supersede、Card 原子 evolution、Shared Line 生命周期/历史与反馈治理均已包含。Nginx `/mcp` 上游 Host 固定为 loopback，避免 SDK 的 DNS-rebinding 防护把普通客户端拒为 403。
 
 ---
 
@@ -111,12 +117,13 @@ curl http://127.0.0.1:51890/healthz
 |---|---|---|
 | `docs/01-architecture.md` | 想知道"为什么这么设计"、部署形态、nginx 配置 | §11.0 有实现进度表 |
 | `docs/02-data-model.md` | **写迁移文件前必读**。表结构、三层空间、检索模型、并发控制 | 已落地，偏差就地标注 |
-| `docs/03-mcp-contract.md` | 写 MCP 工具前必读 | 16/20 已落地 |
+| `docs/03-mcp-contract.md` | 写 MCP 工具前必读 | 24/24 已落地 |
+| `docs/08-usage-guide.md` | 实际接入、调用、验收和缺口速查 | 与当前测试部署同步 |
 | `docs/04-web-scope.md` | 写 Web 前必读。页面清单 + **可见性边界** | 活动流与管理员完整审计已实现，§3.3 有进度表 |
 | `docs/05-code-structure.md` | **动手前必读**。目录结构、依赖方向、约束机制 | 目录树已按实际结构更新 |
 | `docs/06-poc-findings.md` | 遇到 MCP 协议/传输层问题时查 | 已验证的结论与已知限制 |
 
-各文档末尾的「待确认」清单已于 2026-08-06 全部拍板，速查表见本文 §已拍板。**目前没有未决问题**——下一刀 Continuity 开工前先对齐 Desktop 契约与 `03-mcp-contract.md` 的既有语义，不凭空再造一套。
+各文档末尾的「待确认」清单已于 2026-08-06 全部拍板，速查表见本文 §已拍板。**目前没有未决产品决策**；已知工程改进见本文「缺口总览」，人工浏览器与完整业务验收仍需用户完成。
 
 ---
 
@@ -148,12 +155,13 @@ internal/ports/embedder.go     Model() + Embed()。纯基础设施接口，不�
 internal/adapters/embedding/   Ollama（/api/embed 批量）+ OpenAI-compatible（按 index 归位）
   └─ embedding_test.go         用 httptest 造真服务不会给你的坏响应：数量对不上、
                                维度不一致、空向量、404、错误信息泄露内网地址
-internal/mcp/                  MCP Host：bearer 认证 + 身份注入 + 错误映射 + 16 个工具
-  └─ activity.go               16 个工具统一审计装饰器 + 强类型安全元数据提取
+internal/mcp/                  MCP Host：bearer 认证 + 身份注入 + 错误映射 + 24 个工具
+  └─ activity.go               24 个工具统一审计装饰器 + 强类型安全元数据提取
   └─ knowledge.go              编排骨架：begin() 是唯一的权限解析入口 + 结果编码
-  └─ memory.go / card.go / space.go   Memory 6 + Card 5 + 空间 3 + 系统 2
+  └─ memory.go / card.go / space.go   Memory 6 + Card 5 + 空间 3
+  └─ continuity.go / context.go       Continuity 5 + 系统/上下文 5
   └─ host_test.go              8 个协议层测试，用 fake 治理服务，不碰数据库
-  └─ tools_test.go             21 个工具层测试，用只记录入参的 fake 核心域——
+  └─ tools_test.go             24 个工具层测试，用只记录入参的 fake 核心域——
                                这一层唯一该测的是「Host 往领域层传了什么」
 internal/web/                  Host B：治理面（SSR + htmx 的位置，第一版还没用上 htmx）
   └─ server.go                 路由三层门 + 每页一套模板 + 安全响应头
@@ -259,7 +267,7 @@ poc/                           丢弃型验证代码，独立 go.mod，不参与
 - **`last_used_at` 有 5 分钟写入节流，且写失败不影响认证**。它是运维辅助信号，不是授权依据。
 - **`checkAuthConsistency` 在正常情况下永远不触发**，它防的是数据损坏导致的跨租户越权。有测试专门盯着它还活着，别当成冗余代码删掉。
 
-**这一层缺的东西**：领域层不做密码哈希——argon2id 的参数（memory/time/parallelism）属于配置，而领域层不读配置。`CreateUserInput.PasswordHash` 目前由调用方传入，等实现 Web 登录时在 `ports/` 定义 `PasswordHasher` 接口，Host 层调用后传进来。在那之前没有任何地方能真正创建用户密码。
+**密码哈希欠账已还清**：领域层仍不读取 argon2id 配置；`ports.PasswordHasher` 由 `adapters/crypto` 实现，`governance.Service` 统一调用。Web 登录、成员创建、重置密码和参数升级均走同一实现。
 
 ---
 
@@ -425,22 +433,24 @@ VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后�
 
 塞 `authorUserId` / `tenantId` 进 arguments 会被 SDK 直接拒掉（`additionalProperties`），连 handler 都进不去。`TestToolSchemasHaveNoIdentityParams` 扫全部工具的 inputSchema，盯的是**未来新增的工具**——谁哪天顺手加一个 `userId` 参数，那条会红。
 
-### 工具清单（16 个，上限 20）
+### 工具清单（24 个，上限 24）
 
 | 组 | 工具 |
 |---|---|
 | Memory 6 | `memoria_create` / `search` / `get` / `update` / `delete` / `link` |
 | Card 5 | `card_create` / `recall` / `search` / `get` / `update` |
 | 空间 3 | `space_list` / `promote` / `space_stats` |
-| 系统 2 | `whoami` / `server_status` |
+| Continuity 5 | `shared_line_list` / `get` / `update` / `handoff` / `status` |
+| 系统与上下文 5 | `whoami` / `server_status` / `gateway_auto_context` / `gateway_context_feedback` / `context_quality_status` |
 
-契约里的 Continuity 4 个（`shared_line_*`）**还没做**——它们要 `internal/domain/continuity`，那个包目前是空的。工具总数因此是 16 而不是 20。
+Continuity 只保存可续接的当前位置、事实 ID 与里程碑交接，不复制 Memory / Card 正文，也不虚构 `space_id`；共享边界是 tenant。用户已在 2026-08-27 确认 Server 版保留这条线能力。
 
-**维护类操作一律不进 MCP**（导入导出、合并建议、休眠归档、标签别名管理）：它们是人的运维动作，归 Web 治理面。有测试盯着工具总数不超过 20。
+**维护类操作一律不进 MCP**（导入导出、合并建议、休眠归档、标签别名管理）：它们是人的运维动作，归 Web 治理面。有测试盯着工具总数不超过 24；Shared Line 生命周期和上下文反馈属于高频运行契约，因此保留在 MCP。
 
 ### 这一层缺的东西
 
-- **`memoria_update` 没有 `supersedes` 字段**。契约 §4.1 说 Desktop 的 `supersede` 并入 update，但那是两次写（旧的置 `superseded` + 建一条 `evolved-from` 关联），必须原子完成——那是一个领域用例，不是 Host 层能编排的。要做就在 `knowledge` 里加 `SupersedeMemory`。
+- **Memory supersede 已实现，但入口在 `memoria_create.supersedes`**。创建当前事实、旧事实置 `superseded` 与建立 `supersedes` 链在同一事务；`memoria_search.timeView` 读取 current / historical / all。
+- **Card evolution 已实现**。`card_create.evolvesFrom` 原子创建新卡、把旧卡置 `deprecated` 并建立 `evolved-from` 链。
 - **`space_stats` 的合格判定有两份表达**。SQL 是 `body_understanding IS NULL`，领域是 `Card.IsQualified()`。等价靠的是 0002「空 section 写 NULL 而非空串」加写入侧的 `nullIfEmpty`。`TestSpaceStatsUnqualifiedMatchesIsQualified` 把两者写在了一起，但它挡不住「给 IsQualified 加一条判据却忘了改 SQL」。
 
 ---
@@ -452,9 +462,10 @@ VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后�
 摄取只把文档变成一张**带 source 的 draft 卡**：标题 + 原文，别的都不填。
 提炼（写「理解」与召回条件）交给 agent 走 `card_update`。
 
-服务端不引入 LLM 依赖，是因为那会带来又一套 baseURL / model / 配额 / 超时 /
-失败重试，而换来的自动提炼质量不可控——一旦跑偏就是批量产出垃圾召回条件，
+摄取链路不引入 LLM 提炼，是因为自动提炼质量不可控——一旦跑偏就是批量产出垃圾召回条件，
 而垃圾召回条件比没有召回条件更糟：它会污染 `card_recall` 这个产品的核心能力。
+
+自动上下文使用确定性最低分与差值门槛，只读选择最多一张卡；终端 Agent 的模型负责最终相关性判断。它不生成卡片、不修改召回条件，也不改变摄取的人工审核边界。
 
 代价必须说清楚：**刚摄完那批卡，`card_recall` 一条都命不中**（没有触发条件）。
 `card_search` 能找到它们（正文进了向量），但那不是这个产品的主路径。
@@ -492,11 +503,7 @@ VERSION_CONFLICT: 内容已被他人修改，当前版本 7。请重新 get 后�
 
 ### 这一层缺的东西
 
-- **没有删除检测**。源里删掉一份文档，库里那张卡会一直留着。要做的话是
-  「扫描结果与库里该源的全部 source_key 求差集」，然后**标记而不是删除**
-  （人可能已经在那张卡上写了东西）。
-- **只有 CLI 入口，没有 Web 摄取管理页**（`04` 页面 9）。现在是
-  `server -ingest`，参数里的空间 ID / 用户 ID 要人自己从 Web 上抄。
+- 删除检测和 Web 摄取管理页已经实现；扫描不完整时 fail closed，只报告缺失，不自动改卡。
 - **只有 Markdown 目录一个源**。odoc 那类活系统按 `01` §8.1.3 是「连接而非纳入」，
   属于第二版的索引同步，路径完全不同。
 - **整篇一张卡，不按 `##` 切分**。按章节拆是一种提炼判断，而提炼不归摄取管——
@@ -579,23 +586,24 @@ requireAdmin        ↑ 且角色是 admin
 
 ### 活动流与完整审计（2026-08-11 已实现）
 
-- `internal/mcp/activity.go` 是 16 个 MCP 工具的唯一注册/审计边界；每个工具必须声明读写分类与强类型安全提取器，新工具不能悄悄绕过活动记录。
+- `internal/mcp/activity.go` 是 24 个 MCP 工具的唯一注册/审计边界；每个工具必须声明读写分类与强类型安全提取器，新工具不能悄悄绕过活动记录。
 - `requireUser` 是 Web 已认证写操作的统一审计边界；业务响应先完成，普通审计失败只记服务端错误，不把已经成功的写改成失败。管理员完整审计例外：meta-audit 写不下时**拒绝查询**，不能先看再补记。
 - 普通 `/activity` 只把治理层已解析出的 team/project 可读空间 ID 交给 `activity.ListVisible`；MySQL 在 SQL 中只返回「本人全部 + 他人共享空间写入」。个人空间与他人读取/召回不会先进入应用内存。
 - `/admin/audit` 与日常活动页分离：GET 只展示风险说明和确认，POST 先持久化 `admin.audit.query` 的 meta-audit，再读取租户完整日志；翻下一页也要重新确认并留痕。
 - MCP 元数据白名单只含实体/空间 ID、命中 ID、计数与语义标志；Web 写审计不序列化表单。query、situation、标题、正文、密码、token 与错误文本都不进 `audit_logs`。
 - `trace` 与 `governance` / `meta_audit` 共用一张表但分类独立：后台 worker 启动时立即清一次，之后每 24 小时按 1000 条一批抽干 30 天前的 `trace`；治理与 meta-audit 不进入这条删除路径。服务关闭会等待这一 worker 退出。
 
-**当前最远证据**：开发 MySQL 已应用 `0006`；`make check` 与完整 `make itest` 均过；真浏览器已验 `/activity` 的可见结果、`/admin/audit` 的二次确认和查询自留痕，桌面与 390px 窄屏均无 console 错误。最远只到开发环境验收，未部署。
+**当前最远证据**：MySQL 已是 8 个迁移的最新结构；本轮 `make check` 全绿（domain 85.0%），完整 `make itest` 通过；`192.168.3.200` 上 `dev-20260828-apache-closeout-v1` 由 Supervisor 保持 RUNNING，release 为 `claracore-server_dev-20260828-apache-closeout-v1_linux_amd64`，发布包 SHA-256 为 `113883cd2b007abb1d0cfb50039cc9bed287f2f29a6b7b151f1de81efae6381a`。服务器内外部署探针验证 MySQL、Web 和 MCP 401 边界，三个后台 worker 均在新进程启动；上一轮已验证线上 `tools/list` 为 24 个工具且无 7B / qwen / recall-judge 工具或配置。内容浏览全文查找、共同线详情/历史/归档恢复、知识卡精确/高相似重复候选都已通过领域与 Web 测试；高相似阈值为 0.90，长卡片与存量向量使用同一 2000-rune 截断。真实 bge-m3 + 确定性 Stage B 集成门禁本轮两组正负样本均通过，单次约 103–110ms；没有靠降低阈值强行交付。README、贡献指南、安全策略、PR 模板、Dependabot、普通门槛 CI 与 MySQL 8.4 真库 CI 已加入，根目录及二进制 tarball 均包含与 Apache 官方原文哈希一致的 Apache License 2.0，公开模板中的团队内网拓扑已替换为安全示例值。登录后的 Web 重复候选与 1440/390px 人工页面验收仍待用户确认；当前内网 HTTP 按维护者决定暂不升级，公网部署时再验 HTTPS。
 
 ### 这一层还缺的东西
 
 - **审核页没有批量操作**。几千条 draft 一条条点是不现实的，但「批量确认」与「必须有人真的看过」直接冲突——这个取舍要等真实的审核负担出现再定。
-- **浏览页没有全文搜索框**。要接的是 `SearchCards`，但那和列表是两条路径，混在一个页面上要先想清楚交互。
-- **会话过期靠 `CleanupSessions` 手动调**，没有定时任务。行会一直堆着——不影响正确性（过期判断在领域层），但表会长。
-- **项目空间与权限管理页没做**，只能靠代码调 `CreateProjectSpace` / `GrantSpaceAccess`。团队真用起来会立刻需要它。
+- **内容浏览全文查找已实现**。它扩展治理列表 SQL，在当前类型/空间/状态内筛标题与正文，保留 draft / deprecated 等状态和 keyset 分页；不复用 agent 的语义检索，避免候选截断与默认 active 状态破坏治理列表。
+- **真实演示数据已有近重复知识卡**。自动上下文会因 top-2 margin 不足而安全放弃；审核与浏览详情现在复用现有两阶段检索展示 active 重复候选，精确内容无 embedding 也能识别，高相似语义候选阈值为 0.90。系统不自动合并或删除，人工比较后沿用 `deprecated` 保留历史；不能靠降低 Stage B 阈值掩盖数据质量问题。
+- **过期 Web session 已有独立 worker**：启动即清一次，之后每日清理；领域层仍负责过期判断与删除语义。
+- 项目空间与权限管理页已经实现；后续缺口只按真实使用反馈补充，不再把它列为待做。
 
-### Web 视觉设计节点（2026-08-11 已验收，尚未实现）
+### Web 视觉设计节点（2026-08-11 已验收，2026-08-27 已同步 SSR）
 
 - Figma 文件：[ClaraCore Server — Product Direction 01](https://www.figma.com/design/6ObFIgv8rQVrZnEX5WdaMr)。
 - `03 · Web Workspace` 是工作台基准；生产页是 `04 · Activity Feed`、`05 · Card Review`、`06 · Content Browse`；`07 · Responsive & States` 覆盖 390px 窄屏与加载、空、错误、焦点等状态。`00`–`02` 只保留方向过程与被否决方案。
@@ -603,7 +611,7 @@ requireAdmin        ↑ 且角色是 admin
 - 保留现有温暖、可信、低装饰的色彩语气；不要恢复巨型编辑式标题、居中舞台、三张等权大卡，也不要套紫色 AI 渐变或通用 SaaS 圆角卡片墙。
 - 设计系统现有 3 个变量集合、61 个变量、9 个文字样式、1 个效果样式；14 个组件/组件集共 61 个形态，覆盖按钮、表单、导航、分页、表格行、反馈状态与业务列表项。
 - 结构验收已过：生产页与组件没有默认命名、占位文案或未绑定填充/描边；统一 Noto Sans SC；390px 根容器无横向溢出；交互控件有焦点态，状态不只靠颜色；关键对比度不低于 5.0:1。
-- 下一阶段不是继续探索视觉，而是按「共享 shell / tokens / 组件 → 活动流 → 卡片审核 → 内容浏览 → 响应式与状态」同步进 SSR 模板与嵌入 CSS。Code Connect 等到代码组件与 Figma 组件稳定一一对应后再接。
+- 生产视觉已同步进 SSR；后续视觉调整必须来自 1440/390px 的真实部署验收回执，不继续凭空探索方向。Code Connect 等到代码组件与 Figma 组件稳定一一对应后再接。
 
 ---
 
@@ -613,37 +621,30 @@ requireAdmin        ↑ 且角色是 admin
 
 | 缺口 | 影响 | 在哪一段 |
 |---|---|---|
-| **embedding 没有 backfill** | 后来才打开 embedding 的存量内容不会被补索引；换模型灰度重建同理 | §检索层 |
-| **摄取没有删除检测** | 源里删掉的文档，库里那张卡会一直留着 | §摄取 |
-| **摄取只有 CLI 入口** | 空间 ID / 用户 ID 要人从 Web 上抄，没有管理页 | §摄取 |
-| **项目空间与权限没有管理页** | 只能靠代码调 `CreateProjectSpace` / `GrantSpaceAccess`，团队真用起来立刻会要 | §Web 治理面 |
-| **Continuity 完全没做** | `shared_line_*` 4 个工具，`internal/domain/continuity` 是空目录 | §MCP 工具层 |
-| **没有向量缓存** | `ports.Cache` 不存在，查询向量每次都真算 | §检索层 |
-| **会话过期靠手动清理** | `CleanupSessions` 没有定时任务，表会长 | §Web 治理面 |
-| **`memoria_update` 没有 `supersedes`** | 契约 §4.1 提到但没做，它是两次写且必须原子 | §MCP 工具层 |
+| **缓存尚未跨实例共享** | 单实例已有 `hash(model+text)` 有界 LRU；Redis decorator 尚未实现 | §检索层 |
+| **自动上下文只召回 Card** | 还不是 Desktop Memory Controller 的完整移植，也不组合 Memory + Shared Line | `08-usage-guide.md` §8 |
 | **审核页没有批量操作** | 几千条 draft 一条条点不现实，但与「必须有人真看过」冲突 | §Web 治理面 |
 | **外部源连接（odoc 等）** | 第二版。`01` §8.1.3 定的是「活系统连接、死文档纳入」 | `01` §8 |
+| **回召反馈只有基础计数** | `context_quality_status` 可看 30 天 submitted/outcome，但样本未覆盖所有曝光，不能解释成准确率 | `08-usage-guide.md` §8 |
+| **自动质量样本仍需扩充** | 真实 embedding + Stage B 已有正负与延迟门禁，但样本量仍小，需结合 wrong/ignored 反馈演进 | `08-usage-guide.md` §8 |
+| **开源许可证已完成** | 根目录与二进制发布包均携带 Apache License 2.0，贡献指南同步说明默认贡献许可 | 根目录 README / LICENSE |
+| **公开生产 HTTPS 尚未验收** | 模板已安全默认 HTTPS，但当前团队实例仍是内网 HTTP，不能作为公网生产证据 | `07-deployment.md` |
 
 ---
 
-## 检索层缺的东西（详）
+## 检索层剩余的东西（详）
 
-- **没有 backfill**。未配 Embedder 时不入队（没有模型名可写），所以**后来才打开 embedding 的存量内容不会被自动补索引**，换模型灰度重建同理。要补的形态大致是 `ListUnindexed(model, limit)` 把没有当前模型向量行的实体捞出来、由领域层拼文本再入队——放在 Web 治理面或一个 `-reindex` flag 后面。
-- **没有向量缓存**。`ports.Cache` 还不存在，查询向量每次都真算一次。`hash(text+model)` 的 Redis 缓存是 `01-architecture.md` §6.2 里价值最高的一项，等 Cache 端口落地时一起做。
-- **没有失败可观测性**。`status=failed` 的行只能靠翻库看，没有计数接口。Web 治理面要用。
+- **backfill 与失败观测已完成**。`/admin/indexing` 可查看状态、最近失败并触发补索引/失败重试；真实 MySQL 的租户隔离和重试路径有集成测试。
+- **单实例 embedding 缓存已完成**。进程内有界 LRU 使用 `hash(model+text)`，TTL 与容量可配，`server_status` 可看 hits/misses；多实例共享与跨重启保留仍需要 Redis decorator。
 - **检索结果不带 labels**。粗筛刻意不填（N+1 或让候选集膨胀的 JOIN），按 ID 取单条时才有。MCP 工具编码时注意这一点。
 
 ---
 
 ## 下一步
 
-**0. 当前工作流：把已验收的 Web 生产设计同步进 SSR。** 先落共享 shell、变量与基础组件，再按「活动流 → 卡片审核 → 内容浏览 → 响应式与状态」逐页替换现有 Go 模板与嵌入 CSS。每一页都保留现有路由、权限、CSRF 与领域调用，只改呈现层；完成后同时跑模板测试，并在真浏览器验 1440 与 390px。除非实现暴露真实问题，不再回到方向探索。
+**0. 当前工作流：人工验收与许可证选择。** 团队测试实例已有拟真演示数据、共同线列表/详情/历史/归档恢复、内容全文查找、重复候选、选择即提交筛选和新的上下文/生命周期能力；由用户刷新后用真浏览器验这些页面，以及登录、概览、活动、管理页和 1440/390px 布局。视觉与业务回执回来之前，不宣称生产验收。公开发布前由维护者明确选择许可证，不由实现者代猜。
 
-**1. 代码下一优先级：Continuity。** `shared_line_*` 4 个工具还没做，`internal/domain/continuity` 仍是空目录。先从 Desktop 的现行契约与 `03-mcp-contract.md` 对齐实体、可见性和四个工具语义，再按现有结构落 Store → Service → MCP Host → 装配与测试；不要直接复制 Desktop 的本地身份或 SQLite 假设。
-
-第一轮先做一件可验证的事：把 Desktop 当前「`agent_id` 是稳定 owner、显式跨 agent 写保留 writer provenance、不隐式转移归属」的模型，映射到 Server 已认证的 `(tenant, user, agent)` 身份，再写迁移与领域契约。团队版的任何额外共享/空间语义只能来自现有产品契约或明确需求，不能因为这里已经有 `space_id` 就顺手加进去。
-
-**2. 零散但值得顺手做的**：见 §缺口总览。其中「项目空间与权限管理页」是团队真用起来第一个会要的东西。
+Continuity、项目空间权限、Web 摄取、删除检测、embedding backfill/失败观测、部署包、Supervisor 与 Nginx 代理均已完成。使用与验收方法统一见 `docs/08-usage-guide.md`；下一轮只按人工验收回执或缺口总览中的真实需求继续，不再根据旧文档重复建设已完成能力。
 
 ---
 

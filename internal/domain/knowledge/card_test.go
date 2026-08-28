@@ -58,6 +58,23 @@ func TestCreateCardStatusDefaultsByOrigin(t *testing.T) {
 	}
 }
 
+func TestCreateCardCanAtomicallyEvolveActiveCard(t *testing.T) {
+	svc, store := newTestService(t)
+	old := seedCard(t, svc, spacePriv)
+	current := seedCard(t, svc, spacePriv, func(in *CreateCardInput) {
+		in.Title = "删除前必须完成隔离恢复抽查"
+		in.EvolvesFromID = old.ID
+		in.WritableSpaces = mySpaces()
+	})
+	if got := store.cards[old.ID]; got.Status != CardDeprecated {
+		t.Fatalf("旧卡未 deprecated: %+v", got)
+	}
+	links, err := store.ListLinks(context.Background(), tenantA, Ref{EntityCard, current.ID})
+	if err != nil || len(links) != 1 || links[0].Kind != LinkEvolvedFrom || links[0].To.ID != old.ID {
+		t.Fatalf("演进链错误: %+v err=%v", links, err)
+	}
+}
+
 // deprecated 不删除：「这条约定曾经成立过」本身是信息。
 // 检索时降权而非消失，否则团队会重复踩同一个已被否决的方案。
 func TestDeprecatedCardStaysRetrievable(t *testing.T) {

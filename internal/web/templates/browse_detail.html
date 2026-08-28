@@ -8,6 +8,13 @@
     {{if .Memory.Labels}}<p>{{range .Memory.Labels}}<span class="tag">{{.}}</span> {{end}}</p>{{end}}
   </div>
 {{else}}
+  {{if .DuplicateCandidates}}
+    <section class="card alert notice" aria-labelledby="duplicate-heading">
+      <h2 id="duplicate-heading">重复候选</h2>
+      <p>这些卡片的核心内容相同或高度相似。请人工确认哪一张应作为当前版本；系统不会自动删除或合并。</p>
+      <ul>{{range .DuplicateCandidates}}<li><a href="/browse/{{.Card.ID}}?kind=card">{{.Card.Title}}</a>　{{if .Exact}}<strong>内容相同</strong>{{else}}语义相似 {{printf "%.0f%%" (mul100 .Score)}}{{end}}</li>{{end}}</ul>
+    </section>
+  {{end}}
   <div class="card">
     <p class="hint">
       状态 {{.Card.Status}}　类型 {{.Card.CardType}}　版本 {{.Card.Version}}　更新于 {{stamp .Card.UpdatedAt}}
@@ -31,12 +38,12 @@
 
 {{if .Links}}
 <h2>关联</h2>
-<table class="grid">
+<div class="table-scroll"><table class="grid">
   <thead><tr><th>方向</th><th>类型</th><th>对端</th><th>说明</th></tr></thead>
   <tbody>{{range .Links}}
     <tr><td>{{.From.Type}} → {{.To.Type}}</td><td>{{.Kind}}</td><td><code>{{.To.ID}}</code></td><td>{{.Note}}</td></tr>
   {{end}}</tbody>
-</table>
+</table></div>
 <p class="hint">关联只给 ID 不解析标题——对端可能在你无权访问的空间里。</p>
 {{end}}
 {{end}}

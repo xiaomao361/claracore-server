@@ -186,15 +186,17 @@ Desktop 的教训：全表扫 + 单线程算余弦。Server 版拆成两段：
 - **默认跨**用户全部可读空间
 - 结果**必须标注来源空间**——agent 据此判断权威性：team = 已达成共识，personal = 个人经验
 - 工具参数支持显式 `spaces: [...]` 限定作为逃生舱
-- 排序中空间层级参与权重（team > project > personal 为建议默认，可配 —— 待定项）
+- 排序中空间层级只在分数接近时作为 tie-break（team > project > personal），不做无评估依据的可配权重
 
 ### 5.3 Embedding 与缓存
 
 `embeddings` 表持有 `content_hash`：
 
 - 内容未变则不重算，直接复用
-- 同时作为 Redis 缓存的 key（`hash(text + model)`），embedding 结果可永久缓存
+- 可作为未来 Redis 查询向量缓存的 key（`hash(text + model)`）；当前尚未实现该缓存端口
 - 换 embedding 模型时按 `model` 列区分，新旧共存，可灰度重建
+
+自动上下文复用 Desktop 的确定性 Stage B：只接收已通过权限过滤且带语义分数的 Card，按可配置的最低分与 top-2 差值门槛筛选，弱相关、歧义或无向量时均 fail closed，最多返回 top-1 只读证据块。Server 不再调用第二个大模型；终端 Agent 配置的大模型负责最终语境判断。它不参与显式 `card_recall`，也不生成或改写知识。
 
 ---
 
@@ -403,7 +405,7 @@ CREATE TABLE links (
   from_id       CHAR(26)     NOT NULL,
   to_type       VARCHAR(16)  NOT NULL,
   to_id         CHAR(26)     NOT NULL,
-  kind          VARCHAR(32)  NOT NULL,       -- related | causes | evolved-from | contradicts | part-of
+  kind          VARCHAR(32)  NOT NULL,       -- related | causes | evolved-from | contradicts | part-of | supersedes
   note          TEXT             NULL,
   created_at    DATETIME(3)  NOT NULL,
   PRIMARY KEY (id),
@@ -469,7 +471,16 @@ CREATE TABLE audit_logs (
 
 > **0006 的实现边界**：`metadata` 不是任意请求/响应快照。Host 只允许 ID、命中计数与语义标志等安全字段；query、situation、正文、密码、token 与错误文本不能写入。可选 ID 不符合定长 ASCII 存储形状时只丢目标维度，metadata 超过 8 KiB 时只丢补充信息，两者都不能让主 action/outcome 事件丢失。管理员完整查询必须先成功写入 `meta_audit`，否则拒绝查询。0811 的 `make migrate` 与 `make itest` 已验证开发 MySQL 上的实际结构、可见性、分页与清理契约。
 
-> `shared_line`（Continuity）表结构从 Desktop 契约平移，待 `03-mcp-contract.md` 对齐工具语义后补充。
+### 7.1 Continuity（0008）
+
+`0008_continuity.sql` 已落地四张 tenant-scoped 表：
+
+- `continuity_lines`：稳定 owner（user + agent）、标题与 active/archived 状态；不加 `space_id`。
+- `continuity_positions`：每条 line 唯一一行当前位置，保存摘要、解释状态、事实 ID、下一步、当前 writer 与乐观锁 `version`。
+- `continuity_position_history`：每次成功位置写入都追加不可变快照，保留 writer provenance。
+- `continuity_handoffs`：里程碑交接，保存目标、已完成、待办、下一步与 writer。
+
+所有定位 SQL 同时带 `tenant_id` 与 `line_id`。跨 agent 显式更新只改变 position/handoff 的 writer，不改变 line owner；不传 `lineId` 且当前 agent 有多条 active line 时拒绝写入。Shared Line 是可恢复工作位置，不是第二套事实库，`facts_used` 仅保存事实 ID。
 
 ---
 

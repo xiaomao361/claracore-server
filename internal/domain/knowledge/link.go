@@ -17,6 +17,7 @@ const (
 	LinkEvolvedFrom = "evolved-from"
 	LinkContradicts = "contradicts"
 	LinkPartOf      = "part-of"
+	LinkSupersedes  = "supersedes"
 )
 
 // Link 是一条有向关联。
@@ -37,11 +38,13 @@ type Link struct {
 
 func validLinkKind(k string) bool {
 	switch k {
-	case LinkRelated, LinkCauses, LinkEvolvedFrom, LinkContradicts, LinkPartOf:
+	case LinkRelated, LinkCauses, LinkEvolvedFrom, LinkContradicts, LinkPartOf, LinkSupersedes:
 		return true
 	}
 	return false
 }
+
+func validUserLinkKind(k string) bool { return validLinkKind(k) && k != LinkSupersedes }
 
 func (l *Link) validate() error {
 	if l.TenantID == "" {
@@ -60,7 +63,7 @@ func (l *Link) validate() error {
 	}
 	l.Kind = strings.TrimSpace(l.Kind)
 	if !validLinkKind(l.Kind) {
-		return fmt.Errorf("%w: 关联类型取值非法 %q（可选 related/causes/evolved-from/contradicts/part-of）",
+		return fmt.Errorf("%w: 关联类型取值非法 %q（可选 related/causes/evolved-from/contradicts/part-of/supersedes）",
 			ErrInvalidArgument, l.Kind)
 	}
 	return nil

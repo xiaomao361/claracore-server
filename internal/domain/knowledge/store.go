@@ -59,6 +59,9 @@ type Store interface {
 	// 下次重扫仍然要认出它是同一份源——否则会新建一张，
 	// 而那个「已经判过这份文档没用」的决定就被悄悄推翻了。
 	FindCardBySourceKey(ctx context.Context, tenantID, spaceID platform.ID, sourceKey string) (*Card, error)
+	// ListCardsBySource 返回一个可枚举摄取源过去写入的全部卡片，
+	// 用于全量扫描后的来源删除检测；不解释状态，也不自动删除。
+	ListCardsBySource(ctx context.Context, tenantID, spaceID platform.ID, sourceName string) ([]Card, error)
 
 	UpdateCard(ctx context.Context, c Card, expectedVersion int) error
 
@@ -183,6 +186,16 @@ type Store interface {
 	// MarkEmbeddingsFailed 批量标记失败：累加 attempts、记下原因。
 	// 行不删——「这条内容算不出向量」本身是要给运维看的信息。
 	MarkEmbeddingsFailed(ctx context.Context, ids []platform.ID, reason string, at time.Time) error
+
+	// 三类 Missing 查询只取当前可检索但尚无指定模型行的实体。
+	// 文本如何拼仍由领域层唯一决定，SQL 不复制 embedding 语义。
+	ListMemoriesMissingEmbedding(ctx context.Context, tenantID platform.ID, model string, limit int) ([]Memory, error)
+	ListCardsMissingEmbedding(ctx context.Context, tenantID platform.ID, model string, limit int) ([]Card, error)
+	ListTriggersMissingEmbedding(ctx context.Context, tenantID platform.ID, model string, limit int) ([]RecallTrigger, error)
+
+	EmbeddingStats(ctx context.Context, tenantID platform.ID, model string, maxAttempts int) (EmbeddingStats, error)
+	ListEmbeddingFailures(ctx context.Context, tenantID platform.ID, model string, limit int) ([]Embedding, error)
+	RetryEmbeddingFailures(ctx context.Context, tenantID platform.ID, model string, at time.Time) (int, error)
 
 	// --- Link ---
 

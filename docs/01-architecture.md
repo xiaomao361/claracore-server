@@ -97,7 +97,7 @@ Desktop 唯一的 npm 依赖是 `@xenova/transformers`（本地 ONNX 推理）�
 
 **Server 版不做本地 embedding**，一律走 HTTP：
 
-- Ollama（`/api/embeddings`）
+- Ollama（`/api/embed`，批量输入）
 - OpenAI-compatible 接口
 
 纯 HTTP 调用，Go 无任何劣势。本地推理在服务端是负担而非资产。
@@ -139,17 +139,16 @@ Desktop 唯一的 npm 依赖是 `@xenova/transformers`（本地 ONNX 推理）�
                     │              │              │
                     │  ┌───────────▼───────────┐  │
                     │  │   Ports (interfaces)  │  │  ← 端口层
-                    │  │ Store/Cache/Locker/   │  │
-                    │  │ RateLimiter/Embedder/ │  │
-                    │  │ VectorIndex/EventStore│  │
+                    │  │ Domain Store /        │  │
+                    │  │ Embedder / Stage B    │  │
                     │  └───────────┬───────────┘  │
                     └──────────────┼──────────────┘
                                    │
               ┌────────────────────┼────────────────────┐
               ▼                    ▼                    ▼
         ┌──────────┐         ┌──────────┐        ┌──────────┐
-        │  MySQL   │         │  Redis   │        │ Embedding│
-        │          │         │ (可选)    │        │  Service │
+        │  MySQL   │         │  Redis   │        │ Ollama / │
+        │          │         │ (可选)    │        │ API 服务  │
         └──────────┘         └──────────┘        └──────────┘
 ```
 
@@ -247,8 +246,8 @@ Web 会话过期不影响 agent 连接；token 吊销不影响网页登录。
 
 | 端口 | 默认实现 | Redis 实现 | 何时需要 Redis |
 |---|---|---|---|
-| `Cache` | 进程内 LRU | Redis | 多实例部署 |
-| `Embedder` 缓存 | 进程内 / 数据库表 | Redis | **价值最高**：`hash(text+model)` 永久缓存，直接省掉重复 API 调用 |
+| `Cache` | 进程内有界 LRU（已用于 embedding） | Redis | 多实例部署 |
+| `Embedder` 缓存 | `hash(text+model)` + TTL，默认 1024 条（已实现） | Redis | 多实例共享命中与跨重启保留 |
 | `RateLimiter` | 进程内计数 | Redis 滑动窗口 | 租户级配额、多实例 |
 | `Locker` | 数据库行锁 | Redis 分布式锁 | **多实例部署时必须** |
 | `SessionStore` | 数据库 | Redis | 多实例部署 |
@@ -395,24 +394,23 @@ location /mcp {
 | **复杂 RBAC** | 只分读写。角色体系的复杂度不匹配当前场景 |
 | **自助注册流程** | 管理员分配账号，见 §5.4 |
 | **前后端分离** | 会把 npm 生态与构建链请回来，抵消单二进制部署优势 |
-| **Resumability（第一版）** | 见 §4.3 |
 | **复用 Desktop 代码** | 语言不同，且 Desktop 携带大量本地单用户假设。共享契约而非代码 |
 
 ---
 
 ## 11. 决策记录与剩余待定
 
-### 11.0 实现进度（2026-08-11）
+### 11.0 实现进度（2026-08-27）
 
 | 部分 | 状态 |
 |---|---|
 | 治理域（tenant / user / agent / token / space / permission） | ✅ 已落地，真库跑通 |
 | 核心域写入侧（memory / card / 召回条件 / 标签 / 关联 / promote） | ✅ 已落地 |
 | 两段式检索 + 索引队列 + Embedder | ✅ 已落地，真模型验证过召回质量 |
-| MCP 工作面 | ✅ 16/20（缺 Continuity 4 个） |
-| Continuity（shared_line） | ❌ `internal/domain/continuity` 是空目录 |
-| Web 管理面 | ⚠️ 登录 / 成员 / token / 概览 / 内容浏览 / 卡片审核已落地。**活动流与管理员完整审计 0811 已落地**（`/activity`，可见性 SQL 下推，管理员全量需二次确认并先写 meta-audit）——§10 说的「消除黑盒」已有承载页。剩余欠账是把已验收的 Web 生产设计同步进 SSR 模板与 CSS |
-| 摄取 | ⚠️ 本地 Markdown 目录已通（幂等、失败清单、draft 产物），CLI 入口。Web 管理页与删除检测未做 |
+| MCP 工作面 | ✅ 24/24，统一 token 身份、错误映射与活动审计；自动上下文用确定性 Stage B 预筛，终端 Agent 最终判断，并有反馈治理与 30 天 outcome 汇总 |
+| Continuity（shared_line） | ✅ 领域层、MySQL、5 个 MCP 工具、归档/恢复、位置/交接历史与 exact resume packet 已落地 |
+| Web 管理面 | ✅ 登录、成员/token、空间权限、摄取、索引、内容/审核、活动与完整审计均已落地；生产工作台视觉已同步进 SSR，待目标服务器 1440/390px 人工验收 |
+| 摄取 | ✅ CLI + Web 管理页、幂等摄取、失败清单、完整扫描下的缺失源检测已落地；缺失检测非破坏性 |
 | 外部源连接（odoc 等） | ❌ 第二版 |
 
 各条决策的落地细节与偏差见 `HANDOFF.md`；本节只回答「做到哪儿了」。

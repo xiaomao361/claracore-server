@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
 )
@@ -38,6 +40,63 @@ type fakeKnow struct {
 	search knowledge.MemorySearchResult
 	recall knowledge.CardSearchResult
 	stats  []knowledge.SpaceStats
+}
+
+type fakeContinuity struct {
+	lastList    continuity.ListInput
+	lastGet     continuity.GetInput
+	lastUpdate  continuity.UpdateInput
+	lastHandoff continuity.HandoffInput
+
+	err    error
+	lines  []continuity.LineSummary
+	packet continuity.ResumePacket
+}
+
+func (f *fakeContinuity) SetStatus(_ context.Context, in continuity.SetStatusInput) (continuity.ResumePacket, error) {
+	f.packet.Line.Status = in.Status
+	return f.packet, f.err
+}
+
+func newFakeContinuity() *fakeContinuity {
+	now := time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)
+	line := continuity.Line{
+		ID: "01LINEAAAAAAAAAAAAAAAAAAAA", TenantID: tenantA, OwnerUserID: userClar, OwnerAgentID: agentClara,
+		Title: "Clara Shared Line", Status: continuity.LineActive, CreatedAt: now, UpdatedAt: now,
+		Position: &continuity.Position{
+			ID: "01POSITIONAAAAAAAAAAAAAAAA", TenantID: tenantA, LineID: "01LINEAAAAAAAAAAAAAAAAAAAA",
+			Summary: "当前进展", InterpretationStatus: continuity.PositionActive, NextStep: "继续验证",
+			WriterUserID: userClar, WriterAgentID: agentClara, Version: 1, UpdatedAt: now,
+		},
+	}
+	return &fakeContinuity{
+		lines: []continuity.LineSummary{{
+			ID: line.ID, OwnerAgentID: line.OwnerAgentID, Title: line.Title, Status: line.Status,
+			Summary: line.Position.Summary, InterpretationStatus: line.Position.InterpretationStatus,
+			NextStep: line.Position.NextStep, UpdatedAt: now,
+		}},
+		packet: continuity.ResumePacket{Line: line},
+	}
+}
+
+func (f *fakeContinuity) List(_ context.Context, in continuity.ListInput) ([]continuity.LineSummary, error) {
+	f.lastList = in
+	return f.lines, f.err
+}
+
+func (f *fakeContinuity) Get(_ context.Context, in continuity.GetInput) (continuity.ResumePacket, error) {
+	f.lastGet = in
+	return f.packet, f.err
+}
+
+func (f *fakeContinuity) Update(_ context.Context, in continuity.UpdateInput) (continuity.ResumePacket, error) {
+	f.lastUpdate = in
+	return f.packet, f.err
+}
+
+func (f *fakeContinuity) Handoff(_ context.Context, in continuity.HandoffInput) (continuity.ResumePacket, error) {
+	f.lastHandoff = in
+	return f.packet, f.err
 }
 
 func newFakeKnow() *fakeKnow {
@@ -154,6 +213,18 @@ func (f *fakeKnow) RecallCards(_ context.Context, in knowledge.RecallCardsInput)
 	return f.recall, nil
 }
 
+func (f *fakeKnow) RecallCardForContext(_ context.Context, in knowledge.RecallCardsInput) (knowledge.AutomaticRecallResult, error) {
+	f.lastRecall = in
+	if err := f.bump(); err != nil {
+		return knowledge.AutomaticRecallResult{}, err
+	}
+	if len(f.recall.Hits) == 0 {
+		return knowledge.AutomaticRecallResult{Reason: "no_candidates", SemanticAvailable: f.recall.SemanticAvailable, PolicyAvailable: true}, nil
+	}
+	hit := f.recall.Hits[0]
+	return knowledge.AutomaticRecallResult{Hit: &hit, Reason: "high_confidence_top1", SemanticAvailable: f.recall.SemanticAvailable, PolicyAvailable: true}, nil
+}
+
 func (f *fakeKnow) CreateLink(_ context.Context, in knowledge.LinkInput) (knowledge.Link, error) {
 	f.lastLink = in
 	if err := f.bump(); err != nil {
@@ -219,6 +290,53 @@ func contentText(result map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func TestSharedLineUsesTokenIdentityAndReturnsExactPacket(t *testing.T) {
+	srv, _, cont := newToolHostWithActivityAndContinuity(t, newFakeActivity())
+
+	out, errMsg := callTool(t, srv, "ccs_valid_clara", "shared_line_update", map[string]any{
+		"summary":              "已完成 MCP 接入",
+		"interpretationStatus": "active",
+		"factsUsed":            []string{"01MEMORYAAAAAAAAAAAAAAAAAA"},
+		"nextStep":             "运行集成测试",
+		"version":              1,
+	})
+	if errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	if cont.lastUpdate.TenantID != tenantA || cont.lastUpdate.UserID != userClar || cont.lastUpdate.AgentID != agentClara {
+		t.Fatalf("Shared Line 身份必须来自 token，实际 tenant=%s user=%s agent=%s",
+			cont.lastUpdate.TenantID, cont.lastUpdate.UserID, cont.lastUpdate.AgentID)
+	}
+	if cont.lastUpdate.Title != "Clara Shared Line" {
+		t.Fatalf("新建时应生成稳定默认标题，实际 %q", cont.lastUpdate.Title)
+	}
+	var packet resumePacketOut
+	decodeInto(t, out, &packet)
+	if packet.Line.ID != "01LINEAAAAAAAAAAAAAAAAAAAA" || packet.Line.Position == nil || packet.Line.Position.Version != 1 {
+		t.Fatalf("更新确认必须返回 exact line 的完整恢复包，实际 %+v", packet)
+	}
+}
+
+func TestSharedLineErrorsHaveStableCodes(t *testing.T) {
+	srv, _, cont := newToolHostWithActivityAndContinuity(t, newFakeActivity())
+	cont.err = &continuity.LineIDRequiredError{Candidates: []continuity.LineSummary{
+		{ID: "01LINEAAAAAAAAAAAAAAAAAAAA", Title: "发布收口"},
+		{ID: "01LINEBBBBBBBBBBBBBBBBBBBB", Title: "记忆库"},
+	}}
+	_, errMsg := callTool(t, srv, "ccs_valid_clara", "shared_line_get", nil)
+	if !strings.Contains(errMsg, codeLineIDRequired) || !strings.Contains(errMsg, "01LINEAAAAAAAAAAAAAAAAAAAA") {
+		t.Fatalf("多线歧义应返回稳定码与候选，实际 %q", errMsg)
+	}
+
+	cont.err = &continuity.VersionConflictError{Current: 7}
+	_, errMsg = callTool(t, srv, "ccs_valid_clara", "shared_line_update", map[string]any{
+		"lineId": "01LINEAAAAAAAAAAAAAAAAAAAA", "summary": "冲突更新", "version": 6,
+	})
+	if !strings.Contains(errMsg, codeConflict) || !strings.Contains(errMsg, "7") {
+		t.Fatalf("并发冲突应返回 VERSION_CONFLICT 与当前版本，实际 %q", errMsg)
+	}
 }
 
 func decodeInto(t *testing.T, raw map[string]any, dst any) {
@@ -408,8 +526,8 @@ func TestToolSchemasHaveNoIdentityParams(t *testing.T) {
 		t.Fatalf("tools/list 失败: %s", resp.raw)
 	}
 	tools, _ := result["tools"].([]any)
-	if len(tools) < 15 {
-		t.Fatalf("工具数量异常，实际 %d 个", len(tools))
+	if len(tools) != 24 {
+		t.Fatalf("契约应恰好注册 24 个工具，实际 %d 个", len(tools))
 	}
 
 	banned := []string{"userid", "tenantid", "agentid", "authoruserid"}
@@ -433,18 +551,20 @@ func TestToolSchemasHaveNoIdentityParams(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"whoami", "server_status",
+		"whoami", "server_status", "gateway_auto_context", "gateway_context_feedback", "context_quality_status",
 		"memoria_create", "memoria_search", "memoria_get", "memoria_update", "memoria_delete", "memoria_link",
 		"card_create", "card_recall", "card_search", "card_get", "card_update",
 		"space_list", "promote", "space_stats",
+		"shared_line_list", "shared_line_get", "shared_line_update", "shared_line_handoff",
+		"shared_line_status",
 	} {
 		if !names[want] {
 			t.Errorf("契约里的工具 %s 没有注册", want)
 		}
 	}
-	// 工具数量控制在 20 以内是明确目标（03 §1）：每个 schema 都占 agent 的上下文
-	if len(tools) > 20 {
-		t.Errorf("工具数量 %d 超过 20，维护类操作应该归 Web 治理面而不是塞进 MCP", len(tools))
+	// 自动上下文是核心运行面能力，仍给少量增长留出硬上限。
+	if len(tools) > 24 {
+		t.Errorf("工具数量 %d 超过 24，维护类操作应该归 Web 治理面而不是塞进 MCP", len(tools))
 	}
 }
 
@@ -721,6 +841,47 @@ func TestServerStatusReportsSemanticSearch(t *testing.T) {
 	// 是同一件事
 	if enabled, _ := out["semanticSearch"].(bool); !enabled {
 		t.Fatalf("应如实报告是否接了语义检索，实际 %+v", out)
+	}
+}
+
+func TestServerStatusReportsEmbeddingCacheCounters(t *testing.T) {
+	srv, _, _ := newToolHostWithActivityAndContinuity(t, newFakeActivity(), HostOptions{
+		Version: "test", SemanticSearch: true,
+		EmbeddingCacheStats: func() (uint64, uint64, bool) { return 7, 3, true },
+	})
+	out, errMsg := callTool(t, srv, "ccs_valid_clara", "server_status", nil)
+	if errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	cache, _ := out["embeddingCache"].(map[string]any)
+	if cache["enabled"] != true || cache["hits"] != float64(7) || cache["misses"] != float64(3) {
+		t.Fatalf("缓存状态不完整: %+v", out)
+	}
+}
+
+func TestContextQualityStatusReportsSubmittedFeedbackWithoutClaimingAccuracy(t *testing.T) {
+	since := time.Date(2026, 7, 29, 1, 2, 3, 0, time.UTC)
+	activities := newFakeActivity()
+	activities.quality = activity.ContextFeedbackQuality{
+		Since: since, Delivered: 2, Used: 3, Ignored: 1, Wrong: 1, Corrected: 1,
+	}
+	srv, _ := newToolHostWithActivity(t, activities)
+
+	out, errMsg := callTool(t, srv, "ccs_valid_clara", "context_quality_status", nil)
+	if errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	if out["submitted"] != float64(8) || out["used"] != float64(3) || out["wrong"] != float64(1) {
+		t.Fatalf("反馈计数不完整: %+v", out)
+	}
+	if caveat, _ := out["caveat"].(string); !strings.Contains(caveat, "不是自动上下文准确率") {
+		t.Fatalf("必须明确反馈计数不等于准确率: %+v", out)
+	}
+	activities.mu.Lock()
+	tenant, window := activities.qualityTenant, activities.qualityWindow
+	activities.mu.Unlock()
+	if tenant != tenantA || window != 30*24*time.Hour {
+		t.Fatalf("查询必须来自 token 租户并限制到 30 天: tenant=%s window=%s", tenant, window)
 	}
 }
 

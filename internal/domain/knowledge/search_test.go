@@ -507,6 +507,102 @@ func TestRecallLimitCountsCardsNotTriggers(t *testing.T) {
 	}
 }
 
+func TestRecallCollapsesPromotedCardLineageButKeepsIndependentCards(t *testing.T) {
+	svc, store, _ := newSearchService(t, "删除")
+	original := seedCard(t, svc, spacePriv, withCard("原始经验", "准备删除数据时"))
+	copy := seedCard(t, svc, spaceTeam, withCard("团队副本", "准备删除数据时"))
+	copy.CopiedFrom = &Origin{Type: EntityCard, ID: original.ID}
+	store.cards[copy.ID] = copy
+	independent := seedCard(t, svc, spacePriv, withCard("独立经验", "准备删除数据时"))
+	indexAll(t, svc)
+
+	res, err := svc.RecallCards(context.Background(), RecallCardsInput{
+		TenantID: tenantA, Spaces: readable(mySpaces()...), Situation: "我准备删除数据", Limit: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hits) != 2 {
+		t.Fatalf("原件与提升副本应折叠为一条，另一个独立卡片保留，实际 %d: %+v", len(res.Hits), res.Hits)
+	}
+	ids := map[platform.ID]bool{}
+	for _, hit := range res.Hits {
+		ids[hit.Card.ID] = true
+	}
+	if ids[original.ID] && ids[copy.ID] {
+		t.Fatal("同一 copied_from 谱系不应重复占用召回名额")
+	}
+	if !ids[independent.ID] {
+		t.Fatal("谱系折叠不能误删独立卡片")
+	}
+}
+
+func TestAutomaticRecallUsesDeterministicStageB(t *testing.T) {
+	t.Run("semantic unavailable", func(t *testing.T) {
+		svc, _ := newSearchServiceNoEmbedder(t)
+		seedCard(t, svc, spacePriv, withCard("删除前恢复验证", "准备删除数据时"))
+		got, err := svc.RecallCardForContext(context.Background(), RecallCardsInput{TenantID: tenantA, Spaces: readable(spacePriv), Situation: "准备删除数据"})
+		if err != nil || got.Hit != nil || got.PolicyAvailable || got.Reason != "semantic_unavailable" {
+			t.Fatalf("无语义证据必须放弃: %+v err=%v", got, err)
+		}
+	})
+
+	t.Run("high confidence top1", func(t *testing.T) {
+		svc, _, _ := newSearchService(t, "删除")
+		card := seedCard(t, svc, spacePriv, withCard("删除前恢复验证", "准备删除数据时"))
+		indexAll(t, svc)
+		got, err := svc.RecallCardForContext(context.Background(), RecallCardsInput{TenantID: tenantA, Spaces: readable(spacePriv), Situation: "准备删除数据"})
+		if err != nil || got.Hit == nil || got.Hit.Card.ID != card.ID || !got.PolicyAvailable || got.Reason != "high_confidence_top1" {
+			t.Fatalf("高置信首条应交给终端 Agent: %+v err=%v", got, err)
+		}
+	})
+
+	t.Run("low relevance", func(t *testing.T) {
+		svc, _, _ := newSearchService(t, "删除", "数据", "恢复", "备份")
+		seedCard(t, svc, spacePriv, withCard("删除前恢复验证", "删除 数据 恢复 备份"))
+		indexAll(t, svc)
+		got, err := svc.RecallCardForContext(context.Background(), RecallCardsInput{TenantID: tenantA, Spaces: readable(spacePriv), Situation: "删除"})
+		if err != nil || got.Hit != nil || got.Reason != "low_relevance" {
+			t.Fatalf("低分必须放弃: %+v err=%v", got, err)
+		}
+	})
+
+	t.Run("ambiguous top results", func(t *testing.T) {
+		svc, _, _ := newSearchService(t, "删除")
+		seedCard(t, svc, spacePriv, withCard("恢复验证 A", "准备删除数据时"))
+		seedCard(t, svc, spacePriv, withCard("恢复验证 B", "准备删除数据时"))
+		indexAll(t, svc)
+		got, err := svc.RecallCardForContext(context.Background(), RecallCardsInput{TenantID: tenantA, Spaces: readable(spacePriv), Situation: "准备删除数据"})
+		if err != nil || got.Hit != nil || got.Reason != "ambiguous_top_results" {
+			t.Fatalf("歧义首条必须放弃: %+v err=%v", got, err)
+		}
+	})
+}
+
+func TestMemorySearchTimeViewSeparatesCurrentAndHistorical(t *testing.T) {
+	svc, store := newSearchServiceNoEmbedder(t)
+	current := seedMemory(t, svc, spacePriv)
+	historical := seedMemory(t, svc, spacePriv)
+	h := store.memories[historical.ID]
+	h.Status = MemorySuperseded
+	store.memories[historical.ID] = h
+	base := SearchMemoriesInput{TenantID: tenantA, Spaces: readable(spacePriv), Limit: 10}
+	cur, err := svc.SearchMemories(context.Background(), base)
+	if err != nil || len(cur.Hits) != 1 || cur.Hits[0].Memory.ID != current.ID {
+		t.Fatalf("current=%+v err=%v", cur.Hits, err)
+	}
+	base.TimeView = "historical"
+	hist, err := svc.SearchMemories(context.Background(), base)
+	if err != nil || len(hist.Hits) != 1 || hist.Hits[0].Memory.ID != historical.ID {
+		t.Fatalf("historical=%+v err=%v", hist.Hits, err)
+	}
+	base.TimeView = "all"
+	all, err := svc.SearchMemories(context.Background(), base)
+	if err != nil || len(all.Hits) != 2 {
+		t.Fatalf("all=%+v err=%v", all.Hits, err)
+	}
+}
+
 func TestRecallWorksWithoutEmbedder(t *testing.T) {
 	svc, _ := newTestService(t) // 降级形态
 	seedCard(t, svc, spacePriv, withCard("备份成功不等于数据可恢复", "准备删除聊天记录时"))

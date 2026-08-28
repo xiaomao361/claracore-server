@@ -24,6 +24,7 @@ type knowledgeService interface {
 	UpdateCard(ctx context.Context, in knowledge.UpdateCardInput) (knowledge.Card, error)
 	SearchCards(ctx context.Context, in knowledge.SearchCardsInput) (knowledge.CardSearchResult, error)
 	RecallCards(ctx context.Context, in knowledge.RecallCardsInput) (knowledge.CardSearchResult, error)
+	RecallCardForContext(ctx context.Context, in knowledge.RecallCardsInput) (knowledge.AutomaticRecallResult, error)
 
 	CreateLink(ctx context.Context, in knowledge.LinkInput) (knowledge.Link, error)
 	DeleteLink(ctx context.Context, in knowledge.LinkInput) error

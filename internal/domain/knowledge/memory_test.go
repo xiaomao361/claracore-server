@@ -76,6 +76,26 @@ func TestCreateMemoryNormalizesLabels(t *testing.T) {
 	}
 }
 
+func TestCreateMemoryCanAtomicallySupersedeOldFact(t *testing.T) {
+	svc, store := newTestService(t)
+	old := seedMemory(t, svc, spacePriv)
+	current, err := svc.CreateMemory(context.Background(), CreateMemoryInput{
+		TenantID: tenantA, SpaceID: spacePriv, AuthorUserID: userA,
+		Title: "当前连接池配置", Body: "MaxOpenConns 现在固定为 32。",
+		SupersedesID: old.ID, WritableSpaces: mySpaces(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.memories[old.ID]; got.Status != MemorySuperseded || got.Version != old.Version+1 {
+		t.Fatalf("旧事实没有转历史: %+v", got)
+	}
+	links, err := store.ListLinks(context.Background(), tenantA, Ref{EntityMemory, current.ID})
+	if err != nil || len(links) != 1 || links[0].Kind != LinkSupersedes || links[0].To.ID != old.ID {
+		t.Fatalf("替代链不正确: %+v err=%v", links, err)
+	}
+}
+
 func TestCreateMemoryRejectsMissingFields(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()

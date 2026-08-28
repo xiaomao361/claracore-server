@@ -4,19 +4,22 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
+	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 )
 
 // 对外错误码。agent 按码分支，不解析文案——文案会变，码不会。
 const (
-	codeForbidden = "FORBIDDEN"
-	codeNotFound  = "NOT_FOUND"
-	codeInvalid   = "INVALID_ARGUMENT"
-	codeConflict  = "VERSION_CONFLICT"
-	codeDataFault = "DATA_FAULT"
-	codeInternal  = "INTERNAL"
+	codeForbidden      = "FORBIDDEN"
+	codeNotFound       = "NOT_FOUND"
+	codeInvalid        = "INVALID_ARGUMENT"
+	codeConflict       = "VERSION_CONFLICT"
+	codeDataFault      = "DATA_FAULT"
+	codeInternal       = "INTERNAL"
+	codeLineIDRequired = "SHARED_LINE_ID_REQUIRED"
 )
 
 // toolError 是**唯一**的领域错误 → 协议错误映射点
@@ -103,6 +106,41 @@ func toolError(logger *slog.Logger, tool string, err error) error {
 	// 触发了就是数据损坏导致的跨租户越权。必须留下日志。
 	case errors.Is(err, knowledge.ErrTenantMismatch):
 		logger.Error("数据异常：取到的内容不属于当前租户", "tool", tool, "error", err)
+		return protocolError(codeDataFault, "数据异常，请联系管理员")
+
+	// --- Continuity / Shared Line ---
+	case errors.Is(err, continuity.ErrLineIDRequired):
+		var required *continuity.LineIDRequiredError
+		if errors.As(err, &required) {
+			candidates := make([]string, 0, len(required.Candidates))
+			for _, candidate := range required.Candidates {
+				// 候选目录本来就是 shared_line_list 的可见内容；仍限制条数，避免
+				// 错误通道被意外变成一个无界列表接口。
+				if len(candidates) == 3 {
+					break
+				}
+				candidates = append(candidates, fmt.Sprintf("%s (%s)", candidate.ID, candidate.Title))
+			}
+			return protocolError(codeLineIDRequired, "当前 agent 有多条 active Shared Line，请明确 lineId。候选："+strings.Join(candidates, "；"))
+		}
+		return protocolError(codeLineIDRequired, "当前 agent 有多条 active Shared Line，请明确 lineId")
+
+	case errors.Is(err, continuity.ErrVersionConflict):
+		var conflict *continuity.VersionConflictError
+		if errors.As(err, &conflict) {
+			return protocolError(codeConflict,
+				fmt.Sprintf("Shared Line 已被他人修改，当前位置版本 %d。请重新 get 后再改", conflict.Current))
+		}
+		return protocolError(codeConflict, "Shared Line 已被他人修改，请重新 get 后再改")
+
+	case errors.Is(err, continuity.ErrNotFound):
+		return protocolError(codeNotFound, "Shared Line 不存在或不可用")
+
+	case errors.Is(err, continuity.ErrInvalidArgument):
+		return protocolError(codeInvalid, err.Error())
+
+	case errors.Is(err, continuity.ErrTenantMismatch):
+		logger.Error("数据异常：Shared Line 不属于当前租户", "tool", tool, "error", err)
 		return protocolError(codeDataFault, "数据异常，请联系管理员")
 
 	case errors.Is(err, errNoIdentity):

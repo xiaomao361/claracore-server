@@ -1,0 +1,41 @@
+{{define "content"}}
+<section class="card">
+  <p>从服务器已配置目录中扫描 Markdown，并幂等写入草稿卡片。来源名称用于跨机器识别同一批文档，请保持稳定。</p>
+  {{if .Root}}<p class="hint">允许的根目录：<code>{{.Root}}</code></p>{{end}}
+  <form method="post" action="/admin/ingest">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label>目标空间
+      <select name="space" required {{if not .Enabled}}disabled{{end}}>
+        <option value="">请选择可写空间</option>
+        {{range .Spaces}}<option value="{{.ID}}" {{if eq $.Selected .ID}}selected{{end}}>{{.Name}}（{{.Type}}）</option>{{end}}
+      </select>
+    </label>
+    <label>稳定来源名称<input name="source" value="{{.SourceName}}" maxlength="120" required placeholder="team-handbook" {{if not .Enabled}}disabled{{end}}></label>
+    <label>根目录下的相对目录<input name="dir" value="{{.RelativeDir}}" placeholder="docs（留空扫描整个根目录）" {{if not .Enabled}}disabled{{end}}></label>
+    <button type="submit" {{if not .Enabled}}disabled{{end}}>开始扫描并导入</button>
+  </form>
+</section>
+
+{{if .ScanWarning}}<p class="alert notice">{{.ScanWarning}}</p>{{end}}
+{{if .Ran}}
+<section class="card">
+  <h2>本轮结果</h2>
+  <div class="ingest-summary">
+    <span>新建 <strong>{{.Report.Created}}</strong></span>
+    <span>更新 <strong>{{.Report.Updated}}</strong></span>
+    <span>未变化 <strong>{{.Report.Unchanged}}</strong></span>
+    <span>失败 <strong>{{len .Report.Failed}}</strong></span>
+    <span>源文件缺失 <strong>{{len .Report.Missing}}</strong></span>
+  </div>
+  {{if .Report.Failed}}
+  <h3>失败项</h3>
+  <ul>{{range .Report.Failed}}<li><code>{{.SourcePath}}</code>：{{.Reason}}</li>{{end}}</ul>
+  {{end}}
+  {{if .Report.Missing}}
+  <h3>源文件缺失（仅报告，未自动修改卡片）</h3>
+  <ul>{{range .Report.Missing}}<li><code>{{.SourcePath}}</code>，卡片 <code>{{.CardID}}</code></li>{{end}}</ul>
+  {{end}}
+</section>
+{{end}}
+<p class="hint">只有完整扫描成功时才检测缺失；发现缺失也不会自动废弃或删除卡片，以保留人工提炼结果。</p>
+{{end}}

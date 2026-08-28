@@ -15,13 +15,14 @@ import (
 )
 
 type Config struct {
-	Env       string
-	Addr      string
-	MySQL     MySQL
-	Redis     Redis
-	Embedding Embedding
-	Password  Password
-	Web       Web
+	Env         string
+	Addr        string
+	MySQL       MySQL
+	Redis       Redis
+	Embedding   Embedding
+	AutoContext AutoContext
+	Password    Password
+	Web         Web
 }
 
 // Web 是治理面的配置。
@@ -39,6 +40,10 @@ type Web struct {
 	// 症状是「登录成功但立刻又跳回登录页」——一个没人第一次就能猜对的
 	// 现象，所以默认值跟着 CCS_ENV 走，而不是让人自己想起来配。
 	SecureCookie bool
+
+	// IngestRoot 是 Web 管理员可扫描的唯一文件树。页面只接受它下面的
+	// 相对目录；留空即关闭 Web 摄取，避免表单退化成本机任意文件读取器。
+	IngestRoot string
 }
 
 // Password 是 argon2id 的哈希参数。
@@ -110,6 +115,16 @@ type Embedding struct {
 
 	// IndexBatch 是一轮处理多少条。
 	IndexBatch int
+
+	// CacheEntries 为 0 时关闭进程内缓存。TTL 只控制重新校准周期；
+	// key 已包含 model，因此换模型不会复用旧向量。
+	CacheEntries int
+	CacheTTL     time.Duration
+}
+
+type AutoContext struct {
+	MinScore  float64
+	MinMargin float64
 }
 
 // Enabled 表示是否配了真正的 embedding 服务。
@@ -154,6 +169,7 @@ func Load() (*Config, error) {
 		Web: Web{
 			PublicMCPURL: getStr("CCS_PUBLIC_MCP_URL", ""),
 			SecureCookie: getBool("CCS_WEB_SECURE_COOKIE", getStr("CCS_ENV", "development") == "production"),
+			IngestRoot:   getStr("CCS_INGEST_ROOT", ""),
 		},
 		Embedding: Embedding{
 			Provider:      getStr("CCS_EMBEDDING_PROVIDER", ProviderDisabled),
@@ -163,6 +179,12 @@ func Load() (*Config, error) {
 			Timeout:       time.Duration(getInt("CCS_EMBEDDING_TIMEOUT_SEC", 30)) * time.Second,
 			IndexInterval: time.Duration(getInt("CCS_EMBEDDING_INDEX_INTERVAL_SEC", 5)) * time.Second,
 			IndexBatch:    getInt("CCS_EMBEDDING_INDEX_BATCH", 32),
+			CacheEntries:  getInt("CCS_EMBEDDING_CACHE_ENTRIES", 1024),
+			CacheTTL:      time.Duration(getInt("CCS_EMBEDDING_CACHE_TTL_SEC", 86400)) * time.Second,
+		},
+		AutoContext: AutoContext{
+			MinScore:  getFloat("CCS_AUTO_CONTEXT_MIN_SCORE", 0.55),
+			MinMargin: getFloat("CCS_AUTO_CONTEXT_MIN_MARGIN", 0.03),
 		},
 	}
 
@@ -206,6 +228,12 @@ func (c *Config) validate() error {
 	case ProviderDisabled:
 	default:
 		return fmt.Errorf("CCS_EMBEDDING_PROVIDER 取值非法: %q（可选 ollama | openai-compatible | disabled）", c.Embedding.Provider)
+	}
+	if c.AutoContext.MinScore < 0 || c.AutoContext.MinScore > 1 || c.AutoContext.MinMargin < 0 || c.AutoContext.MinMargin > 1 {
+		return fmt.Errorf("CCS_AUTO_CONTEXT_MIN_SCORE 与 CCS_AUTO_CONTEXT_MIN_MARGIN 必须在 0 到 1 之间")
+	}
+	if c.Embedding.CacheEntries < 0 || (c.Embedding.CacheEntries > 0 && c.Embedding.CacheTTL <= 0) {
+		return fmt.Errorf("CCS_EMBEDDING_CACHE_ENTRIES 不能为负，启用缓存时 CCS_EMBEDDING_CACHE_TTL_SEC 必须大于 0")
 	}
 	return nil
 }
@@ -255,6 +283,15 @@ func getBool(key string, def bool) bool {
 func getInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func getFloat(key string, def float64) float64 {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
 			return n
 		}
 	}

@@ -258,6 +258,33 @@ func TestProvisionTenantCreatesEverything(t *testing.T) {
 	}
 }
 
+func TestBootstrapTenantOnlyInitializesEmptyDeployment(t *testing.T) {
+	store := newFakeStore()
+	svc, _ := newTestService(t, store)
+	in := ProvisionTenantInput{
+		TenantName:    "ClaraCore 团队",
+		TeamSpaceName: "团队记忆",
+		AdminUsername: "admin",
+		AdminPassword: testPassword,
+	}
+
+	first, err := svc.BootstrapTenant(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Admin.Username != "admin" || !first.Admin.MustChangePw {
+		t.Fatalf("初始化管理员不正确: %+v", first.Admin)
+	}
+
+	if _, err := svc.BootstrapTenant(context.Background(), in); !errors.Is(err, ErrAlreadyProvisioned) {
+		t.Fatalf("重复初始化应拒绝，得到 %v", err)
+	}
+	if len(store.tenants) != 1 || len(store.users) != 1 || len(store.spaces) != 2 {
+		t.Fatalf("重复初始化不应写入数据: tenants=%d users=%d spaces=%d",
+			len(store.tenants), len(store.users), len(store.spaces))
+	}
+}
+
 // 半途失败留下的「有租户没有团队空间」没有自愈路径，必须整体回滚。
 func TestProvisionTenantRollsBackOnFailure(t *testing.T) {
 	store := newFakeStore()
@@ -381,10 +408,17 @@ func TestGrantSpaceAccess(t *testing.T) {
 	store := newFakeStore()
 	svc, _ := newTestService(t, store)
 	admin, _ := seed(t, svc)
+	other, _, err := svc.CreateUser(ctx, CreateUserInput{
+		TenantID: admin.TenantID, Username: "tongshi", DisplayName: "同事",
+		Password: testPassword, Role: RoleMember,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("个人空间不可授权他人", func(t *testing.T) {
 		personal := adminPersonalSpace(t, store, admin.UserID)
-		err := svc.GrantSpaceAccess(ctx, admin.TenantID, personal, "01OTHERUSERAAAAAAAAAAAAAAA", admin.UserID, true, false)
+		err := svc.GrantSpaceAccess(ctx, admin.TenantID, personal, other.ID, admin.UserID, true, false)
 		if !errors.Is(err, ErrSpaceForbidden) {
 			t.Errorf("个人空间的封闭性是设计约束，得到 %v", err)
 		}
@@ -395,11 +429,10 @@ func TestGrantSpaceAccess(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		other := platform.ID("01OTHERUSERAAAAAAAAAAAAAAA")
-		if err := svc.GrantSpaceAccess(ctx, admin.TenantID, project.ID, other, admin.UserID, false, true); err != nil {
+		if err := svc.GrantSpaceAccess(ctx, admin.TenantID, project.ID, other.ID, admin.UserID, false, true); err != nil {
 			t.Fatal(err)
 		}
-		p := store.perms[permKey{project.ID, other}]
+		p := store.perms[permKey{project.ID, other.ID}]
 		if !p.CanRead {
 			t.Error("允许「只写不读」会造出一个能写进去却看不见的空间")
 		}
@@ -407,9 +440,35 @@ func TestGrantSpaceAccess(t *testing.T) {
 
 	t.Run("既不读也不写应当报错", func(t *testing.T) {
 		project, _ := svc.CreateProjectSpace(ctx, admin.TenantID, admin.UserID, "另一个项目")
-		err := svc.GrantSpaceAccess(ctx, admin.TenantID, project.ID, "01OTHERUSERAAAAAAAAAAAAAAA", admin.UserID, false, false)
+		err := svc.GrantSpaceAccess(ctx, admin.TenantID, project.ID, other.ID, admin.UserID, false, false)
 		if !errors.Is(err, ErrInvalidArgument) {
 			t.Errorf("空授权应当报错而非静默写入一行无意义数据，得到 %v", err)
+		}
+	})
+
+	t.Run("不能把其他租户用户写进授权表", func(t *testing.T) {
+		project, _ := svc.CreateProjectSpace(ctx, admin.TenantID, admin.UserID, "租户边界")
+		foreignID := platform.ID("01FOREIGNUSERAAAAAAAAAAAAAA")
+		store.users[foreignID] = User{ID: foreignID, TenantID: "01FOREIGNTENANTAAAAAAAAAAA", Username: "foreign"}
+		err := svc.GrantSpaceAccess(ctx, admin.TenantID, project.ID, foreignID, admin.UserID, true, false)
+		if !errors.Is(err, ErrUserNotFound) {
+			t.Fatalf("跨租户授权必须被拒绝，得到 %v", err)
+		}
+	})
+
+	t.Run("撤销也必须经过租户边界", func(t *testing.T) {
+		project, _ := svc.CreateProjectSpace(ctx, admin.TenantID, admin.UserID, "撤销边界")
+		if err := svc.GrantSpaceAccess(ctx, admin.TenantID, project.ID, other.ID, admin.UserID, true, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.RevokeSpaceAccess(ctx, "01FOREIGNTENANTAAAAAAAAAAA", project.ID, other.ID); !errors.Is(err, ErrSpaceNotFound) {
+			t.Fatalf("跨租户撤销必须被拒绝，得到 %v", err)
+		}
+		if err := svc.RevokeSpaceAccess(ctx, admin.TenantID, project.ID, other.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := store.perms[permKey{project.ID, other.ID}]; ok {
+			t.Fatal("授权行没有被撤销")
 		}
 	})
 }

@@ -98,7 +98,7 @@ func newTestHost(t *testing.T) (*httptest.Server, *fakeGov) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, newFakeKnow(), newFakeActivity(), logger, HostOptions{Version: "test"}).Handler())
+	srv := httptest.NewServer(NewHost(gov, newFakeKnow(), newFakeContinuity(), newFakeActivity(), logger, HostOptions{Version: "test"}).Handler())
 	t.Cleanup(srv.Close)
 	return srv, gov
 }
@@ -111,6 +111,11 @@ func newToolHost(t *testing.T) (*httptest.Server, *fakeKnow) {
 }
 
 func newToolHostWithActivity(t *testing.T, activities activityService) (*httptest.Server, *fakeKnow) {
+	srv, know, _ := newToolHostWithActivityAndContinuity(t, activities)
+	return srv, know
+}
+
+func newToolHostWithActivityAndContinuity(t *testing.T, activities activityService, options ...HostOptions) (*httptest.Server, *fakeKnow, *fakeContinuity) {
 	t.Helper()
 	owner := platform.ID(userClar)
 	gov := &fakeGov{
@@ -140,10 +145,15 @@ func newToolHostWithActivity(t *testing.T, activities activityService) (*httptes
 		},
 	}
 	know := newFakeKnow()
+	cont := newFakeContinuity()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, know, activities, logger, HostOptions{Version: "test", SemanticSearch: true}).Handler())
+	opts := HostOptions{Version: "test", SemanticSearch: true}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	srv := httptest.NewServer(NewHost(gov, know, cont, activities, logger, opts).Handler())
 	t.Cleanup(srv.Close)
-	return srv, know
+	return srv, know, cont
 }
 
 // --- JSON-RPC 客户端 ---
@@ -347,7 +357,7 @@ func TestAuthFailuresAreIndistinguishable(t *testing.T) {
 	for _, reason := range reasons {
 		failing := &failingGov{err: reason}
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-		s := httptest.NewServer(NewHost(failing, newFakeKnow(), newFakeActivity(), logger, HostOptions{Version: "test"}).Handler())
+		s := httptest.NewServer(NewHost(failing, newFakeKnow(), newFakeContinuity(), newFakeActivity(), logger, HostOptions{Version: "test"}).Handler())
 
 		resp := call(t, s, "ccs_whatever", "tools/call",
 			map[string]any{"name": "whoami", "arguments": map[string]any{}})

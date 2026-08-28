@@ -46,6 +46,16 @@ func listSQL(q knowledge.ListQuery) (table, where string, args []any) {
 			args = append(args, s)
 		}
 	}
+	if strings.TrimSpace(q.Query) != "" {
+		var cols string
+		if q.Kind == knowledge.EntityMemory {
+			cols = "title, body"
+		} else {
+			cols = cardFullTextColumns
+		}
+		b.WriteString(" AND (MATCH(" + cols + ") AGAINST (? IN BOOLEAN MODE) OR CONCAT_WS(' ', " + cols + ") LIKE ? ESCAPE '=')")
+		args = append(args, q.Query, literalLikePattern(q.Query))
+	}
 	return table, b.String(), args
 }
 

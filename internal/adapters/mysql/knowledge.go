@@ -110,7 +110,7 @@ func (s *KnowledgeStore) UpdateMemory(ctx context.Context, m knowledge.Memory, e
 // ---------------------------------------------------------------------------
 
 const cardColumns = `id, tenant_id, space_id, author_user_id, author_agent_id,
-	title, card_type, status, source, source_key, source_hash,
+	title, card_type, status, source, source_name, source_key, source_hash,
 	body_original, body_distilled, body_understanding, body_why_keep, body_unresolved,
 	copied_from_type, copied_from_id, version, created_at, updated_at`
 
@@ -118,9 +118,9 @@ func (s *KnowledgeStore) CreateCard(ctx context.Context, c knowledge.Card) error
 	fromType, fromID := originArgs(c.CopiedFrom)
 	_, err := s.ex.ExecContext(ctx,
 		`INSERT INTO cards (`+cardColumns+`)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		string(c.ID), string(c.TenantID), string(c.SpaceID), string(c.AuthorUserID), idPtrArg(c.AuthorAgentID),
-		c.Title, c.CardType, c.Status, nullIfEmpty(c.Source),
+		c.Title, c.CardType, c.Status, nullIfEmpty(c.Source), nullIfEmpty(c.SourceName),
 		// source_key 必须写 NULL 而不是空串：uk_cards_source 允许多行 NULL，
 		// 而空串会让所有手写卡片在同一个空间里互相冲突。
 		nullIfEmpty(c.SourceKey), nullIfEmpty(c.SourceHash),
@@ -181,6 +181,38 @@ func (s *KnowledgeStore) FindCardBySourceKey(ctx context.Context, tenantID, spac
 	return c, nil
 }
 
+func (s *KnowledgeStore) ListCardsBySource(ctx context.Context, tenantID, spaceID platform.ID, sourceName string) ([]knowledge.Card, error) {
+	if sourceName == "" {
+		return nil, nil
+	}
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT id, tenant_id, space_id, source, source_name, source_key, status
+		 FROM cards
+		 WHERE tenant_id = ? AND space_id = ? AND source_name = ?
+		 ORDER BY source, id`, string(tenantID), string(spaceID), sourceName)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 查询摄取来源卡片: %w", err)
+	}
+	defer rows.Close()
+
+	var out []knowledge.Card
+	for rows.Next() {
+		var c knowledge.Card
+		var id, tid, sid string
+		var source, name, key sql.NullString
+		if err := rows.Scan(&id, &tid, &sid, &source, &name, &key, &c.Status); err != nil {
+			return nil, fmt.Errorf("mysql: 读取摄取来源卡片: %w", err)
+		}
+		c.ID, c.TenantID, c.SpaceID = platform.ID(id), platform.ID(tid), platform.ID(sid)
+		c.Source, c.SourceName, c.SourceKey = source.String, name.String, key.String
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("mysql: 遍历摄取来源卡片: %w", err)
+	}
+	return out, nil
+}
+
 // scanCardRow 读一行卡片。FindCard 与 FindCardBySourceKey 共用，
 // 列顺序只写一遍——两份 Scan 迟早有一份忘了跟着 cardColumns 改。
 func (s *KnowledgeStore) scanCardRow(row *sql.Row) (*knowledge.Card, error) {
@@ -188,13 +220,13 @@ func (s *KnowledgeStore) scanCardRow(row *sql.Row) (*knowledge.Card, error) {
 		c                                      knowledge.Card
 		cID, tID, sID, aID                     string
 		agentID                                sql.NullString
-		source, srcKey, srcHash                sql.NullString
+		source, sourceName, srcKey, srcHash    sql.NullString
 		orig, dist, under, whyKeep, unresolved sql.NullString
 		fromType, fromID                       sql.NullString
 		created, updated                       time.Time
 	)
 	err := row.Scan(&cID, &tID, &sID, &aID, &agentID, &c.Title, &c.CardType, &c.Status,
-		&source, &srcKey, &srcHash,
+		&source, &sourceName, &srcKey, &srcHash,
 		&orig, &dist, &under, &whyKeep, &unresolved,
 		&fromType, &fromID, &c.Version, &created, &updated)
 	switch {
@@ -206,7 +238,7 @@ func (s *KnowledgeStore) scanCardRow(row *sql.Row) (*knowledge.Card, error) {
 
 	c.ID, c.TenantID, c.SpaceID, c.AuthorUserID = platform.ID(cID), platform.ID(tID), platform.ID(sID), platform.ID(aID)
 	c.AuthorAgentID = idFromNull(agentID)
-	c.Source, c.SourceKey, c.SourceHash = source.String, srcKey.String, srcHash.String
+	c.Source, c.SourceName, c.SourceKey, c.SourceHash = source.String, sourceName.String, srcKey.String, srcHash.String
 	c.Original, c.Distilled = orig.String, dist.String
 	c.Understanding, c.WhyKeep, c.Unresolved = under.String, whyKeep.String, unresolved.String
 	c.CopiedFrom = originFromNull(fromType, fromID)
@@ -217,13 +249,13 @@ func (s *KnowledgeStore) scanCardRow(row *sql.Row) (*knowledge.Card, error) {
 func (s *KnowledgeStore) UpdateCard(ctx context.Context, c knowledge.Card, expectedVersion int) error {
 	fromType, fromID := originArgs(c.CopiedFrom)
 	res, err := s.ex.ExecContext(ctx,
-		`UPDATE cards SET space_id = ?, title = ?, card_type = ?, status = ?, source = ?,
+		`UPDATE cards SET space_id = ?, title = ?, card_type = ?, status = ?, source = ?, source_name = ?,
 		        source_key = ?, source_hash = ?,
 		        body_original = ?, body_distilled = ?, body_understanding = ?,
 		        body_why_keep = ?, body_unresolved = ?,
 		        copied_from_type = ?, copied_from_id = ?, version = ?, updated_at = ?
 		 WHERE id = ? AND tenant_id = ? AND version = ?`,
-		string(c.SpaceID), c.Title, c.CardType, c.Status, nullIfEmpty(c.Source),
+		string(c.SpaceID), c.Title, c.CardType, c.Status, nullIfEmpty(c.Source), nullIfEmpty(c.SourceName),
 		nullIfEmpty(c.SourceKey), nullIfEmpty(c.SourceHash),
 		nullIfEmpty(c.Original), nullIfEmpty(c.Distilled), nullIfEmpty(c.Understanding),
 		nullIfEmpty(c.WhyKeep), nullIfEmpty(c.Unresolved),

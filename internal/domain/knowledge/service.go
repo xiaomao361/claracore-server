@@ -25,11 +25,20 @@ type Service struct {
 	// 用 nil 而不是塞一个「什么都不做的 Embedder」：空实现的 Model()
 	// 得编一个模型名出来，而那个名字会被写进 embeddings.model 列，
 	// 将来真的接上模型时没人分得清哪些行是它留下的。
-	embedder ports.Embedder
+	embedder         ports.Embedder
+	autoRecallPolicy AutomaticRecallPolicy
 }
 
 func NewService(store Store, clock platform.Clock, ids *platform.IDGenerator, embedder ports.Embedder) *Service {
-	return &Service{store: store, clock: clock, ids: ids, embedder: embedder}
+	return &Service{store: store, clock: clock, ids: ids, embedder: embedder, autoRecallPolicy: DefaultAutomaticRecallPolicy()}
+}
+
+// WithAutomaticRecallPolicy returns a shallow copy with deployment-calibrated
+// deterministic gates. The terminal Agent remains the final relevance judge.
+func (s *Service) WithAutomaticRecallPolicy(policy AutomaticRecallPolicy) *Service {
+	copy := *s
+	copy.autoRecallPolicy = policy
+	return &copy
 }
 
 // ---------------------------------------------------------------------------
@@ -46,6 +55,10 @@ type CreateMemoryInput struct {
 	Title         string
 	Body          string
 	Labels        []string
+	// SupersedesID 非空时，新记忆与旧记忆在同一事务中完成替代：
+	// current(new) -> historical(old)，旧记录保留但退出默认检索。
+	SupersedesID   platform.ID
+	WritableSpaces []platform.ID
 }
 
 func (s *Service) CreateMemory(ctx context.Context, in CreateMemoryInput) (Memory, error) {
@@ -69,6 +82,20 @@ func (s *Service) CreateMemory(ctx context.Context, in CreateMemoryInput) (Memor
 	}
 
 	err := s.store.Atomically(ctx, func(st Store) error {
+		var historical *Memory
+		if in.SupersedesID != "" {
+			if in.SupersedesID == m.ID || len(in.WritableSpaces) == 0 {
+				return fmt.Errorf("%w: supersede 缺少可写范围或目标非法", ErrInvalidArgument)
+			}
+			var findErr error
+			historical, findErr = st.FindMemory(ctx, in.TenantID, in.SupersedesID, in.WritableSpaces)
+			if findErr != nil {
+				return findErr
+			}
+			if historical.Status != MemoryActive {
+				return fmt.Errorf("%w: 只能替代 active 记忆", ErrInvalidArgument)
+			}
+		}
 		if err := st.CreateMemory(ctx, m); err != nil {
 			return err
 		}
@@ -77,7 +104,22 @@ func (s *Service) CreateMemory(ctx context.Context, in CreateMemoryInput) (Memor
 		}
 		// 入队与内容同事务提交：分两步的话，中间崩一次这条内容就永远
 		// 搜不到，而且没有任何地方会报错（见 enqueueEmbedding 的注释）。
-		return s.enqueueEmbedding(ctx, st, m.TenantID, Ref{EntityMemory, m.ID}, memoryEmbedText(m), now)
+		if err := s.enqueueEmbedding(ctx, st, m.TenantID, Ref{EntityMemory, m.ID}, memoryEmbedText(m), now); err != nil {
+			return err
+		}
+		if historical == nil {
+			return nil
+		}
+		old := *historical
+		old.Status, old.Version, old.UpdatedAt = MemorySuperseded, old.Version+1, now
+		if err := st.UpdateMemory(ctx, old, historical.Version); err != nil {
+			return err
+		}
+		link := Link{ID: s.ids.New(), TenantID: m.TenantID, From: Ref{EntityMemory, m.ID}, To: Ref{EntityMemory, old.ID}, Kind: LinkSupersedes, CreatedAt: now}
+		if err := link.validate(); err != nil {
+			return err
+		}
+		return st.CreateLink(ctx, link)
 	})
 	if err != nil {
 		return Memory{}, err
@@ -226,6 +268,8 @@ type CreateCardInput struct {
 
 	RecallTriggers []string
 	Labels         []string
+	EvolvesFromID  platform.ID
+	WritableSpaces []platform.ID
 }
 
 func (s *Service) CreateCard(ctx context.Context, in CreateCardInput) (Card, error) {
@@ -260,7 +304,38 @@ func (s *Service) CreateCard(ctx context.Context, in CreateCardInput) (Card, err
 	}
 	c.RecallTriggers = s.buildTriggers(c, triggers, now)
 
-	if err := s.persistNewCard(ctx, c, now); err != nil {
+	if in.EvolvesFromID == "" {
+		if err := s.persistNewCard(ctx, c, now); err != nil {
+			return Card{}, err
+		}
+		return c, nil
+	}
+	if len(in.WritableSpaces) == 0 {
+		return Card{}, fmt.Errorf("%w: evolvesFrom 缺少可写范围", ErrInvalidArgument)
+	}
+	err = s.store.Atomically(ctx, func(st Store) error {
+		old, err := st.FindCard(ctx, in.TenantID, in.EvolvesFromID, in.WritableSpaces)
+		if err != nil {
+			return err
+		}
+		if old.Status != CardActive {
+			return fmt.Errorf("%w: 只能演进 active 卡片", ErrInvalidArgument)
+		}
+		if err := s.persistNewCardWithStore(ctx, st, c, now); err != nil {
+			return err
+		}
+		previous := *old
+		previous.Status, previous.Version, previous.UpdatedAt = CardDeprecated, previous.Version+1, now
+		if err := st.UpdateCard(ctx, previous, old.Version); err != nil {
+			return err
+		}
+		link := Link{ID: s.ids.New(), TenantID: c.TenantID, From: Ref{EntityCard, c.ID}, To: Ref{EntityCard, old.ID}, Kind: LinkEvolvedFrom, CreatedAt: now}
+		if err := link.validate(); err != nil {
+			return err
+		}
+		return st.CreateLink(ctx, link)
+	})
+	if err != nil {
 		return Card{}, err
 	}
 	return c, nil
@@ -272,23 +347,27 @@ func (s *Service) CreateCard(ctx context.Context, in CreateCardInput) (Card, err
 // 它退化成一条普通记忆，却占着"知识卡片"的位置。
 func (s *Service) persistNewCard(ctx context.Context, c Card, at time.Time) error {
 	return s.store.Atomically(ctx, func(st Store) error {
-		if err := st.CreateCard(ctx, c); err != nil {
-			return err
-		}
-		if err := st.ReplaceLabels(ctx, c.TenantID, Ref{EntityCard, c.ID}, c.Labels, at); err != nil {
-			return err
-		}
-		if err := st.ReplaceRecallTriggers(ctx, c.TenantID, c.ID, c.RecallTriggers); err != nil {
-			return err
-		}
-		// 卡片正文与每条召回条件各自入队。两者匹配的是不同的东西：
-		// 正文回答「这张卡在讲什么」（card_search），召回条件回答
-		// 「什么情境下该想起它」（card_recall）——后者才是这个产品的核心优势。
-		if err := s.enqueueEmbedding(ctx, st, c.TenantID, Ref{EntityCard, c.ID}, cardEmbedText(c), at); err != nil {
-			return err
-		}
-		return s.enqueueCardTriggers(ctx, st, c, at)
+		return s.persistNewCardWithStore(ctx, st, c, at)
 	})
+}
+
+func (s *Service) persistNewCardWithStore(ctx context.Context, st Store, c Card, at time.Time) error {
+	if err := st.CreateCard(ctx, c); err != nil {
+		return err
+	}
+	if err := st.ReplaceLabels(ctx, c.TenantID, Ref{EntityCard, c.ID}, c.Labels, at); err != nil {
+		return err
+	}
+	if err := st.ReplaceRecallTriggers(ctx, c.TenantID, c.ID, c.RecallTriggers); err != nil {
+		return err
+	}
+	// 卡片正文与每条召回条件各自入队。两者匹配的是不同的东西：
+	// 正文回答「这张卡在讲什么」（card_search），召回条件回答
+	// 「什么情境下该想起它」（card_recall）——后者才是这个产品的核心优势。
+	if err := s.enqueueEmbedding(ctx, st, c.TenantID, Ref{EntityCard, c.ID}, cardEmbedText(c), at); err != nil {
+		return err
+	}
+	return s.enqueueCardTriggers(ctx, st, c, at)
 }
 
 // buildTriggers 把清洗后的文本变成带 ID 的触发条件行。
@@ -452,6 +531,9 @@ func (s *Service) CreateLink(ctx context.Context, in LinkInput) (Link, error) {
 	if err := requireSpaces(in.ReadableSpaces); err != nil {
 		return Link{}, err
 	}
+	if !validUserLinkKind(in.Kind) {
+		return Link{}, fmt.Errorf("%w: 关联类型取值非法 %q", ErrInvalidArgument, in.Kind)
+	}
 	l := Link{
 		ID:        s.ids.New(),
 		TenantID:  in.TenantID,
@@ -490,7 +572,7 @@ func (s *Service) DeleteLink(ctx context.Context, in LinkInput) error {
 	if err := in.To.Validate(); err != nil {
 		return err
 	}
-	if !validLinkKind(in.Kind) {
+	if !validUserLinkKind(in.Kind) {
 		return fmt.Errorf("%w: 关联类型取值非法 %q", ErrInvalidArgument, in.Kind)
 	}
 	if err := s.requireVisible(ctx, in.TenantID, in.From, in.ReadableSpaces); err != nil {

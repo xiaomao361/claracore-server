@@ -15,7 +15,7 @@
   <button type="submit">签发 token</button>
 </form>
 
-<table class="grid">
+<div class="table-scroll"><table class="grid">
   <thead><tr><th>设备</th><th>前缀</th><th>创建</th><th>最后使用</th><th>状态</th><th></th></tr></thead>
   <tbody>
   {{range .Tokens}}
@@ -37,6 +37,6 @@
     <tr><td colspan="6" class="empty">还没有 token。签发一个，把配置粘进你的 agent。</td></tr>
   {{end}}
   </tbody>
-</table>
+</table></div>
 <p class="hint">轮换的做法：先签发新 token，各设备逐个换上，观察旧 token 的「最后使用」不再变化，再吊销它。</p>
 {{end}}

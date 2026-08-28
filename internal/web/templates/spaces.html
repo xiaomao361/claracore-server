@@ -1,0 +1,57 @@
+{{define "content"}}
+<form method="post" action="/admin/spaces" class="card row">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <label>项目空间名称<input name="name" required maxlength="120"></label>
+  <button type="submit">创建项目空间</button>
+</form>
+
+{{range .Spaces}}
+{{$space := .}}
+<section class="card space-admin">
+  <h2>{{.Space.Name}} <span class="tag {{.Space.Type}}">{{.Space.Type}}</span></h2>
+  {{if .OwnerName}}<p class="hint">创建者：{{.OwnerName}}（始终读写）</p>{{else}}<p class="hint">团队空间对所有成员默认可读；下面只需配置谁可以写。</p>{{end}}
+  <div class="table-scroll">
+  <table class="grid">
+    <thead><tr><th>成员</th><th>当前权限</th><th>调整</th></tr></thead>
+    <tbody>
+    {{range $space.Grants}}
+      <tr>
+        <td>{{.User.DisplayName}} <code>{{.User.Username}}</code></td>
+        <td>
+          {{if .Permission}}{{if .Permission.CanWrite}}读写{{else}}只读{{end}}
+          {{else}}{{if eq $space.Space.Type "team"}}默认只读{{else}}未授权{{end}}{{end}}
+        </td>
+        <td class="actions permission-actions">
+          <form method="post" action="/admin/spaces/grant">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="space" value="{{$space.Space.ID}}">
+            <input type="hidden" name="user" value="{{.User.ID}}">
+            <select name="access" aria-label="{{.User.DisplayName}}的权限">
+              <option value="read" {{if and .Permission (not .Permission.CanWrite)}}selected{{end}}>只读</option>
+              <option value="write" {{if and .Permission .Permission.CanWrite}}selected{{end}}>读写</option>
+            </select>
+            <button type="submit">保存</button>
+          </form>
+          {{if .Permission}}
+          <form method="post" action="/admin/spaces/revoke">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="space" value="{{$space.Space.ID}}">
+            <input type="hidden" name="user" value="{{.User.ID}}">
+            <button class="danger" type="submit">撤销</button>
+          </form>
+          {{end}}
+        </td>
+      </tr>
+    {{else}}
+      <tr><td colspan="3" class="empty">还没有可配置的成员。</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  </div>
+</section>
+{{else}}
+<div class="empty-state">还没有团队或项目空间。</div>
+{{end}}
+
+<p class="hint">个人空间不会出现在这里，也不能授权给别人。需要共享内容时，请把 Memory 或 Card 提升到项目或团队空间。</p>
+{{end}}

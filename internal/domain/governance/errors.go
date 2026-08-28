@@ -46,6 +46,9 @@ var (
 	// 是为了让 Host 层不必 import 数据库驱动去判断错误码
 	// （那会撞上「Host 不得直连基础设施」的架构约束）。
 	ErrAlreadyExists = errors.New("governance: 目标已存在")
+	// ErrAlreadyProvisioned 表示这个单部署单元已经有租户，不能再次执行
+	// 首次初始化。它与普通的账号重名不同：操作者需要停止初始化，而不是换名重试。
+	ErrAlreadyProvisioned = errors.New("governance: 部署单元已经初始化")
 
 	ErrInvalidArgument = errors.New("governance: 参数非法")
 

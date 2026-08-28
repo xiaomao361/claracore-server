@@ -72,6 +72,25 @@ func (s *ActivityStore) ListAdmin(ctx context.Context, query activity.AdminQuery
 		query.AfterCreatedAt, query.AfterID, query.Limit)
 }
 
+func (s *ActivityStore) CountContextFeedback(ctx context.Context, query activity.ContextFeedbackQuery) (activity.ContextFeedbackQuality, error) {
+	quality := activity.ContextFeedbackQuality{Since: query.Since.UTC()}
+	err := s.ex.QueryRowContext(ctx,
+		`SELECT
+			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'delivered' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'used' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'ignored' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'wrong' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'corrected' THEN 1 ELSE 0 END), 0)
+		 FROM audit_logs
+		 WHERE tenant_id = ? AND kind = ? AND action = ? AND outcome = ? AND created_at >= ?`,
+		string(query.TenantID), activity.KindGovernance, "gateway_context_feedback", activity.OutcomeSuccess, query.Since.UTC(),
+	).Scan(&quality.Delivered, &quality.Used, &quality.Ignored, &quality.Wrong, &quality.Corrected)
+	if err != nil {
+		return activity.ContextFeedbackQuality{}, fmt.Errorf("mysql: 汇总自动上下文反馈: %w", err)
+	}
+	return quality, nil
+}
+
 func (s *ActivityStore) list(
 	ctx context.Context,
 	where string,

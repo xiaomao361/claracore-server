@@ -43,7 +43,17 @@ func matchExpr(cols, query string) (string, []any) {
 	if strings.TrimSpace(query) == "" {
 		return "0", nil
 	}
-	return "MATCH(" + cols + ") AGAINST (? IN NATURAL LANGUAGE MODE)", []any{query}
+	// MATCH 的索引在刚提交后可能短暂不可见。给明确的字面包含一个极小正分，
+	// 保住「刚写完立刻搜」；真正的全文相关性一旦可见，量级远大于这个兜底，
+	// 不改变正常排序。
+	return "MATCH(" + cols + ") AGAINST (? IN NATURAL LANGUAGE MODE) + " +
+			"CASE WHEN CONCAT_WS(' ', " + cols + ") LIKE ? ESCAPE '=' THEN 0.000001 ELSE 0 END",
+		[]any{query, literalLikePattern(query)}
+}
+
+func literalLikePattern(query string) string {
+	replacer := strings.NewReplacer("=", "==", "%", "=%", "_", "=_")
+	return "%" + replacer.Replace(strings.TrimSpace(query)) + "%"
 }
 
 // labelFilter 生成标签**交集**过滤。
@@ -73,7 +83,13 @@ func (s *KnowledgeStore) SearchMemories(ctx context.Context, q knowledge.Candida
 	score, args := matchExpr("title, body", q.Query)
 	args = append(args, string(q.TenantID))
 	args = append(args, idArgs(q.SpaceIDs)...)
-	args = append(args, knowledge.MemoryActive)
+	statuses := q.MemoryStatuses
+	if len(statuses) == 0 {
+		statuses = []string{knowledge.MemoryActive}
+	}
+	for _, status := range statuses {
+		args = append(args, status)
+	}
 
 	where, labelArgs := labelFilter(q.TenantID, knowledge.EntityMemory, q.Labels)
 	args = append(args, labelArgs...)
@@ -82,7 +98,7 @@ func (s *KnowledgeStore) SearchMemories(ctx context.Context, q knowledge.Candida
 	rows, err := s.ex.QueryContext(ctx,
 		`SELECT `+memoryColumns+`, `+score+` AS score
 		 FROM memories
-		 WHERE tenant_id = ? AND space_id IN (`+placeholders(len(q.SpaceIDs))+`) AND status = ?`+where+`
+		 WHERE tenant_id = ? AND space_id IN (`+placeholders(len(q.SpaceIDs))+`) AND status IN (`+placeholders(len(statuses))+`)`+where+`
 		 ORDER BY score DESC, updated_at DESC, id ASC
 		 LIMIT ?`, args...)
 	if err != nil {
@@ -169,6 +185,17 @@ func (s *KnowledgeStore) SearchCards(ctx context.Context, q knowledge.CandidateQ
 // 这里 MATCH **进 WHERE**（与 SearchCards 相反）：那个数字回答的是
 // 「另有多少条卡片命中」，把没命中的也数进去就是在骗人。
 // 走 ngram 索引的一次 COUNT，代价与返回内容完全不同。
+//
+// 这里使用 BOOLEAN MODE，不使用检索排序的 NATURAL LANGUAGE MODE：后者的
+// 相关性统计会把高频词判成 0 分。在小团队或刚冷启动的库里，一条术语只要
+// 出现在少量卡片中的一半，就可能出现「正文明确包含，命中数却是 0」的静默
+// 假阴性。这个查询只回答有没有字面命中，不承担相关性排序，布尔模式才是
+// 与产品语义一致的选择。
+//
+// 仍保留一个转义后的字面包含兜底。InnoDB FULLTEXT 在刚提交新卡后存在很短的
+// 可见性窗口：行已经能 SELECT 到，MATCH 仍可能返回 0；团队冷启动时用户最
+// 容易在写完卡后立刻搜索，不能让这个窗口把真实命中说成 0。LIKE 只在这次
+// 低频提示 COUNT 中运行，且租户、空间、状态过滤仍先下推。
 func (s *KnowledgeStore) CountCardMatches(ctx context.Context, q knowledge.CandidateQuery) (int, error) {
 	if len(q.SpaceIDs) == 0 || strings.TrimSpace(q.Query) == "" {
 		return 0, nil
@@ -179,13 +206,16 @@ func (s *KnowledgeStore) CountCardMatches(ctx context.Context, q knowledge.Candi
 
 	where, labelArgs := labelFilter(q.TenantID, knowledge.EntityCard, q.Labels)
 	args = append(args, labelArgs...)
-	args = append(args, q.Query)
+	args = append(args, q.Query, literalLikePattern(q.Query))
 
 	var n int
 	err := s.ex.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM cards
 		 WHERE tenant_id = ? AND space_id IN (`+placeholders(len(q.SpaceIDs))+`) AND status = ?`+where+`
-		   AND MATCH(`+cardFullTextColumns+`) AGAINST (? IN NATURAL LANGUAGE MODE)`, args...).Scan(&n)
+		   AND (
+		     MATCH(`+cardFullTextColumns+`) AGAINST (? IN BOOLEAN MODE)
+		     OR CONCAT_WS(' ', title, body_distilled, body_understanding) LIKE ? ESCAPE '='
+		   )`, args...).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("mysql: 统计卡片命中: %w", err)
 	}
@@ -321,20 +351,20 @@ func scanCard(rows *sql.Rows, c *knowledge.Card, score *float64) error {
 	var (
 		cID, tID, sID, aID                     string
 		agentID                                sql.NullString
-		source, srcKey, srcHash                sql.NullString
+		source, sourceName, srcKey, srcHash    sql.NullString
 		orig, dist, under, whyKeep, unresolved sql.NullString
 		fromType, fromID                       sql.NullString
 		created, updated                       time.Time
 	)
 	if err := rows.Scan(&cID, &tID, &sID, &aID, &agentID, &c.Title, &c.CardType, &c.Status,
-		&source, &srcKey, &srcHash,
+		&source, &sourceName, &srcKey, &srcHash,
 		&orig, &dist, &under, &whyKeep, &unresolved,
 		&fromType, &fromID, &c.Version, &created, &updated, score); err != nil {
 		return fmt.Errorf("mysql: 读取卡片行: %w", err)
 	}
 	c.ID, c.TenantID, c.SpaceID, c.AuthorUserID = platform.ID(cID), platform.ID(tID), platform.ID(sID), platform.ID(aID)
 	c.AuthorAgentID = idFromNull(agentID)
-	c.Source, c.SourceKey, c.SourceHash = source.String, srcKey.String, srcHash.String
+	c.Source, c.SourceName, c.SourceKey, c.SourceHash = source.String, sourceName.String, srcKey.String, srcHash.String
 	c.Original, c.Distilled = orig.String, dist.String
 	c.Understanding, c.WhyKeep, c.Unresolved = under.String, whyKeep.String, unresolved.String
 	c.CopiedFrom = originFromNull(fromType, fromID)

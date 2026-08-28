@@ -72,6 +72,8 @@ type CandidateQuery struct {
 	// Labels 非空时要求候选**同时具有**全部标签（交集，不是并集）。
 	// 并集可以靠调用两次得到，交集不行——「缩小范围」是这个参数唯一的用途。
 	Labels []string
+	// MemoryStatuses is used only by SearchMemories. Empty means active.
+	MemoryStatuses []string
 
 	// Limit 是候选集上限，由领域层填 candidateCap。
 	Limit int
@@ -150,9 +152,10 @@ type SearchMemoriesInput struct {
 	// governance.SpaceScope.ResolveReadTargets 解析。
 	Spaces []SearchSpace
 
-	Query  string
-	Labels []string
-	Limit  int
+	Query    string
+	Labels   []string
+	Limit    int
+	TimeView string // current | historical | all
 }
 
 func (s *Service) SearchMemories(ctx context.Context, in SearchMemoriesInput) (MemorySearchResult, error) {
@@ -166,6 +169,16 @@ func (s *Service) SearchMemories(ctx context.Context, in SearchMemoriesInput) (M
 		Query:    in.Query,
 		Labels:   in.Labels,
 		Limit:    candidateCap,
+	}
+	switch in.TimeView {
+	case "", "current":
+		q.MemoryStatuses = []string{MemoryActive}
+	case "historical":
+		q.MemoryStatuses = []string{MemorySuperseded}
+	case "all":
+		q.MemoryStatuses = []string{MemoryActive, MemorySuperseded}
+	default:
+		return MemorySearchResult{}, fmt.Errorf("%w: timeView 取值非法 %q", ErrInvalidArgument, in.TimeView)
 	}
 
 	candidates, err := s.store.SearchMemories(ctx, q)
@@ -277,6 +290,59 @@ type RecallCardsInput struct {
 	Limit int
 }
 
+type AutomaticRecallResult struct {
+	Hit               *CardHit
+	Reason            string
+	SemanticAvailable bool
+	PolicyAvailable   bool
+}
+
+type AutomaticRecallPolicy struct {
+	MinScore  float64
+	MinMargin float64
+}
+
+const (
+	defaultAutomaticRecallMinScore  = 0.55
+	defaultAutomaticRecallMinMargin = 0.03
+)
+
+func DefaultAutomaticRecallPolicy() AutomaticRecallPolicy {
+	return AutomaticRecallPolicy{MinScore: defaultAutomaticRecallMinScore, MinMargin: defaultAutomaticRecallMinMargin}
+}
+
+// RecallCardForContext is the conservative automatic path. It mirrors
+// Desktop Stage B: semantic evidence must clear score and ambiguity gates,
+// then one bounded read-only block is offered to the terminal Agent. The
+// terminal Agent's configured model remains the final relevance judge.
+func (s *Service) RecallCardForContext(ctx context.Context, in RecallCardsInput) (AutomaticRecallResult, error) {
+	in.Limit = 3
+	res, err := s.RecallCards(ctx, in)
+	if err != nil {
+		return AutomaticRecallResult{}, err
+	}
+	out := AutomaticRecallResult{SemanticAvailable: res.SemanticAvailable, PolicyAvailable: res.SemanticAvailable}
+	if !res.SemanticAvailable {
+		out.Reason = "semantic_unavailable"
+		return out, nil
+	}
+	if len(res.Hits) == 0 {
+		out.Reason = "no_candidates"
+		return out, nil
+	}
+	top := res.Hits[0]
+	if !top.Semantic || top.Score < s.autoRecallPolicy.MinScore {
+		out.Reason = "low_relevance"
+		return out, nil
+	}
+	if len(res.Hits) > 1 && res.Hits[1].Semantic && top.Score-res.Hits[1].Score < s.autoRecallPolicy.MinMargin {
+		out.Reason = "ambiguous_top_results"
+		return out, nil
+	}
+	out.Hit, out.Reason = &top, "high_confidence_top1"
+	return out, nil
+}
+
 // RecallCards 按当前情境召回卡片。
 //
 // 与另外两条检索的形状不同：粗筛打在 card_recall_triggers 上，
@@ -331,9 +397,6 @@ func (s *Service) RecallCards(ctx context.Context, in RecallCardsInput) (CardSea
 		}
 		picked[r.item.CardID] = pick{trigger: r.item, score: r.score, semantic: r.semantic}
 		order = append(order, r.item.CardID)
-		if len(order) == limit {
-			break
-		}
 	}
 	if len(order) == 0 {
 		return CardSearchResult{Hits: []CardHit{}, SemanticAvailable: semantic}, nil
@@ -353,7 +416,13 @@ func (s *Service) RecallCards(ctx context.Context, in RecallCardsInput) (CardSea
 		byID[c.ID] = c
 	}
 
-	hits := make([]CardHit, 0, len(order))
+	// promote 是复制而非移动，因此同一个经验可能同时出现在个人、项目、
+	// 团队空间。召回若把原件和副本都塞回去，不只是浪费名额，还会让 agent
+	// 误以为有两条独立证据。沿当前候选集中可见的 copied_from 链折叠，保留
+	// 排序最靠前（相关性相同再由空间权重决胜）的那张；显式 card_search 仍可
+	// 看见各空间里的实体，不改变治理与来源可见性。
+	lineage := make(map[platform.ID]bool, len(order))
+	hits := make([]CardHit, 0, min(limit, len(order)))
 	for _, id := range order {
 		c, ok := byID[id]
 		if !ok {
@@ -362,10 +431,48 @@ func (s *Service) RecallCards(ctx context.Context, in RecallCardsInput) (CardSea
 			// 一条脏数据不该让整次召回失败。
 			continue
 		}
+		root := recallLineageRoot(c, byID)
+		if lineage[root] {
+			continue
+		}
+		lineage[root] = true
 		p := picked[id]
 		hits = append(hits, CardHit{Card: c, Score: p.score, Semantic: p.semantic, Trigger: p.trigger.Text})
+		if len(hits) == limit {
+			break
+		}
 	}
 	return CardSearchResult{Hits: hits, SemanticAvailable: semantic}, nil
+}
+
+// recallLineageRoot 只沿本次已经通过租户/空间权限过滤的候选集追溯。
+// 链外 ID 仍可作为稳定根键，但绝不额外读取不可见卡片。循环属于脏数据；
+// 遇到时退回当前最小 ID，保证结果稳定且不会死循环。
+func recallLineageRoot(card Card, visible map[platform.ID]Card) platform.ID {
+	cur := card
+	seen := map[platform.ID]bool{}
+	root := card.ID
+	for {
+		if seen[cur.ID] {
+			return root
+		}
+		seen[cur.ID] = true
+		if cur.ID < root {
+			root = cur.ID
+		}
+		if cur.CopiedFrom == nil || cur.CopiedFrom.Type != EntityCard || cur.CopiedFrom.ID == "" {
+			return cur.ID
+		}
+		parentID := cur.CopiedFrom.ID
+		if parentID < root {
+			root = parentID
+		}
+		parent, ok := visible[parentID]
+		if !ok {
+			return parentID
+		}
+		cur = parent
+	}
 }
 
 // ---------------------------------------------------------------------------
