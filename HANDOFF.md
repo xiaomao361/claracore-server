@@ -593,7 +593,7 @@ requireAdmin        ↑ 且角色是 admin
 - MCP 元数据白名单只含实体/空间 ID、命中 ID、计数与语义标志；Web 写审计不序列化表单。query、situation、标题、正文、密码、token 与错误文本都不进 `audit_logs`。
 - `trace` 与 `governance` / `meta_audit` 共用一张表但分类独立：后台 worker 启动时立即清一次，之后每 24 小时按 1000 条一批抽干 30 天前的 `trace`；治理与 meta-audit 不进入这条删除路径。服务关闭会等待这一 worker 退出。
 
-**当前最远证据**：MySQL 已是 8 个迁移的最新结构；本轮 `make check` 全绿（domain 85.0%），完整 `make itest` 通过；`192.168.3.200` 上由代码提交 `49d5b16` 构建的 `dev-20260828-ui-polish-v1` 已由 Supervisor 保持 RUNNING，release 为 `claracore-server_dev-20260828-ui-polish-v1_linux_amd64`，发布包 SHA-256 为 `7500d65504855928dfce24b9c4b067186b3c021e91ac15d9828035fa4c6dc9b3`，上一 release `dev-20260828-apache-closeout-v1` 保留用于回滚。服务器内部与开发机绕过本地代理后的外部部署探针均验证 MySQL、Web 和 MCP 401 边界；`/proc` 已确认实际进程指向新 release，三个后台 worker 均在新进程启动，外部 CSS 已出现 `metric-grid`、`filter-bar`、`copy-button` 与 `visually-hidden`。上一轮已验证线上 `tools/list` 为 24 个工具且无 7B / qwen / recall-judge 工具或配置。内容浏览全文查找、共同线详情/历史/归档恢复、知识卡精确/高相似重复候选都已通过领域与 Web 测试；高相似阈值为 0.90，长卡片与存量向量使用同一 2000-rune 截断。真实 bge-m3 + 确定性 Stage B 集成门禁本轮两组正负样本均通过，单次约 101–107ms；没有靠降低阈值强行交付。README、贡献指南、安全策略、PR 模板、Dependabot、普通门槛 CI 与 MySQL 8.4 真库 CI 已加入，根目录及二进制 tarball 均包含与 Apache 官方原文哈希一致的 Apache License 2.0，公开模板中的团队内网拓扑已替换为安全示例值。登录后的主观视觉与完整业务操作验收仍待用户确认；当前内网 HTTP 按维护者决定暂不升级，公网部署时再验 HTTPS。
+**当前最远证据**：MySQL 已是 8 个迁移的最新结构；本轮 `make check` 全绿（domain 85.1%），完整 `make itest` 通过，包含真实 MySQL、MCP 端到端、语义召回、活动筛选与共同线 keyset 分页；`192.168.3.200` 上由代码提交 `b70c3d2` 构建的 `dev-20260828-ui-completion-v1` 已由 Supervisor 保持 RUNNING，release 为 `claracore-server_dev-20260828-ui-completion-v1_linux_amd64`，发布包 SHA-256 为 `481dec0382947209d641578778e4d9d9cfec80de8c7c538f78df5d9187d19137`，上一 release `dev-20260828-ui-polish-v1` 保留用于回滚。部署前备份 `predeploy-20260828-ui-completion-v1.sql.gz` 已用 `--no-tablespaces` 生成并通过 gzip 完整性、19 张表结构与 19 组数据段检查。服务器内部与开发机绕过本地代理后的外部部署探针均验证 MySQL、Web 和 MCP 401 边界；`/proc` 已确认实际进程指向新 release 且 `CCS_ENV=production`。这一版补齐草稿审核并发保护、高风险操作确认、共同线分页、概览 Agent/近期卡片、内容空间与作者信息、列表返回上下文、活动/审计多维筛选和管理员系统状态页；真实 bge-m3 + 确定性 Stage B 集成门禁两组正负样本均通过，单次约 107–131ms。线上 `tools/list` 的 24 工具证据沿用上一轮，本轮没有改变 MCP 工具面。登录后的主观视觉与完整业务操作验收仍待用户确认；当前内网 HTTP 按维护者决定暂不升级，公网部署时再验 HTTPS。
 
 ### 这一层还缺的东西
 
@@ -642,7 +642,7 @@ requireAdmin        ↑ 且角色是 admin
 
 ## 下一步
 
-**0. 当前工作流：人工验收与许可证选择。** 团队测试实例已有拟真演示数据、共同线列表/详情/历史/归档恢复、内容全文查找、重复候选、选择即提交筛选和新的上下文/生命周期能力；由用户刷新后用真浏览器验这些页面，以及登录、概览、活动、管理页和 1440/390px 布局。视觉与业务回执回来之前，不宣称生产验收。公开发布前由维护者明确选择许可证，不由实现者代猜。
+**0. 当前工作流：人工视觉与业务验收。** 团队测试实例已有拟真演示数据、共同线列表/详情/历史/归档恢复、内容全文查找、重复候选、选择即提交筛选、活动/审计筛选、系统状态和新的上下文/生命周期能力；由用户刷新后用真实身份检查登录、概览、内容、共同线、活动、管理页及 1440/390px 布局，并实际确认一次高风险操作提示。视觉与业务回执回来之前，不宣称生产验收。许可证已确定并落地为 Apache License 2.0。
 
 Continuity、项目空间权限、Web 摄取、删除检测、embedding backfill/失败观测、部署包、Supervisor 与 Nginx 代理均已完成。使用与验收方法统一见 `docs/08-usage-guide.md`；下一轮只按人工验收回执或缺口总览中的真实需求继续，不再根据旧文档重复建设已完成能力。
 
