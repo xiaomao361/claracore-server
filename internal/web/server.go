@@ -249,7 +249,7 @@ func NewHost(gov governanceService, know knowledgeService, continuity continuity
 // pages 是全部页面模板。新增页面要加进来——漏加会在启动时 panic，
 // 而不是等有人点开它才 500。
 var pages = []string{
-	"login.html", "password.html", "overview.html", "tokens.html", "members.html",
+	"login.html", "password.html", "overview.html", "governance.html", "context_quality.html", "tokens.html", "members.html",
 	"spaces.html",
 	"ingest.html",
 	"indexing.html",
@@ -297,6 +297,8 @@ func (h *Host) Handler() http.Handler {
 	mux.Handle("POST /password", h.requireUser(http.HandlerFunc(h.handlePasswordChange)))
 
 	mux.Handle("GET /{$}", h.requirePasswordSet(http.HandlerFunc(h.handleOverview)))
+	mux.Handle("GET /governance", h.requirePasswordSet(http.HandlerFunc(h.handleGovernance)))
+	mux.Handle("GET /context-quality", h.requirePasswordSet(http.HandlerFunc(h.handleContextQuality)))
 	mux.Handle("GET /tokens", h.requirePasswordSet(http.HandlerFunc(h.handleTokensPage)))
 	mux.Handle("POST /tokens", h.requirePasswordSet(http.HandlerFunc(h.handleTokenCreate)))
 	mux.Handle("POST /tokens/revoke", h.requirePasswordSet(http.HandlerFunc(h.handleTokenRevoke)))

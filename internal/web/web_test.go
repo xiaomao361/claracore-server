@@ -706,7 +706,7 @@ func body(t *testing.T, resp *http.Response) string {
 func TestUnauthenticatedIsRedirectedEverywhere(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, false)
 
-	for _, path := range []string{"/", "/tokens", "/password", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit", "/admin/system", "/admin/sources", "/admin/export"} {
+	for _, path := range []string{"/", "/governance", "/context-quality", "/tokens", "/password", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit", "/admin/system", "/admin/sources", "/admin/export"} {
 		t.Run(path, func(t *testing.T) {
 			resp := get(t, srv, path, false)
 			defer resp.Body.Close()
@@ -760,7 +760,7 @@ func TestMemberCannotPostToAdminEndpoints(t *testing.T) {
 func TestMustChangePasswordBlocksEverythingElse(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, true)
 
-	for _, path := range []string{"/", "/tokens", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit", "/admin/system", "/admin/sources", "/admin/export"} {
+	for _, path := range []string{"/", "/governance", "/context-quality", "/tokens", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit", "/admin/system", "/admin/sources", "/admin/export"} {
 		resp := get(t, srv, path, true)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/password" {
@@ -1332,12 +1332,106 @@ func TestOverviewKeepsRenderingWhenOptionalSignalsFail(t *testing.T) {
 	}
 }
 
+func TestGovernanceTurnsExistingSignalsIntoScopedWork(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	know := &fakeKnow{spaceStats: []knowledge.SpaceStats{
+		{SpaceID: spPers, DraftCards: 3, ActiveCards: 4, ActiveUnqualifiedCards: 1},
+		{SpaceID: spTeam, DraftCards: 7, ActiveCards: 8, ActiveUnqualifiedCards: 2},
+	}, embedHealth: knowledge.EmbeddingHealth{Enabled: true, Stats: knowledge.EmbeddingStats{Pending: 2, Failed: 4, Exhausted: 1}}}
+	lines := newFakeContinuity()
+	lines.stats = continuity.LineStats{Active: 5, NeedsReview: 1, Stale: 2}
+	activities := &fakeActivity{quality: activity.ContextFeedbackQuality{
+		Wrong: 2, Corrected: 1, AbstainReasons: activity.ContextAbstainReasons{Ambiguous: 4},
+	}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, lines, activities, logger, Options{
+		Version: "test", ExternalConfigured: true,
+		ExternalSources: func(context.Context, platform.ID) ([]external.SourceHealth, error) {
+			return []external.SourceHealth{
+				{Name: "healthy", LastSyncStatus: external.SyncSucceeded, LastSucceededAt: ptrTime(time.Now())},
+				{Name: "failed", LastSyncStatus: external.SyncFailed},
+			}, nil
+		},
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/governance", true))
+	for _, want := range []string{
+		"治理待办", "审核待发布卡片", ">3</strong><span>项", "补齐已发布卡片", ">1</strong><span>项",
+		"待复核 1 条，已陈旧 2 条", "错误 2、已纠正 1、因歧义放弃 4",
+		"处理语义索引失败", ">4</strong><span>项", "恢复外部来源", ">1</strong><span>项",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("治理待办缺少 %q", want)
+		}
+	}
+	if strings.Contains(page, ">10</strong><span>项") {
+		t.Fatal("审核待办不得包含只读团队空间的草稿")
+	}
+}
+
+func TestGovernanceHidesAdminOperationsFromMembers(t *testing.T) {
+	srv, _ := newTestWeb(t, governance.RoleMember, false)
+	page := body(t, get(t, srv, "/governance", true))
+	for _, hidden := range []string{"处理语义索引失败", "恢复外部来源"} {
+		if strings.Contains(page, hidden) {
+			t.Errorf("成员治理待办不应显示管理员运行项 %q", hidden)
+		}
+	}
+}
+
+func TestContextQualitySupportsBoundedWindowsAndHonestCopy(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	activities := &fakeActivity{quality: activity.ContextFeedbackQuality{
+		Selected: 20, Abstained: 6, FeedbackCoveredSelections: 5,
+		AbstainReasons: activity.ContextAbstainReasons{NoRelevantEvidence: 2, Ambiguous: 1, SemanticUnavailable: 1, RetrievalTimeout: 1, SharedLineNotReady: 1},
+		Delivered:      2, Used: 3, Ignored: 1, Wrong: 2, Corrected: 1,
+	}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), activities, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/context-quality?range=7d", true))
+	for _, want := range []string{
+		"自动上下文质量", "近 7 天选择与覆盖", "覆盖 25%", `progress max="20" value="5"`,
+		"无相关证据", "候选歧义", "反馈结果", "没有反馈表示未知", "不能解释成自动上下文准确率",
+		`href="/activity?action=gateway_context_feedback&amp;range=7d"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("上下文质量页缺少 %q", want)
+		}
+	}
+	if activities.qualityTenant != tenantA || activities.qualityWindow != 7*24*time.Hour {
+		t.Fatalf("上下文质量窗口不正确: tenant=%s window=%s", activities.qualityTenant, activities.qualityWindow)
+	}
+}
+
+func TestTokensGroupsAccessByAgentAndLinksToFilteredActivity(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	lastUsed := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
+	gov.tokens = []governance.Token{{
+		ID: "token", TenantID: tenantA, UserID: userMe, AgentID: "codex-local", Name: "MacBook", Prefix: "ccs", CreatedAt: lastUsed.Add(-time.Hour), LastUsedAt: &lastUsed,
+	}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/tokens", true))
+	for _, want := range []string{"Agent 接入状态", "codex-local", "有效 token", "全部 token", "最近使用", `href="/activity?agent=codex-local"`, "Token 明细"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("接入页缺少 %q", want)
+		}
+	}
+}
+
+func ptrTime(value time.Time) *time.Time { return &value }
+
 func TestWorkspaceShellKeepsNavigationAndAccessibilityContracts(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, false)
 	page := body(t, get(t, srv, "/", true))
 	for _, want := range []string{
 		`class="skip-link"`, `href="#main-content"`, `<aside class="sidebar">`,
-		`<nav aria-label="主导航">`, `aria-current="page"`, `id="main-content"`,
+		`<nav aria-label="主导航">`, `href="/governance"`, `href="/context-quality"`, `aria-current="page"`, `id="main-content"`,
 		`role="status"`,
 	} {
 		if want == `role="status"` {

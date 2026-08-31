@@ -15,6 +15,8 @@
   <nav aria-label="主导航">
     <p class="nav-label">工作区</p>
     <a href="/" class="{{if eq .Nav "overview"}}on{{end}}" {{if eq .Nav "overview"}}aria-current="page"{{end}}>概览</a>
+    <a href="/governance" class="{{if eq .Nav "governance"}}on{{end}}" {{if eq .Nav "governance"}}aria-current="page"{{end}}>治理待办</a>
+    <a href="/context-quality" class="{{if eq .Nav "context-quality"}}on{{end}}" {{if eq .Nav "context-quality"}}aria-current="page"{{end}}>上下文质量</a>
     <a href="/browse" class="{{if eq .Nav "browse"}}on{{end}}" {{if eq .Nav "browse"}}aria-current="page"{{end}}>内容库</a>
     <a href="/continuity" class="{{if eq .Nav "continuity"}}on{{end}}" {{if eq .Nav "continuity"}}aria-current="page"{{end}}>共同线</a>
     <a href="/review" class="{{if eq .Nav "review"}}on{{end}}" {{if eq .Nav "review"}}aria-current="page"{{end}}>审核队列</a>

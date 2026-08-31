@@ -16,6 +16,23 @@
   <button type="submit">签发 token</button>
 </form>
 
+<section aria-labelledby="agent-access-heading">
+  <div class="section-heading"><div><h2 id="agent-access-heading">Agent 接入状态</h2><p class="hint">按 Agent 汇总 token 和最近使用情况；权限仍继承所属成员。</p></div></div>
+  <div class="agent-grid">
+  {{range .Agents}}
+    <article class="card agent-card">
+      <div><h3><code>{{.AgentID}}</code></h3><p class="hint">最近签发 {{stamp .LastIssuedAt}}</p></div>
+      <dl><div><dt>有效 token</dt><dd>{{.ActiveTokens}}</dd></div><div><dt>全部 token</dt><dd>{{.TokenCount}}</dd></div><div><dt>最近使用</dt><dd>{{stampPtr .LastUsedAt}}</dd></div></dl>
+      <a href="/activity?agent={{urlquery .AgentID}}">查看此 Agent 的活动 →</a>
+    </article>
+  {{else}}
+    <div class="empty-state card">还没有 Agent 接入。先在上方签发第一个 token。</div>
+  {{end}}
+  </div>
+</section>
+
+<div class="section-heading"><div><h2>Token 明细</h2><p class="hint">轮换时先确认新 token 已开始使用，再吊销旧 token。</p></div></div>
+
 <div class="table-scroll" role="region" aria-label="访问令牌" tabindex="0"><table class="grid">
   <thead><tr><th scope="col">设备</th><th scope="col">Agent</th><th scope="col">前缀</th><th scope="col">创建</th><th scope="col">最后使用</th><th scope="col">状态</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
   <tbody>

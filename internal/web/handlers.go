@@ -403,6 +403,7 @@ func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 type tokensPageData struct {
 	pageData
 	Tokens      []governance.TokenSummary
+	Agents      []governance.AgentAccessSummary
 	HasPrevious bool
 	NextURL     string
 	// NewToken 只在刚创建后的那一次渲染里有值。明文**仅此一次展示**，
@@ -426,6 +427,11 @@ func (h *Host) renderTokens(w http.ResponseWriter, r *http.Request, data tokensP
 		data.Error = "读取 token 列表失败"
 	}
 	data.Tokens = page.Items
+	data.Agents, err = h.gov.ListAgentAccessSummaries(r.Context(), p.TenantID, p.UserID, 20)
+	if err != nil {
+		h.logger.Warn("读取接入页 agent 摘要失败", "error", err)
+		data.Notice = appendNotice(data.Notice, "Agent 汇总暂时不可用。")
+	}
 	data.HasPrevious = cursor != ""
 	if page.NextCursor != "" {
 		data.NextURL = "/tokens?" + url.Values{"cursor": {page.NextCursor}}.Encode()
