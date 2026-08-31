@@ -145,6 +145,27 @@ Shared Line 保存“工作推进到哪里”，不是第二套事实库：`fact
 - 管理员“团队导出”在明确确认后生成完整租户 ZIP。下载包含成员公开身份、空间权限、Memory、Card 与 Shared Line 历史，不包含密码/Token 哈希、会话、embedding、旧审计或运行队列；敏感读取会先写 meta-audit。下载后先运行发布包中的 `-verify-export`，再用 `-plan-import` 检查实体关系并选择接管管理员，这两个离线动作都不读取 `.env` 或连接外部依赖。`-import-export` 只能原子写入已迁移的空部署：接管管理员设置新密码，其他成员保持禁用，不能合并或覆盖现有团队。配置 embedding 时会把当前模型的可检索内容与导入数据同事务入队，但不会在 CLI 中调用模型；禁用时回执明确标为 `backfill_required`。导入 JSON 若因终端断开而丢失，在启动服务前用 `-check-import -import-admin <账号>` 只读重建纯净收据，不能盲目重跑。详细命令和索引收口见 `07-deployment.md`；迁移成功仍不替代来源认证、灾备恢复演练或代表性内容人工抽查。
 - `[演示]` 前缀及 `demo-seed` 标签的数据是拟真测试材料，不是团队业务事实。
 
+多用户展示数据由独立命令生成，不需要替换或重启正在运行的 Server。命令必须显式指定目标 tenant 和固定 seed key；首次应用把 5 组随机初始密码与 MCP token 写入一个新的 `0600` 绝对路径文件，标准输出只含不带秘密的 ID 回执。重复应用会核对数据库回执并返回 `alreadyApplied=true`，不会新增第二批数据：
+
+```bash
+go run ./cmd/demo-seed \
+  -mode apply \
+  -tenant <目标 tenant ULID> \
+  -confirm demo-seed-20260831-multi-user-v1 \
+  -credentials-file /secure/absolute/demo-credentials.json
+
+go run ./cmd/demo-seed -mode inspect -tenant <目标 tenant ULID>
+```
+
+清理只接受同一个 tenant 与 seed key，并按数据库回执中的精确 ID 在单事务内删除。若演示账号后来产生了回执之外的 Agent、Token、空间、Memory、Card 或 Shared Line，命令会拒绝自动清理，避免把后续人工数据当作 seed 一并删除：
+
+```bash
+go run ./cmd/demo-seed \
+  -mode cleanup \
+  -tenant <目标 tenant ULID> \
+  -confirm demo-seed-20260831-multi-user-v1
+```
+
 页面人工验收仍由用户完成：刷新后分别核对 1440px 与 390px、筛选结果、共同线内容、登录/权限/活动页；自动测试和 HTTP 探针不等于视觉验收。
 
 ## 7. 运维验证

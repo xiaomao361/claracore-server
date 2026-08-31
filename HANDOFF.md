@@ -48,6 +48,10 @@ Web 那条链路 0810 在真浏览器会话里手跑过一遍：未登录访问�
 
 **0827–0828 体验数据、共同线 Web、筛选与上下文能力已部署**：三个空间均有带 `[演示]` 前缀和 `demo-seed-20260827-v1` / `demo-seed` 标签的 Memory / Card，覆盖 active、archived、superseded、deleted、draft、deprecated、事实替代、卡片演进、跨实体关联与提升来源；另有一条 `ClaraCore Server 体验数据与筛选验收` Shared Line。它们是明确标记的拟真测试数据，不是业务事实。共同线现为左侧导航中的独立页面，按进行中/已归档/全部查看租户内各 agent；详情展示当前位置、位置历史和交接历史，可归档/恢复且经过 CSRF 与治理审计。内容浏览支持在类型、空间、状态范围内全文查找，查询与游标会安全编码并跨页保留；下拉筛选由同源 `/static/app.js` 选择即提交，切换类型会清除不兼容状态，并保留“应用筛选”作为无 JavaScript 兜底。自动 Card 上下文已与 Desktop 对齐为确定性 Stage B 预筛，终端 Agent 的模型做最终判断；服务端不再运行第二个大模型。Memory 原子 supersede、Card 原子 evolution、Shared Line 生命周期/历史与反馈治理均已包含。Nginx `/mcp` 上游 Host 固定为 loopback，避免 SDK 的 DNS-rebinding 防护把普通客户端拒为 403。
 
+**0831 多用户展示数据已写入团队测试实例**：tenant `01M11BM3XXXWYX63HVXC87Q52Y` 已应用 `demo-seed-20260831-multi-user-v1`，包含 5 个 `[演示]` 成员、5 个 Agent、5 个 30 天 token、7 个新空间（5 个个人、2 个项目）、10 条 Memory、10 张 Card（9 active、1 draft）、3 条 Shared Line 和跨最近 5 天的共享写入活动。数据库回执 `01M1BJNAVS0RXQPY9TRAS6FP67` 核对完整，重复应用返回 `alreadyApplied=true`；随机密码与 token 只保存在服务器 `/home/gbjk/zhouwei/claracore-server/.demo-seed-20260831-multi-user-v1.credentials.json`（0600）。写入前备份为 `claracore-server_claracore_server_20260831T092952Z.sql.gz`，SHA-256 与 gzip 已验证；写入后 29 条完整性规则零违规，Server readiness 继续通过。独立 seed 工具保存在 `ops/claracore-demo-seed-v2`，支持 inspect 和带漂移保护的精确 cleanup，不替换或重启 Server。
+
+**新登录当前被两条空的 active 集成测试 tenant 阻断**：`Team A` (`01M16PVMF9BF722QPM2GG6DWQE`) 与 `Foreign` (`01M16PVMF9BF722QPM2GG6DWQF`) 均为 0 用户、0 空间、0 审计，名称和创建方式可追到 `internal/adapters/mysql/export_integration_test.go`，但它们仍让单租户登录规则看到 3 个 active tenant；0831 的自动登录探针因此得到 401。已有管理员会话与页面读取仍正常。不要在没有明确数据修复授权时直接删除；下一步应先修正集成测试残留清理，再把这两个空 tenant 暂停或精确删除并复测新登录。
+
 ---
 
 ## 接手指引：先读哪三段
