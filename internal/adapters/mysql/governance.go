@@ -67,11 +67,11 @@ func NewGovernanceStore(db *sql.DB) *GovernanceStore {
 //	             发现这种数据损坏才存在的；SQL 替它把活干了，它就永远不会响。
 const findAuthContextSQL = `
 SELECT
-    t.id, t.tenant_id, t.user_id, t.agent_id, t.name, t.token_prefix, t.token_hash,
-    t.expires_at, t.last_used_at, t.revoked_at, t.created_at,
-    u.id, u.tenant_id, u.username, u.password_hash, u.display_name, u.role, u.must_change_pw, u.status, u.created_at,
-    a.id, a.tenant_id, a.user_id, a.slug, a.display_name, a.created_at,
-    n.id, n.name, n.status, n.created_at
+    t.id, t.tenant_id, t.user_id, t.agent_id,
+    t.expires_at, t.last_used_at, t.revoked_at,
+    u.id, u.tenant_id, u.username, u.display_name, u.role, u.status,
+    a.id, a.tenant_id, a.user_id, a.slug, a.display_name,
+    n.id, n.status
 FROM tokens t
 LEFT JOIN users   u ON u.id = t.user_id
 LEFT JOIN agents  a ON a.id = t.agent_id
@@ -81,27 +81,21 @@ WHERE t.token_hash = ?`
 func (s *GovernanceStore) FindAuthContext(ctx context.Context, tokenHash string) (*governance.AuthContext, error) {
 	var (
 		tokID, tokTenant, tokUser, tokAgent string
-		tokName, tokPrefix, tokHash         string
 		expiresAt, lastUsedAt, revokedAt    sql.NullTime
-		tokCreated                          time.Time
 
-		uID, uTenant, uUsername, uHash, uDisplay, uRole, uStatus sql.NullString
-		uMustChange                                              sql.NullBool
-		uCreated                                                 sql.NullTime
+		uID, uTenant, uUsername, uDisplay, uRole, uStatus sql.NullString
 
 		aID, aTenant, aUser, aSlug, aDisplay sql.NullString
-		aCreated                             sql.NullTime
 
-		nID, nName, nStatus sql.NullString
-		nCreated            sql.NullTime
+		nID, nStatus sql.NullString
 	)
 
 	err := s.ex.QueryRowContext(ctx, findAuthContextSQL, tokenHash).Scan(
-		&tokID, &tokTenant, &tokUser, &tokAgent, &tokName, &tokPrefix, &tokHash,
-		&expiresAt, &lastUsedAt, &revokedAt, &tokCreated,
-		&uID, &uTenant, &uUsername, &uHash, &uDisplay, &uRole, &uMustChange, &uStatus, &uCreated,
-		&aID, &aTenant, &aUser, &aSlug, &aDisplay, &aCreated,
-		&nID, &nName, &nStatus, &nCreated,
+		&tokID, &tokTenant, &tokUser, &tokAgent,
+		&expiresAt, &lastUsedAt, &revokedAt,
+		&uID, &uTenant, &uUsername, &uDisplay, &uRole, &uStatus,
+		&aID, &aTenant, &aUser, &aSlug, &aDisplay,
+		&nID, &nStatus,
 	)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
@@ -124,43 +118,33 @@ func (s *GovernanceStore) FindAuthContext(ctx context.Context, tokenHash string)
 	}
 
 	return &governance.AuthContext{
-		Token: governance.Token{
+		Token: governance.AuthToken{
 			ID:         platform.ID(tokID),
 			TenantID:   platform.ID(tokTenant),
 			UserID:     platform.ID(tokUser),
 			AgentID:    platform.ID(tokAgent),
-			Name:       tokName,
-			Prefix:     tokPrefix,
-			Hash:       tokHash,
 			ExpiresAt:  timePtr(expiresAt),
 			LastUsedAt: timePtr(lastUsedAt),
 			RevokedAt:  timePtr(revokedAt),
-			CreatedAt:  tokCreated.UTC(),
 		},
-		User: governance.User{
-			ID:           platform.ID(uID.String),
-			TenantID:     platform.ID(uTenant.String),
-			Username:     uUsername.String,
-			PasswordHash: uHash.String,
-			DisplayName:  uDisplay.String,
-			Role:         uRole.String,
-			MustChangePw: uMustChange.Bool,
-			Status:       uStatus.String,
-			CreatedAt:    uCreated.Time.UTC(),
+		User: governance.AuthUser{
+			ID:          platform.ID(uID.String),
+			TenantID:    platform.ID(uTenant.String),
+			Username:    uUsername.String,
+			DisplayName: uDisplay.String,
+			Role:        uRole.String,
+			Status:      uStatus.String,
 		},
-		Agent: governance.Agent{
+		Agent: governance.AuthAgent{
 			ID:          platform.ID(aID.String),
 			TenantID:    platform.ID(aTenant.String),
 			UserID:      platform.ID(aUser.String),
 			Slug:        aSlug.String,
 			DisplayName: aDisplay.String,
-			CreatedAt:   aCreated.Time.UTC(),
 		},
-		Tenant: governance.Tenant{
-			ID:        platform.ID(nID.String),
-			Name:      nName.String,
-			Status:    nStatus.String,
-			CreatedAt: nCreated.Time.UTC(),
+		Tenant: governance.AuthTenant{
+			ID:     platform.ID(nID.String),
+			Status: nStatus.String,
 		},
 	}, nil
 }
@@ -273,11 +257,18 @@ func (s *GovernanceStore) CreateTenant(ctx context.Context, t governance.Tenant)
 
 func (s *GovernanceStore) CreateUser(ctx context.Context, u governance.User) error {
 	_, err := s.ex.ExecContext(ctx,
-		`INSERT INTO users (id, tenant_id, username, password_hash, display_name, role, must_change_pw, status, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		string(u.ID), string(u.TenantID), u.Username, u.PasswordHash, u.DisplayName,
+		`INSERT INTO users (id, tenant_id, username, password_hash, auth_version, display_name, role, must_change_pw, status, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		string(u.ID), string(u.TenantID), u.Username, u.PasswordHash, normalizedAuthVersion(u.AuthVersion), u.DisplayName,
 		u.Role, u.MustChangePw, u.Status, u.CreatedAt.UTC())
 	return writeErr("创建用户", err)
+}
+
+func normalizedAuthVersion(version uint64) uint64 {
+	if version == 0 {
+		return 1
+	}
+	return version
 }
 
 func (s *GovernanceStore) CreateAgent(ctx context.Context, a governance.Agent) error {
@@ -315,7 +306,7 @@ func (s *GovernanceStore) CreateToken(ctx context.Context, t governance.Token) e
 // --- 治理面查询 ---
 
 // userColumns 只写一遍。列顺序散在两处 Scan 里，迟早有一处跟不上改动。
-const userColumns = `id, tenant_id, username, password_hash, display_name, role, must_change_pw, status, created_at`
+const userColumns = `id, tenant_id, username, password_hash, auth_version, display_name, role, must_change_pw, status, created_at`
 
 // scanRow 抹平 *sql.Row 与 *sql.Rows 的差异，让单行查询与列表查询共用一个 scan。
 type scanRow interface{ Scan(dest ...any) error }
@@ -326,7 +317,7 @@ func scanUserFrom(row scanRow) (governance.User, error) {
 		id, tid string
 		created time.Time
 	)
-	err := row.Scan(&id, &tid, &u.Username, &u.PasswordHash, &u.DisplayName,
+	err := row.Scan(&id, &tid, &u.Username, &u.PasswordHash, &u.AuthVersion, &u.DisplayName,
 		&u.Role, &u.MustChangePw, &u.Status, &created)
 	if err != nil {
 		return governance.User{}, err
@@ -692,7 +683,7 @@ func (s *GovernanceStore) ListPermissions(ctx context.Context, tenantID platform
 
 func (s *GovernanceStore) UpdateUserPassword(ctx context.Context, tenantID, userID platform.ID, hash string, mustChange bool, _ time.Time) error {
 	res, err := s.ex.ExecContext(ctx,
-		`UPDATE users SET password_hash = ?, must_change_pw = ? WHERE tenant_id = ? AND id = ?`,
+		`UPDATE users SET password_hash = ?, must_change_pw = ?, auth_version = auth_version + 1 WHERE tenant_id = ? AND id = ?`,
 		hash, mustChange, string(tenantID), string(userID))
 	if err != nil {
 		return fmt.Errorf("mysql: 更新密码: %w", err)
@@ -700,10 +691,28 @@ func (s *GovernanceStore) UpdateUserPassword(ctx context.Context, tenantID, user
 	return s.confirmUserTouched(ctx, res, tenantID, userID)
 }
 
+func (s *GovernanceStore) UpgradeUserPasswordHash(ctx context.Context, tenantID, userID platform.ID, expectedHash, newHash string, expectedAuthVersion uint64) (bool, error) {
+	res, err := s.ex.ExecContext(ctx,
+		`UPDATE users SET password_hash = ?
+		 WHERE tenant_id = ? AND id = ? AND password_hash = ? AND auth_version = ?`,
+		newHash, string(tenantID), string(userID), expectedHash, expectedAuthVersion)
+	if err != nil {
+		return false, fmt.Errorf("mysql: 渐进升级密码哈希: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mysql: 确认密码哈希升级: %w", err)
+	}
+	return n == 1, nil
+}
+
 func (s *GovernanceStore) UpdateUserStatus(ctx context.Context, tenantID, userID platform.ID, status string, _ time.Time) error {
 	res, err := s.ex.ExecContext(ctx,
-		`UPDATE users SET status = ? WHERE tenant_id = ? AND id = ?`,
-		status, string(tenantID), string(userID))
+		// MySQL evaluates SET assignments from left to right. Advance the
+		// generation before assigning status, or the comparison would always
+		// observe the new value and revoke nothing.
+		`UPDATE users SET auth_version = auth_version + IF(status <> ?, 1, 0), status = ? WHERE tenant_id = ? AND id = ?`,
+		status, status, string(tenantID), string(userID))
 	if err != nil {
 		return fmt.Errorf("mysql: 更新账号状态: %w", err)
 	}

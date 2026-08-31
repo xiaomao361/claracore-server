@@ -46,5 +46,11 @@
   {{end}}
   </tbody>
 </table></div>
+{{if or .HasPrevious .NextURL}}
+<nav class="pagination" aria-label="成员分页">
+  {{if .HasPrevious}}<a href="/admin/members">← 返回第一页</a>{{end}}
+  {{if .NextURL}}<a href="{{.NextURL}}">下一页 →</a>{{end}}
+</nav>
+{{end}}
 <p class="hint">停用会立即废掉此人全部 Web 会话；他的 MCP token 也会在下一次调用时失效。</p>
 {{end}}

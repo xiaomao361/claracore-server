@@ -180,21 +180,40 @@ func auditGatewayAutoContext(_ gatewayAutoContextInput, out gatewayAutoContextOu
 	if err != nil {
 		return toolActivityDetails{}
 	}
-	return toolActivityDetails{metadata: map[string]any{"decision": out.Decision, "semanticAvailable": out.SemanticAvailable, "policyAvailable": out.PolicyAvailable}}
+	metadata := map[string]any{
+		"decision": out.Decision, "reason": out.Reason,
+		"semanticAvailable": out.SemanticAvailable, "policyAvailable": out.PolicyAvailable,
+	}
+	if out.ContextID != "" {
+		metadata["contextId"] = out.ContextID
+	}
+	return toolActivityDetails{metadata: metadata}
 }
 
 func auditGatewayContextFeedback(in gatewayContextFeedbackInput, out gatewayContextFeedbackOut, err error) toolActivityDetails {
 	if err != nil {
 		return toolActivityDetails{}
 	}
-	return entityDetails("card", in.CardID, "", map[string]any{"feedbackOutcome": out.Outcome})
+	entityType := out.Domain
+	if entityType == "knowledge_card" {
+		entityType = "card"
+	}
+	metadata := map[string]any{"feedbackOutcome": out.Outcome}
+	if out.ContextID != "" {
+		metadata["contextId"] = out.ContextID
+	}
+	return entityDetails(entityType, out.ID, "", metadata)
 }
 
 func auditContextQualityStatus(_ contextQualityStatusInput, out contextQualityStatusOut, err error) toolActivityDetails {
 	if err != nil {
 		return toolActivityDetails{}
 	}
-	return toolActivityDetails{metadata: map[string]any{"submittedFeedbackCount": out.Submitted}}
+	return toolActivityDetails{metadata: map[string]any{
+		"submittedFeedbackCount": out.Submitted,
+		"selectedCount":          out.Selected,
+		"coveredSelectionCount":  out.Covered,
+	}}
 }
 
 func auditSharedLineStatus(in sharedLineStatusInput, _ resumePacketOut, err error) toolActivityDetails {
@@ -249,12 +268,37 @@ func auditMemoriaSearch(_ memoriaSearchInput, out memoriaSearchOut, err error) t
 			semanticHits++
 		}
 	}
+	matchIDs := make([]string, 0, len(out.Matches))
+	matchCounts := map[string]int{"memory": 0, "card": 0, "external": 0}
+	for _, match := range out.Matches {
+		matchCounts[match.Type]++
+		var id string
+		switch {
+		case match.Memory != nil:
+			id = match.Memory.ID
+		case match.Card != nil:
+			id = match.Card.ID
+		case match.External != nil:
+			id = match.External.ID
+		}
+		if safe, ok := safeMetadataID(id); ok {
+			matchIDs = append(matchIDs, safe)
+		}
+	}
 	return toolActivityDetails{metadata: map[string]any{
-		"hitIds":            ids,
-		"hitCount":          len(out.Hits),
-		"semanticHitCount":  semanticHits,
-		"semanticAvailable": out.SemanticAvailable,
-		"cardMatches":       out.CardMatches,
+		"hitIds":                    ids,
+		"hitCount":                  len(out.Hits),
+		"semanticHitCount":          semanticHits,
+		"semanticAvailable":         out.SemanticAvailable,
+		"cardSemanticAvailable":     out.CardSemanticAvailable,
+		"cardMatches":               out.CardMatches,
+		"matchIds":                  matchIDs,
+		"matchCount":                len(out.Matches),
+		"memoryMatchCount":          matchCounts["memory"],
+		"cardMatchCount":            matchCounts["card"],
+		"externalMatchCount":        matchCounts["external"],
+		"externalStatus":            out.ExternalStatus,
+		"externalSemanticAvailable": out.ExternalSemanticAvailable,
 	}}
 }
 

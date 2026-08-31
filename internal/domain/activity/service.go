@@ -19,6 +19,7 @@ const (
 	maxListLimit       = 100
 	defaultDeleteLimit = 1000
 	maxDeleteLimit     = 10000
+	maxPulseDays       = 31
 )
 
 type Service struct {
@@ -152,8 +153,9 @@ func validateListFilters(action, outcome string) error {
 	return nil
 }
 
-// ContextFeedbackQuality returns aggregate submitted feedback since the given
-// instant. Governance rows are retained independently from short-lived traces.
+// ContextFeedbackQuality returns aggregate decisions and submitted feedback
+// since the given instant. A matching context ID provides a trustworthy feedback
+// coverage denominator while outcome values remain caller-submitted evidence.
 func (s *Service) ContextFeedbackQuality(ctx context.Context, tenantID platform.ID, window time.Duration) (ContextFeedbackQuality, error) {
 	if tenantID == "" || window <= 0 {
 		return ContextFeedbackQuality{}, fmt.Errorf("%w: 缺少租户或统计窗口", ErrInvalidArgument)
@@ -163,6 +165,47 @@ func (s *Service) ContextFeedbackQuality(ctx context.Context, tenantID platform.
 		TenantID: tenantID,
 		Since:    since,
 	})
+}
+
+// SharedActivityPulse returns complete UTC calendar-day buckets for successful
+// writes in readable shared spaces. Missing days are filled with zero so the Web
+// layer cannot accidentally turn sparse SQL rows into a misleading timeline.
+func (s *Service) SharedActivityPulse(ctx context.Context, tenantID platform.ID, readableSharedSpaceIDs []platform.ID, days int) (SharedActivityPulse, error) {
+	if tenantID == "" || days <= 0 || days > maxPulseDays {
+		return SharedActivityPulse{}, fmt.Errorf("%w: 缺少租户或统计天数超出 1-%d", ErrInvalidArgument, maxPulseDays)
+	}
+	spaces, err := normalizeSpaceIDs(readableSharedSpaceIDs)
+	if err != nil {
+		return SharedActivityPulse{}, err
+	}
+	now := s.clock.Now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	since := today.AddDate(0, 0, 1-days)
+
+	pulse := SharedActivityPulse{Since: since}
+	if len(spaces) > 0 {
+		pulse, err = s.store.CountSharedActivity(ctx, SharedActivityQuery{
+			TenantID: tenantID, ReadableSharedSpaceIDs: spaces, Since: since,
+		})
+		if err != nil {
+			return SharedActivityPulse{}, err
+		}
+		pulse.Since = since
+	}
+
+	byDay := make(map[string]int, len(pulse.DailyWrites))
+	for _, daily := range pulse.DailyWrites {
+		day := daily.Date.UTC().Format("2006-01-02")
+		byDay[day] += daily.Writes
+	}
+	pulse.DailyWrites = make([]DailySharedWrites, 0, days)
+	for i := 0; i < days; i++ {
+		date := since.AddDate(0, 0, i)
+		pulse.DailyWrites = append(pulse.DailyWrites, DailySharedWrites{
+			Date: date, Writes: byDay[date.Format("2006-01-02")],
+		})
+	}
+	return pulse, nil
 }
 
 // DeleteTracesBefore removes one bounded batch of expired trace rows.
@@ -195,7 +238,7 @@ func (e *Event) validate() error {
 	}
 
 	switch e.Source {
-	case SourceMCP, SourceWeb:
+	case SourceMCP, SourceWeb, SourceCLI:
 	default:
 		return fmt.Errorf("%w: 来源取值非法 %q", ErrInvalidArgument, e.Source)
 	}

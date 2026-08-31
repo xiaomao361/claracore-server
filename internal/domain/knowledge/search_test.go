@@ -579,6 +579,38 @@ func TestAutomaticRecallUsesDeterministicStageB(t *testing.T) {
 	})
 }
 
+func TestAutomaticMemoryRecallUsesDeterministicStageB(t *testing.T) {
+	t.Run("semantic unavailable", func(t *testing.T) {
+		svc, _ := newSearchServiceNoEmbedder(t)
+		seedMemory(t, svc, spacePriv)
+		got, err := svc.RecallMemoryForContext(context.Background(), SearchMemoriesInput{TenantID: tenantA, Spaces: readable(spacePriv), Query: "MySQL 连接池"})
+		if err != nil || got.Hit != nil || got.PolicyAvailable || got.Reason != "semantic_unavailable" {
+			t.Fatalf("无语义证据必须放弃: %+v err=%v", got, err)
+		}
+	})
+
+	t.Run("high confidence current top1", func(t *testing.T) {
+		svc, _, _ := newSearchService(t, "mysql", "连接池", "maxopenconns", "cpu", "核数")
+		memory := seedMemory(t, svc, spacePriv)
+		indexAll(t, svc)
+		got, err := svc.RecallMemoryForContext(context.Background(), SearchMemoriesInput{TenantID: tenantA, Spaces: readable(spacePriv), Query: "MySQL 连接池 MaxOpenConns CPU 核数"})
+		if err != nil || got.Hit == nil || got.Hit.Memory.ID != memory.ID || !got.PolicyAvailable || got.Reason != "high_confidence_top1" {
+			t.Fatalf("高置信当前记忆应进入候选: %+v err=%v", got, err)
+		}
+	})
+
+	t.Run("ambiguous top results", func(t *testing.T) {
+		svc, _, _ := newSearchService(t, "mysql", "连接池", "maxopenconns", "cpu", "核数")
+		seedMemory(t, svc, spacePriv)
+		seedMemory(t, svc, spacePriv)
+		indexAll(t, svc)
+		got, err := svc.RecallMemoryForContext(context.Background(), SearchMemoriesInput{TenantID: tenantA, Spaces: readable(spacePriv), Query: "MySQL 连接池 MaxOpenConns CPU 核数"})
+		if err != nil || got.Hit != nil || got.Reason != "ambiguous_top_results" {
+			t.Fatalf("歧义首条必须放弃: %+v err=%v", got, err)
+		}
+	})
+}
+
 func TestMemorySearchTimeViewSeparatesCurrentAndHistorical(t *testing.T) {
 	svc, store := newSearchServiceNoEmbedder(t)
 	current := seedMemory(t, svc, spacePriv)
@@ -699,6 +731,9 @@ func TestSpaceStatsUnqualifiedMatchesIsQualified(t *testing.T) {
 	}
 	if got.DraftCards != 1 {
 		t.Fatalf("待审草稿应为 1，实际 %d", got.DraftCards)
+	}
+	if got.ActiveCards != 1 || got.ActiveUnqualifiedCards != 0 || got.RecallReadyCards != 1 {
+		t.Fatalf("active 质量口径不符: %+v", got)
 	}
 	// draft 的卡也有召回条件，但它不进默认检索——统计要如实反映库里有什么
 	if got.RecallTriggers != 3 {

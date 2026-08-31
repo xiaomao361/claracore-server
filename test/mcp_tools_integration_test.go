@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"claracore-server/internal/config"
 	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/continuity"
+	"claracore-server/internal/domain/external"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	mcphost "claracore-server/internal/mcp"
@@ -41,10 +43,11 @@ type toolEnv struct {
 	token string
 	know  *knowledge.Service
 
-	tenantID    platform.ID
-	personalID  platform.ID
-	teamID      platform.ID
-	hasEmbedder bool
+	tenantID      platform.ID
+	personalID    platform.ID
+	teamID        platform.ID
+	hasEmbedder   bool
+	externalDocID platform.ID
 }
 
 func newToolEnv(t *testing.T) toolEnv {
@@ -87,6 +90,10 @@ func newToolEnv(t *testing.T) toolEnv {
 			`DELETE FROM continuity_positions WHERE tenant_id = ?`,
 			`DELETE FROM continuity_lines WHERE tenant_id = ?`,
 			`DELETE FROM audit_logs WHERE tenant_id = ?`,
+			`DELETE FROM external_document_vectors WHERE tenant_id = ?`,
+			`DELETE FROM external_documents WHERE tenant_id = ?`,
+			`DELETE FROM external_sync_runs WHERE tenant_id = ?`,
+			`DELETE FROM external_sources WHERE tenant_id = ?`,
 			`DELETE FROM embeddings WHERE tenant_id = ?`,
 			`DELETE FROM card_recall_triggers WHERE tenant_id = ?`,
 			`DELETE FROM labels WHERE tenant_id = ?`,
@@ -131,20 +138,60 @@ func newToolEnv(t *testing.T) toolEnv {
 	}
 
 	know := knowledge.NewService(mysql.NewKnowledgeStore(db), clock, ids, embedder)
+	externalStore := mysql.NewExternalStore(db)
+	externalService := external.NewService(externalStore, clock, ids, embedder)
+	var externalDocID platform.ID
+	if embedder != nil {
+		source, err := externalStore.EnsureSource(ctx, external.MirrorSource{
+			ID: ids.New(), TenantID: tenantID, SpaceID: provisioned.TeamSpace.ID,
+			Kind: "atlas_mcp", Name: "atlas-e2e", System: "shared-docs", Status: external.SourceActive,
+			CreatedAt: clock.Now(), UpdatedAt: clock.Now(),
+		})
+		if err != nil {
+			t.Fatalf("创建外部来源失败: %v", err)
+		}
+		run := external.SyncRun{ID: ids.New(), TenantID: tenantID, ExternalSourceID: source.ID, Status: external.SyncRunning, StartedAt: clock.Now(), LeaseUntil: clock.Now().Add(time.Minute), CreatedAt: clock.Now()}
+		if err := externalStore.BeginSync(ctx, run); err != nil {
+			t.Fatalf("启动外部镜像夹具失败: %v", err)
+		}
+		text := "Atlas 发布部署操作手册\n\n发布前核对版本、迁移与回滚点，完成后检查健康探针。"
+		vectors, err := embedder.Embed(ctx, []string{text})
+		if err != nil || len(vectors) != 1 || len(vectors[0]) == 0 {
+			t.Fatalf("生成外部镜像向量失败: vectors=%d err=%v", len(vectors), err)
+		}
+		externalDocID = ids.New()
+		document := external.MirrorDocument{
+			ID: externalDocID, TenantID: tenantID, SpaceID: provisioned.TeamSpace.ID, ExternalSourceID: source.ID,
+			UpstreamSourceID: "atlas-capture", ExternalID: "atlas-runbook", Kind: "yuque_document",
+			Title: "Atlas 发布部署操作手册", SourceRef: "https://atlas.example/source-documents/atlas-runbook",
+			Revision: "rev-e2e", UpstreamUpdatedAt: "2026-08-29T08:00:00Z", State: external.DocumentActive,
+			LastSeenRunID: run.ID, CreatedAt: clock.Now(), UpdatedAt: clock.Now(),
+		}
+		if err := externalStore.SaveIndexedDocument(ctx, document, external.DocumentVector{
+			ID: ids.New(), TenantID: tenantID, ExternalDocumentID: document.ID, Model: embedder.Model(), Revision: document.Revision,
+			InputHash: strings.Repeat("a", 64), Vector: vectors[0], CreatedAt: clock.Now(), UpdatedAt: clock.Now(),
+		}); err != nil {
+			t.Fatalf("写入外部镜像夹具失败: %v", err)
+		}
+		if _, err := externalStore.CompleteSync(ctx, source.ID, run.ID, external.SyncReport{Seen: 1, Indexed: 1}, clock.Now()); err != nil {
+			t.Fatalf("完成外部镜像夹具失败: %v", err)
+		}
+	}
 	activityService := activity.NewService(mysql.NewActivityStore(db), clock, ids)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	continuityService := continuity.NewService(mysql.NewContinuityStore(db), clock, ids)
 	srv := httptest.NewServer(mcphost.NewHost(gov, know, continuityService, activityService, logger, mcphost.HostOptions{
-		Version: "tools-e2e", SemanticSearch: embedder != nil,
+		Version: "tools-e2e", SemanticSearch: embedder != nil, ExternalSearch: externalService, ExternalConfigured: embedder != nil,
 	}).Handler())
 	t.Cleanup(srv.Close)
 
 	return toolEnv{
 		srv: srv, token: plaintext, know: know,
-		tenantID:    tenantID,
-		personalID:  provisioned.Personal.ID,
-		teamID:      provisioned.TeamSpace.ID,
-		hasEmbedder: embedder != nil,
+		tenantID:      tenantID,
+		personalID:    provisioned.Personal.ID,
+		teamID:        provisioned.TeamSpace.ID,
+		hasEmbedder:   embedder != nil,
+		externalDocID: externalDocID,
 	}
 }
 
@@ -220,6 +267,18 @@ type e2eSearch struct {
 	Hits              []e2eContent `json:"hits"`
 	SemanticAvailable bool         `json:"semanticAvailable"`
 	CardMatches       int          `json:"cardMatches"`
+	Matches           []struct {
+		Type     string `json:"type"`
+		Group    string `json:"group"`
+		External *struct {
+			ID        string   `json:"id"`
+			Space     e2eSpace `json:"space"`
+			SourceRef string   `json:"sourceRef"`
+			Freshness string   `json:"freshness"`
+		} `json:"external"`
+	} `json:"matches"`
+	ExternalStatus            string `json:"externalStatus"`
+	ExternalSemanticAvailable bool   `json:"externalSemanticAvailable"`
 }
 
 type e2eResumePacket struct {
@@ -239,6 +298,28 @@ type e2eResumePacket struct {
 		Completed []string `json:"completed"`
 		NextStep  string   `json:"nextStep"`
 	} `json:"recentHandoff"`
+}
+
+type e2eAutomaticContext struct {
+	Decision          string         `json:"decision"`
+	Reason            string         `json:"reason"`
+	ContextID         string         `json:"contextId"`
+	SemanticAvailable bool           `json:"semanticAvailable"`
+	PolicyAvailable   bool           `json:"policyAvailable"`
+	Block             map[string]any `json:"block"`
+}
+
+type e2eContextQuality struct {
+	Selected       int `json:"selected"`
+	Abstained      int `json:"abstained"`
+	AbstainReasons struct {
+		NoRelevantEvidence  int `json:"noRelevantEvidence"`
+		Ambiguous           int `json:"ambiguous"`
+		SemanticUnavailable int `json:"semanticUnavailable"`
+		RetrievalTimeout    int `json:"retrievalTimeout"`
+		SharedLineNotReady  int `json:"sharedLineNotReady"`
+		Other               int `json:"other"`
+	} `json:"abstainReasons"`
 }
 
 // TestMCPToolsEndToEnd 走一遍真实的工作流。
@@ -308,20 +389,27 @@ func TestMCPToolsEndToEnd(t *testing.T) {
 		if !env.hasEmbedder {
 			t.Skip("降级路径，没有索引队列")
 		}
-		total := 0
+		deadline := time.Now().Add(10 * time.Second)
 		for {
-			report, err := env.know.IndexPending(context.Background(), 32)
+			_, err := env.know.IndexPending(context.Background(), 32)
 			if err != nil {
 				t.Fatalf("索引失败: %v", err)
 			}
-			total += report.Indexed
-			if report.Picked == 0 {
+			health, err := env.know.EmbeddingHealth(context.Background(), env.tenantID, 3)
+			if err != nil {
+				t.Fatalf("读取本租户索引状态失败: %v", err)
+			}
+			// make itest runs packages concurrently against one integration DB.
+			// Another legitimate indexer may claim one of these rows, so this
+			// acceptance must observe the target tenant's durable outcome rather
+			// than count how many rows this particular caller wrote.
+			if health.Stats.Ready == 3 && health.Stats.Pending == 0 && health.Stats.Failed == 0 {
 				break
 			}
-		}
-		// 一条记忆 + 一张卡片正文 + 一条召回条件 = 3
-		if total != 3 {
-			t.Fatalf("期望索引 3 条（记忆 / 卡片正文 / 召回条件），实际 %d", total)
+			if time.Now().After(deadline) {
+				t.Fatalf("期望本租户 3 条索引全部 ready，实际 %+v", health.Stats)
+			}
+			time.Sleep(25 * time.Millisecond)
 		}
 	})
 
@@ -362,6 +450,29 @@ func TestMCPToolsEndToEnd(t *testing.T) {
 		// agent 搜一次 memory 没找到就以为没有，而卡片才是核心载体
 		if res.CardMatches != 1 {
 			t.Fatalf("memory 命中偏少时应给出卡片命中计数，期望 1，实际 %d", res.CardMatches)
+		}
+	})
+
+	t.Run("memoria_search 统一返回 body-free 外部镜像", func(t *testing.T) {
+		if !env.hasEmbedder {
+			t.Skip("降级路径，没有可比较的外部向量")
+		}
+		var res e2eSearch
+		if msg := env.tool(t, "memoria_search", map[string]any{"query": "如何执行 Atlas 发布部署", "limit": 10}, &res); msg != "" {
+			t.Fatal(msg)
+		}
+		var found bool
+		for _, match := range res.Matches {
+			if match.Type != "external" || match.External == nil {
+				continue
+			}
+			found = match.External.ID == string(env.externalDocID)
+			if match.Group != "semantic" || match.External.Space.ID != string(env.teamID) || match.External.SourceRef == "" || match.External.Freshness != "last_sync_succeeded" {
+				t.Fatalf("外部命中缺少空间、来源或新鲜度: %+v", match)
+			}
+		}
+		if !found || res.ExternalStatus != "available" || !res.ExternalSemanticAvailable {
+			t.Fatalf("统一外部检索链路未打通: found=%v result=%+v", found, res)
 		}
 	})
 
@@ -510,6 +621,56 @@ func TestMCPToolsEndToEnd(t *testing.T) {
 			}
 		}
 	})
+}
+
+// 真实 token、权限解析、MCP 协议、MySQL 与 bge-m3 共同证明跨域竞争会
+// fail closed。领域 fake 单测只能证明分支写对，不能证明两个真实召回器
+// 在同一条用户消息上确实都能越过各自的 Stage B 门槛。
+func TestGatewayAutoContextCrossDomainAmbiguityEndToEnd(t *testing.T) {
+	env := newToolEnv(t)
+	if !env.hasEmbedder {
+		t.Skip("需要真实 embedding 才能验证跨域高置信竞争")
+	}
+	const prompt = "准备宣布服务发布完成时，必须分别核对运行时健康和真实业务验收"
+	if msg := env.tool(t, "memoria_create", map[string]any{
+		"title": "发布完成需要分层验收",
+		"body":  prompt,
+	}, nil); msg != "" {
+		t.Fatal(msg)
+	}
+	if msg := env.tool(t, "card_create", map[string]any{
+		"title":         "发布完成需要分层验收",
+		"cardType":      "发布安全",
+		"distilled":     "运行时健康与真实业务验收是两层独立证据。",
+		"understanding": "健康探针成功不能替代业务结果。",
+		"recallTriggers": []string{
+			prompt,
+		},
+	}, nil); msg != "" {
+		t.Fatal(msg)
+	}
+	indexAll(t, env.know, 16)
+
+	var got e2eAutomaticContext
+	if msg := env.tool(t, "gateway_auto_context", map[string]any{"prompt": prompt}, &got); msg != "" {
+		t.Fatal(msg)
+	}
+	if !got.SemanticAvailable || !got.PolicyAvailable {
+		t.Fatalf("真实质量链路应可用: %+v", got)
+	}
+	if got.Decision != "abstain" || got.Reason != "ambiguous_domains" || got.ContextID != "" || got.Block != nil {
+		t.Fatalf("Memory 与 Card 同时高置信时必须跨域拒答: %+v", got)
+	}
+
+	var quality e2eContextQuality
+	if msg := env.tool(t, "context_quality_status", nil, &quality); msg != "" {
+		t.Fatal(msg)
+	}
+	if quality.Selected != 0 || quality.Abstained != 1 || quality.AbstainReasons.Ambiguous != 1 ||
+		quality.AbstainReasons.NoRelevantEvidence != 0 || quality.AbstainReasons.SemanticUnavailable != 0 ||
+		quality.AbstainReasons.RetrievalTimeout != 0 || quality.AbstainReasons.SharedLineNotReady != 0 || quality.AbstainReasons.Other != 0 {
+		t.Fatalf("真实跨域拒答必须进入唯一歧义桶: %+v", quality)
+	}
 }
 
 func containsAny(s string, subs ...string) bool {

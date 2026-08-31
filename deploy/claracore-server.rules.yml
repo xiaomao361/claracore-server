@@ -1,0 +1,288 @@
+groups:
+  - name: claracore-server
+    interval: 30s
+    rules:
+      - alert: ClaraCoreTargetDown
+        expr: up{job="claracore-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: runtime
+        annotations:
+          summary: "ClaraCore Server target is down"
+          description: "Prometheus has been unable to scrape {{ $labels.instance }} for 2 minutes. Check the process, loopback metrics listener, and host networking."
+          runbook: "DEPLOYMENT.md section 4.1 and rollback section 5"
+
+      - alert: ClaraCoreNotAcceptingRequests
+        expr: |
+          (claracore_instance_accepting_requests == 0)
+          and on (job, instance) (up{job="claracore-server"} == 1)
+        for: 10m
+        labels:
+          severity: warning
+          component: runtime
+        annotations:
+          summary: "ClaraCore Server remains in draining state"
+          description: "{{ $labels.instance }} is still scrapeable but has refused new business requests for 10 minutes. A normal rollout should finish before this alert fires."
+          runbook: "DEPLOYMENT.md upgrade section 4"
+
+      - alert: ClaraCoreDevelopmentBuildInProduction
+        expr: |
+          claracore_build_info{
+            job="claracore-server",
+            environment="production",
+            source_digest="development"
+          } == 1
+        for: 5m
+        labels:
+          severity: critical
+          component: release
+        annotations:
+          summary: "ClaraCore production is running an unbound development build"
+          description: "{{ $labels.instance }} reports source_digest=development in production. Replace it with a verified package-release.sh artifact before continuing the rollout."
+          runbook: "DEPLOYMENT.md release package section 1"
+
+      - alert: ClaraCoreMixedBuildArtifacts
+        expr: |
+          count by (job) (
+            count by (job, version, source_digest, binary_digest, environment) (
+              claracore_build_info{job="claracore-server"}
+            )
+          ) > 1
+        for: 15m
+        labels:
+          severity: warning
+          component: release
+        annotations:
+          summary: "ClaraCore instances are running mixed build artifacts"
+          description: "The ClaraCore scrape job has exposed more than one version/source/binary/environment identity for 15 minutes. A normal rolling release should converge before this alert fires."
+          runbook: "DEPLOYMENT.md upgrade section 4 and cluster verification"
+
+      - alert: ClaraCoreBackupReceiptMissing
+        expr: claracore_backup_receipt_available == 0
+        for: 15m
+        labels:
+          severity: critical
+          component: backup
+        annotations:
+          summary: "ClaraCore backup verification receipt is unavailable"
+          description: "{{ $labels.instance }} has no valid bounded backup receipt. Check the timer, oneshot service, file permissions, and verifier output."
+          runbook: "DEPLOYMENT.md backup section 3"
+
+      - alert: ClaraCoreBackupStale
+        expr: |
+          (claracore_backup_fresh == 0)
+          and on (job, instance) (claracore_backup_receipt_available == 1)
+        for: 15m
+        labels:
+          severity: critical
+          component: backup
+        annotations:
+          summary: "ClaraCore latest verified backup is stale"
+          description: "{{ $labels.instance }} has a valid receipt, but the archive is outside its configured age budget or the host clock is invalid."
+          runbook: "DEPLOYMENT.md backup section 3"
+
+      - alert: ClaraCoreRestoreReceiptMissing
+        expr: |
+          (claracore_restore_receipt_available == 0)
+          and on (job, instance) (claracore_backup_receipt_available == 1)
+        for: 24h
+        labels:
+          severity: warning
+          component: recovery
+        annotations:
+          summary: "ClaraCore isolated-restore evidence is unavailable"
+          description: "{{ $labels.instance }} has a valid backup receipt but no valid bounded isolated-restore receipt. Run the rehearsal on an isolated MySQL host and return only its technical receipt."
+          runbook: "DEPLOYMENT.md backup and restore section 3"
+
+      - alert: ClaraCoreRestoreStale
+        expr: |
+          (claracore_restore_fresh == 0)
+          and on (job, instance) (claracore_restore_receipt_available == 1)
+        for: 1h
+        labels:
+          severity: critical
+          component: recovery
+        annotations:
+          summary: "ClaraCore isolated-restore rehearsal is stale"
+          description: "{{ $labels.instance }} has a valid technical restore receipt, but it is outside the declared rehearsal age budget or the host clock is invalid."
+          runbook: "DEPLOYMENT.md backup and restore section 3"
+
+      - alert: ClaraCoreIntegrityReceiptMissing
+        expr: claracore_integrity_receipt_available == 0
+        for: 1h
+        labels:
+          severity: warning
+          component: integrity
+        annotations:
+          summary: "ClaraCore data-integrity evidence is unavailable"
+          description: "{{ $labels.instance }} has no valid bounded integrity receipt for the current schema. Check the timer, oneshot service, receipt permissions, and command logs."
+          runbook: "DEPLOYMENT.md data integrity section"
+
+      - alert: ClaraCoreIntegrityStale
+        expr: |
+          (claracore_integrity_fresh == 0)
+          and on (job, instance) (claracore_integrity_receipt_available == 1)
+          and on (job, instance) (claracore_integrity_verified == 1)
+        for: 1h
+        labels:
+          severity: warning
+          component: integrity
+        annotations:
+          summary: "ClaraCore data-integrity check is stale"
+          description: "{{ $labels.instance }} last completed a zero-violation check outside its configured age budget or has a clock anomaly."
+          runbook: "DEPLOYMENT.md data integrity section"
+
+      - alert: ClaraCoreIntegrityViolations
+        expr: |
+          (claracore_integrity_violations > 0)
+          and on (job, instance) (claracore_integrity_receipt_available == 1)
+        for: 15m
+        labels:
+          severity: critical
+          component: integrity
+        annotations:
+          summary: "ClaraCore database relationship violations detected"
+          description: "{{ $labels.instance }} completed the fixed read-only rule set and found relationship violations. Preserve the receipt and backup; investigate under separate authorization instead of deleting rows to clear the alert."
+          runbook: "DEPLOYMENT.md data integrity section"
+
+      - alert: ClaraCoreHTTPPanics
+        expr: claracore_http_panics_window > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: http
+        annotations:
+          summary: "ClaraCore Server recovered a panic"
+          description: "{{ $labels.instance }} reports a panic in its rolling 5-minute HTTP window. Correlate service logs by the server-generated request ID; do not request credentials or bodies."
+          runbook: "DEPLOYMENT.md request observability section"
+
+      - alert: ClaraCoreSustainedServerErrors
+        expr: claracore_http_server_errors_window > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: http
+        annotations:
+          summary: "ClaraCore Server has sustained 5xx responses"
+          description: "{{ $labels.instance }} has continuously retained at least one 5xx in its rolling 5-minute window for 10 minutes."
+          runbook: "DEPLOYMENT.md request observability section"
+
+      - alert: ClaraCoreP95LatencyOverflow
+        expr: claracore_http_request_duration_p95_overflow > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: http
+        annotations:
+          summary: "ClaraCore Server p95 exceeded the tracked latency range"
+          description: "The approximate p95 on {{ $labels.instance }} has stayed above the largest 30-second bucket for 5 minutes. Inspect dependency latency and pool pressure."
+          runbook: "DEPLOYMENT.md section 4.1"
+
+      - alert: ClaraCoreMySQLPoolStatsMissing
+        expr: claracore_mysql_pool_available == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: mysql
+        annotations:
+          summary: "ClaraCore MySQL pool metrics are unavailable"
+          description: "{{ $labels.instance }} is scrapeable but does not expose database/sql pool statistics. Check runtime wiring before trusting capacity alerts."
+          runbook: "DEPLOYMENT.md section 4.1"
+
+      - alert: ClaraCoreMySQLPoolSaturation
+        expr: |
+          (
+            claracore_mysql_connections_in_use
+            / clamp_min(claracore_mysql_connections_max, 1)
+          ) >= 0.8
+        for: 10m
+        labels:
+          severity: warning
+          component: mysql
+        annotations:
+          summary: "ClaraCore MySQL pool is persistently saturated"
+          description: "{{ $labels.instance }} has used at least 80% of its configured MySQL connections for 10 minutes. Check database capacity and slow operations before raising the limit."
+          runbook: "DEPLOYMENT.md capacity section 4"
+
+      - alert: ClaraCoreMySQLConnectionWaitPressure
+        expr: increase(claracore_mysql_connection_wait_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: mysql
+        annotations:
+          summary: "ClaraCore requests are persistently waiting for MySQL connections"
+          description: "{{ $labels.instance }} has continued to report new database/sql pool waits across a 10-minute interval. Correlate with pool saturation and MySQL health."
+          runbook: "DEPLOYMENT.md capacity section 4"
+
+      - alert: ClaraCoreExternalHealthUnavailable
+        expr: |
+          (claracore_external_monitoring_configured == 1)
+          and on (job, instance) (
+            (claracore_external_health_snapshot_available == 0)
+            or (claracore_external_health_snapshot_age_seconds > 120)
+          )
+        for: 10m
+        labels:
+          severity: warning
+          component: external
+        annotations:
+          summary: "ClaraCore external-source health is unavailable"
+          description: "{{ $labels.instance }} has not produced a recent usable body-free external health snapshot for 10 minutes. Check MySQL connectivity, migrations, and the background sampler before trusting other external-source alerts."
+          runbook: "DEPLOYMENT.md external-source monitoring section 4.1"
+
+      - alert: ClaraCoreExternalSyncFailed
+        expr: |
+          (claracore_external_sources_failed > 0)
+          and on (job, instance) (claracore_external_health_snapshot_available == 1)
+        for: 15m
+        labels:
+          severity: warning
+          component: external
+        annotations:
+          summary: "ClaraCore external-source sync remains failed"
+          description: "{{ $labels.instance }} has retained at least one failed external source for 15 minutes. Inspect the bounded sync receipt and service logs; metrics contain no source name, URL, tenant, or error text."
+          runbook: "DEPLOYMENT.md external-source monitoring section 4.1"
+
+      - alert: ClaraCoreExternalSyncStale
+        expr: |
+          (claracore_external_sources_stale > 0)
+          and on (job, instance) (claracore_external_sources_failed == 0)
+          and on (job, instance) (claracore_external_health_snapshot_available == 1)
+        for: 30m
+        labels:
+          severity: warning
+          component: external
+        annotations:
+          summary: "ClaraCore external-source mirror is stale"
+          description: "{{ $labels.instance }} has at least one source beyond its computed freshness budget. The rule is suppressed while an explicit sync failure is present to avoid duplicate root-cause notifications."
+          runbook: "DEPLOYMENT.md external-source monitoring section 4.1"
+
+      - alert: ClaraCoreExternalSyncClaimExpired
+        expr: |
+          (claracore_external_sync_claims_expired > 0)
+          and on (job, instance) (claracore_external_health_snapshot_available == 1)
+        for: 10m
+        labels:
+          severity: warning
+          component: external
+        annotations:
+          summary: "ClaraCore external sync claim remains expired"
+          description: "{{ $labels.instance }} reports an expired persistent manual-sync claim for 10 minutes. Check worker liveness and database time; another instance should reclaim it automatically."
+          runbook: "DEPLOYMENT.md external-source monitoring section 4.1"
+
+      - alert: ClaraCoreExternalSyncRequestBacklog
+        expr: |
+          (claracore_external_sync_requests_pending > 0)
+          and on (job, instance) (claracore_external_sync_claims_active == 0)
+          and on (job, instance) (claracore_external_sync_claims_expired == 0)
+          and on (job, instance) (claracore_external_health_snapshot_available == 1)
+        for: 15m
+        labels:
+          severity: warning
+          component: external
+        annotations:
+          summary: "ClaraCore manual external-sync request is not being claimed"
+          description: "{{ $labels.instance }} has retained a pending request without an active or expired claim for 15 minutes. Check the worker loop and persistent request polling."
+          runbook: "DEPLOYMENT.md external-source monitoring section 4.1"

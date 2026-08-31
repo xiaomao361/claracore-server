@@ -40,5 +40,11 @@
   {{end}}
   </tbody>
 </table></div>
+{{if or .HasPrevious .NextURL}}
+<nav class="pagination" aria-label="Token 分页">
+  {{if .HasPrevious}}<a href="/tokens">← 返回第一页</a>{{end}}
+  {{if .NextURL}}<a href="{{.NextURL}}">下一页 →</a>{{end}}
+</nav>
+{{end}}
 <p class="hint">轮换的做法：先签发新 token，各设备逐个换上，观察旧 token 的「最后使用」不再变化，再吊销它。</p>
 {{end}}

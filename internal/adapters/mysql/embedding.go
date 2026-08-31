@@ -14,16 +14,14 @@ import (
 
 // 本文件是 embeddings 表的读写：既是向量存储，也是索引队列。
 //
-// 队列这一半有个明确接受的偏差：**多实例部署时同一行可能被两个 worker
-// 同时领到**。没有用 `SELECT ... FOR UPDATE SKIP LOCKED` 领活，是因为
+// 队列查询本身不持有跨请求行锁。没有用 `SELECT ... FOR UPDATE SKIP LOCKED`
+// 领活，是因为
 // 那要求持有事务直到向量算完，而中间夹着一次外部 HTTP 调用——
 // 一个跨越外部服务超时的长事务，比重复算一次向量危险得多。
 //
-// 重复的代价是有限且封闭的：SaveEmbeddingVector 是幂等的按 ID 覆盖写，
-// 两个 worker 算出同一个向量、写两遍，结果完全一致，浪费的只是一次
-// 外部调用。真到了多实例且外部调用要计费的规模，正确的修法是引入
-// ports.Locker（01-architecture.md §6.2 已经给它留了位置），
-// 而不是把 HTTP 调用塞进事务里。
+// 多实例由 worker 外层的 Redis 短租约协调；Redis 未配置或暂时故障时
+// fail-open，SaveEmbeddingVector 仍按 ID 幂等覆盖。这样不把可选 Redis
+// 变成索引可用性的硬依赖，最坏代价仍只是一次重复外部调用。
 
 // encodeVector 把 float32 切片编成小端紧凑字节。
 //

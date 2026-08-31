@@ -12,7 +12,7 @@ EnvironmentFile=/etc/claracore-server/claracore-server.env
 ExecStart=/opt/claracore-server/current/claracore-server
 Restart=on-failure
 RestartSec=3s
-TimeoutStopSec=20s
+TimeoutStopSec=30s
 KillSignal=SIGTERM
 
 # 单二进制服务无需写系统目录；摄取根目录只需读权限。

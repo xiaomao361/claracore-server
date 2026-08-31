@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"claracore-server/internal/platform"
+	"claracore-server/internal/ports"
 )
 
 func seedWeb(t *testing.T) (*Service, *fakeStore, *platform.FixedClock, *fakeSessions, User) {
@@ -117,6 +118,76 @@ func TestLoginRequiresWebDeps(t *testing.T) {
 
 	if _, _, err := svc.Login(context.Background(), "x", "y"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("没配 Web 依赖时应明确报错，而不是 panic 或静默失败，实际: %v", err)
+	}
+}
+
+func TestLoginUpgradesWeakPasswordHashWithoutRevokingSessions(t *testing.T) {
+	svc, store, _, sessions, admin := seedWeb(t)
+	ctx := context.Background()
+	u := store.users[admin.ID]
+	u.PasswordHash = "weak" + u.PasswordHash
+	store.users[admin.ID] = u
+
+	const existingToken = "existing-browser-session"
+	if err := sessions.Create(ctx, ports.Session{
+		TokenHash: hashSessionToken(existingToken), TenantID: string(admin.TenantID), UserID: string(admin.ID), AuthVersion: u.AuthVersion,
+		ExpiresAt: time.Now().Add(time.Hour), CreatedAt: time.Now(), LastSeenAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := svc.Login(ctx, "maozai", testPassword); err != nil {
+		t.Fatal(err)
+	}
+	got := store.users[admin.ID]
+	if got.PasswordHash != fakeHashPrefix+testPassword {
+		t.Fatalf("weak hash was not upgraded: %q", got.PasswordHash)
+	}
+	if got.AuthVersion != u.AuthVersion || got.MustChangePw != u.MustChangePw {
+		t.Fatalf("derived-hash upgrade changed credential semantics: before=%+v after=%+v", u, got)
+	}
+	if _, err := svc.ResumeSession(ctx, existingToken); err != nil {
+		t.Fatalf("rehash must not revoke an existing valid session: %v", err)
+	}
+}
+
+func TestLoginRehashCASDoesNotOverwriteConcurrentPasswordReset(t *testing.T) {
+	svc, store, _, sessions, admin := seedWeb(t)
+	u := store.users[admin.ID]
+	u.PasswordHash = "weak" + u.PasswordHash
+	store.users[admin.ID] = u
+	store.beforePasswordHashUpgrade = func(f *fakeStore, userID platform.ID) {
+		current := f.users[userID]
+		current.PasswordHash = fakeHashPrefix + "concurrent-new-password"
+		current.AuthVersion++
+		f.users[userID] = current
+	}
+
+	if _, _, err := svc.Login(context.Background(), "maozai", testPassword); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("stale verified password must lose to concurrent reset: %v", err)
+	}
+	got := store.users[admin.ID]
+	if got.PasswordHash != fakeHashPrefix+"concurrent-new-password" || got.AuthVersion != u.AuthVersion+1 {
+		t.Fatalf("concurrent reset was overwritten: %+v", got)
+	}
+	if len(sessions.byHash) != 0 {
+		t.Fatal("stale login must not issue a session")
+	}
+}
+
+func TestLoginRehashCASAcceptsAnotherInstanceUpgrade(t *testing.T) {
+	svc, store, _, _, admin := seedWeb(t)
+	u := store.users[admin.ID]
+	u.PasswordHash = "weak" + u.PasswordHash
+	store.users[admin.ID] = u
+	store.beforePasswordHashUpgrade = func(f *fakeStore, userID platform.ID) {
+		current := f.users[userID]
+		current.PasswordHash = fakeHashPrefix + testPassword
+		f.users[userID] = current
+	}
+
+	if _, principal, err := svc.Login(context.Background(), "maozai", testPassword); err != nil || principal.UserID != admin.ID {
+		t.Fatalf("benign concurrent rehash should re-read and succeed: principal=%+v err=%v", principal, err)
 	}
 }
 
@@ -362,6 +433,46 @@ func TestResetPasswordForcesChangeAndKillsSessions(t *testing.T) {
 	}
 	if !p.MustChangePassword {
 		t.Fatal("管理员知道的那个临时密码不该长期有效——必须强制改密")
+	}
+}
+
+// TestPasswordResetRejectsSessionInsertedAfterDelete models the narrow race
+// that a plain DELETE cannot close:
+//
+//  1. login verifies the old password and prepares a session;
+//  2. an administrator resets the password and deletes existing sessions;
+//  3. the already-verified login inserts its session after that DELETE.
+//
+// The late row must still be unusable because it carries the old auth version.
+func TestPasswordResetRejectsSessionInsertedAfterDelete(t *testing.T) {
+	svc, store, _, sessions, admin := seedWeb(t)
+	ctx := context.Background()
+
+	token, _, err := svc.Login(ctx, "maozai", testPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := hashSessionToken(string(token))
+	lateSession := sessions.byHash[hash]
+	oldVersion := store.users[admin.ID].AuthVersion
+
+	if err := svc.ResetPassword(ctx, admin.TenantID, admin.ID, "admin-issued-new-password"); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.users[admin.ID].AuthVersion; got != oldVersion+1 {
+		t.Fatalf("password reset auth version = %d, want %d", got, oldVersion+1)
+	}
+	if len(sessions.byHash) != 0 {
+		t.Fatal("reset must first delete all sessions")
+	}
+
+	// Simulate the old-password login committing immediately after the DELETE.
+	sessions.byHash[hash] = lateSession
+	if _, err := svc.ResumeSession(ctx, string(token)); !errors.Is(err, ErrSessionInvalid) {
+		t.Fatalf("late old-version session must be rejected, got %v", err)
+	}
+	if len(sessions.byHash) != 0 {
+		t.Fatal("version-mismatched session should be removed after rejection")
 	}
 }
 

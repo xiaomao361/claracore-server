@@ -220,30 +220,116 @@ func TestActivityAdminAndKeysetPaginationStayTenantScoped(t *testing.T) {
 	}
 }
 
+func TestCountSharedActivityIsReadableSpaceSuccessAndWindowScoped(t *testing.T) {
+	store, _ := openActivityTestStore(t)
+	f := newActivityFixture()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	since := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -6)
+	shared := f.shared
+	hidden := f.hidden
+	agentA := f.agent
+	agentB := f.ids.New()
+
+	write := func(user, tenant, space platform.ID, agent *platform.ID, at time.Time) activity.Event {
+		event := f.event(user, at)
+		event.TenantID = tenant
+		event.Access = activity.AccessWrite
+		event.Action = "card_create"
+		event.SpaceID = &space
+		event.AgentID = agent
+		return event
+	}
+	first := write(f.me, f.tenant, shared, &agentA, since.Add(2*time.Hour))
+	second := write(f.other, f.tenant, shared, &agentB, now.Add(-2*time.Hour))
+	webWrite := write(f.other, f.tenant, shared, nil, now.Add(-time.Hour))
+
+	failed := write(f.me, f.tenant, shared, &agentA, now.Add(-30*time.Minute))
+	failed.Outcome = activity.OutcomeError
+	read := f.event(f.me, now.Add(-20*time.Minute))
+	read.SpaceID = &shared
+	hiddenWrite := write(f.other, f.tenant, hidden, &agentB, now.Add(-10*time.Minute))
+	old := write(f.me, f.tenant, shared, &agentA, since.Add(-time.Millisecond))
+	foreign := write(f.me, f.foreign, shared, &agentA, now.Add(-5*time.Minute))
+	recordActivity(t, store, first, second, webWrite, failed, read, hiddenWrite, old, foreign)
+
+	pulse, err := store.CountSharedActivity(context.Background(), activity.SharedActivityQuery{
+		TenantID: f.tenant, ReadableSharedSpaceIDs: []platform.ID{f.shared}, Since: since,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pulse.Writes != 3 || pulse.ActiveUsers != 2 || pulse.ActiveAgents != 2 {
+		t.Fatalf("aggregate leaked failed/read/hidden/old/foreign activity: %+v", pulse)
+	}
+	if pulse.LastWriteAt == nil || !pulse.LastWriteAt.Equal(webWrite.CreatedAt) {
+		t.Fatalf("last shared write should be the latest eligible event: %+v", pulse.LastWriteAt)
+	}
+	wantDaily := make(map[time.Time]int)
+	for _, event := range []activity.Event{first, second, webWrite} {
+		at := event.CreatedAt.UTC()
+		day := time.Date(at.Year(), at.Month(), at.Day(), 0, 0, 0, 0, time.UTC)
+		wantDaily[day]++
+	}
+	if len(pulse.DailyWrites) != len(wantDaily) {
+		t.Fatalf("daily buckets should contain only eligible writes: %+v", pulse.DailyWrites)
+	}
+	for _, daily := range pulse.DailyWrites {
+		if daily.Date.Location() != time.UTC || daily.Writes != wantDaily[daily.Date] {
+			t.Fatalf("daily buckets should match eligible writes in UTC: %+v", pulse.DailyWrites)
+		}
+	}
+
+	empty, err := store.CountSharedActivity(context.Background(), activity.SharedActivityQuery{TenantID: f.tenant, Since: since})
+	if err != nil || empty.Writes != 0 || len(empty.DailyWrites) != 0 {
+		t.Fatalf("empty readable shared scope should be an explicit zero aggregate: %+v err=%v", empty, err)
+	}
+}
+
 func TestCountContextFeedbackIsTenantWindowAndOutcomeScoped(t *testing.T) {
 	store, _ := openActivityTestStore(t)
 	f := newActivityFixture()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	since := now.Add(-30 * 24 * time.Hour)
 
-	feedback := func(tenant platform.ID, outcome string, at time.Time) activity.Event {
+	feedback := func(tenant platform.ID, outcome, contextID string, at time.Time) activity.Event {
 		event := f.event(f.me, at)
 		event.TenantID = tenant
 		event.Kind = activity.KindGovernance
 		event.Access = activity.AccessWrite
 		event.Action = "gateway_context_feedback"
-		event.Metadata = json.RawMessage(`{"feedbackOutcome":"` + outcome + `"}`)
+		event.Metadata, _ = json.Marshal(map[string]string{"feedbackOutcome": outcome, "contextId": contextID})
+		return event
+	}
+	decision := func(tenant platform.ID, value, reason, contextID string, at time.Time) activity.Event {
+		event := f.event(f.me, at)
+		event.TenantID = tenant
+		event.Action = "gateway_auto_context"
+		event.Metadata, _ = json.Marshal(map[string]string{"decision": value, "reason": reason, "contextId": contextID})
 		return event
 	}
 	recordActivity(t, store,
-		feedback(f.tenant, "used", now.Add(-time.Hour)),
-		feedback(f.tenant, "used", now.Add(-2*time.Hour)),
-		feedback(f.tenant, "wrong", now.Add(-3*time.Hour)),
-		feedback(f.tenant, "corrected", now.Add(-4*time.Hour)),
-		feedback(f.tenant, "ignored", since.Add(-time.Millisecond)),
-		feedback(f.foreign, "wrong", now.Add(-time.Hour)),
+		decision(f.tenant, "deliver_one", "high_confidence_top1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now.Add(-10*time.Hour)),
+		decision(f.tenant, "deliver_one", "high_confidence_top1", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", now.Add(-9*time.Hour)),
+		decision(f.tenant, "abstain", "low_relevance", "", now.Add(-8*time.Hour)),
+		decision(f.tenant, "abstain", "no_candidates", "", now.Add(-7*time.Hour)),
+		decision(f.tenant, "abstain", "ambiguous_domains", "", now.Add(-6*time.Hour)),
+		decision(f.tenant, "abstain", "semantic_unavailable", "", now.Add(-5*time.Hour)),
+		decision(f.tenant, "abstain", "retrieval_timeout", "", now.Add(-4*time.Hour)),
+		decision(f.tenant, "abstain", "shared_line_not_ready", "", now.Add(-3*time.Hour)),
+		decision(f.tenant, "abstain", "empty_prompt", "", now.Add(-2*time.Hour)),
+		decision(f.tenant, "abstain", "ambiguous_top_results", "", since.Add(-time.Millisecond)),
+		decision(f.foreign, "abstain", "semantic_unavailable", "", now.Add(-time.Hour)),
+		decision(f.tenant, "deliver_one", "high_confidence_top1", "oldoldoldoldoldoldoldoldoldold12", since.Add(-time.Millisecond)),
+		decision(f.foreign, "deliver_one", "high_confidence_top1", "foreignforeignforeignforeign1234", now.Add(-time.Hour)),
+		feedback(f.tenant, "used", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now.Add(-time.Hour)),
+		feedback(f.tenant, "used", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now.Add(-2*time.Hour)),
+		feedback(f.tenant, "wrong", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", now.Add(-3*time.Hour)),
+		feedback(f.tenant, "corrected", "cccccccccccccccccccccccccccccccc", now.Add(-4*time.Hour)),
+		feedback(f.tenant, "delivered", "", now.Add(-5*time.Hour)),
+		feedback(f.tenant, "ignored", "", since.Add(-time.Millisecond)),
+		feedback(f.foreign, "wrong", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", now.Add(-time.Hour)),
 	)
-	failed := feedback(f.tenant, "wrong", now.Add(-time.Hour))
+	failed := feedback(f.tenant, "wrong", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", now.Add(-time.Hour))
 	failed.Outcome = activity.OutcomeError
 	recordActivity(t, store, failed)
 
@@ -251,7 +337,17 @@ func TestCountContextFeedbackIsTenantWindowAndOutcomeScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if quality.Total() != 4 || quality.Used != 2 || quality.Wrong != 1 || quality.Corrected != 1 || quality.Ignored != 0 {
+	if quality.Selected != 2 || quality.Abstained != 7 || quality.FeedbackCoveredSelections != 2 {
+		t.Fatalf("selection coverage leaked scope, window, or unverified IDs: %+v", quality)
+	}
+	wantReasons := activity.ContextAbstainReasons{
+		NoRelevantEvidence: 2, Ambiguous: 1, SemanticUnavailable: 1,
+		RetrievalTimeout: 1, SharedLineNotReady: 1, Other: 1,
+	}
+	if quality.AbstainReasons != wantReasons || quality.AbstainReasons.Total() != quality.Abstained {
+		t.Fatalf("abstain reasons must be fixed, scoped and reconcile to total: got=%+v want=%+v", quality.AbstainReasons, wantReasons)
+	}
+	if quality.Total() != 5 || quality.Delivered != 1 || quality.Used != 2 || quality.Wrong != 1 || quality.Corrected != 1 || quality.Ignored != 0 {
 		t.Fatalf("feedback histogram leaked scope or window: %+v", quality)
 	}
 }

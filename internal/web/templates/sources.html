@@ -1,0 +1,41 @@
+{{define "content"}}
+<section class="card">
+  <h2>Atlas 同步</h2>
+  <p>{{.Summary}}</p>
+  {{if .CanQueue}}
+  <form method="post" action="/admin/sources/sync">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit">开始同步</button>
+  </form>
+  <p class="hint">请求会持久记录；任一可用实例都能领取。重复提交只保留一轮等待，多实例仍由数据库租约防止重叠快照。</p>
+  {{else if .Configured}}
+  <p class="hint">同步已配置，但当前实例没有装配手动入队能力；定时同步不受影响。</p>
+  {{end}}
+</section>
+
+<h2>来源状态</h2>
+{{if .Sources}}
+<div class="table-scroll" role="region" aria-label="外部来源状态" tabindex="0"><table class="grid">
+  <thead><tr><th scope="col">来源</th><th scope="col">状态</th><th scope="col">手动请求</th><th scope="col">最近开始</th><th scope="col">最近成功</th><th scope="col">租约截止</th></tr></thead>
+  <tbody>{{range .Sources}}<tr class="{{if .Attention}}muted{{end}}">
+    <td><strong>{{.Name}}</strong><br><small><code>{{.System}}</code></small></td>
+    <td><strong>{{.Status}}</strong><br><small>{{.Detail}}</small></td>
+    <td>{{.Request}}</td><td>{{.LastStarted}}</td><td>{{.LastSuccess}}</td><td>{{.Lease}}</td>
+  </tr>{{end}}</tbody>
+</table></div>
+{{else}}<div class="empty-state">还没有来源回执。启用 Atlas 后，worker 会在首次完整快照开始时注册来源。</div>{{end}}
+
+<h2>最近运行</h2>
+{{if .Runs}}
+<div class="table-scroll" role="region" aria-label="最近外部同步运行" tabindex="0"><table class="grid">
+  <thead><tr><th scope="col">来源</th><th scope="col">状态</th><th scope="col">计数</th><th scope="col">开始</th><th scope="col">完成</th><th scope="col">错误</th></tr></thead>
+  <tbody>{{range .Runs}}<tr class="{{if .Attention}}muted{{end}}">
+    <td><strong>{{.Source}}</strong><br><small><code>{{.System}}</code></small></td><td>{{.Status}}</td>
+    <td>见 {{.Seen}} · 新索引 {{.Indexed}} · 未变 {{.Unchanged}} · 缺失 {{.Missing}}</td>
+    <td>{{.Started}}</td><td>{{.Finished}}</td><td>{{if .Error}}{{.Error}}{{else}}—{{end}}</td>
+  </tr>{{end}}</tbody>
+</table></div>
+{{else}}<div class="empty-state">尚无同步运行回执。手动入队或等待定时 worker 完成第一轮后再查看。</div>{{end}}
+
+<p class="hint">运行回执只包含来源标识、计数、时间与有界错误文本；外部正文始终留在来源端。</p>
+{{end}}

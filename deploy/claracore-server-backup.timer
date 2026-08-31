@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily ClaraCore Server MySQL backup
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+Persistent=true
+RandomizedDelaySec=30m
+Unit=claracore-server-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -12,12 +12,17 @@ package test
 import (
 	"context"
 	"database/sql"
+	"io"
+	"io/fs"
+	"log/slog"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"claracore-server/internal/adapters/mysql"
 	"claracore-server/internal/config"
+	"claracore-server/migrations"
 )
 
 func openDB(t *testing.T) *sql.DB {
@@ -37,6 +42,60 @@ func openDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// TestDatabaseMigrationsMatchCurrentBinary 是 readiness 的真实数据库证据：
+// 迁移数量相同还不够，每个已应用版本的 checksum 也必须与本次二进制一致，
+// 并且数据库不能含有当前二进制不认识的更新版本。
+func TestDatabaseMigrationsMatchCurrentBinary(t *testing.T) {
+	db := openDB(t)
+	migrator := mysql.NewMigrator(db, migrations.FS, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	status, err := migrator.Check(context.Background())
+	if err != nil {
+		t.Fatalf("真实数据库不能接收当前二进制流量: %v", err)
+	}
+	if status.Expected == 0 || status.Expected != status.Applied || status.LatestVersion == "" {
+		t.Fatalf("迁移状态摘要不完整: %+v", status)
+	}
+	t.Logf("数据库迁移与当前二进制一致：version=%s applied=%d", status.LatestVersion, status.Applied)
+}
+
+func TestUpgradePlanDetectsPendingMigrationAgainstRealDatabaseWithoutWriting(t *testing.T) {
+	db := openDB(t)
+	files := fstest.MapFS{}
+	entries, err := fs.ReadDir(migrations.FS, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		body, err := fs.ReadFile(migrations.FS, entry.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[entry.Name()] = &fstest.MapFile{Data: body}
+	}
+	files["0014_upgrade_plan_probe.sql"] = &fstest.MapFile{Data: []byte("ALTER TABLE tenants ADD COLUMN upgrade_plan_probe INT NULL;\n")}
+
+	plan, err := mysql.NewMigrator(db, files, slog.New(slog.NewTextHandler(io.Discard, nil))).Plan(context.Background())
+	if err != nil {
+		t.Fatalf("read-only upgrade plan against real database failed: %v", err)
+	}
+	if plan.CurrentVersion != "0013" || plan.TargetVersion != "0014" || plan.Pending != 1 ||
+		plan.NextMigration != "0014_upgrade_plan_probe.sql" || plan.Applied != 13 || plan.Expected != 14 {
+		t.Fatalf("unexpected real-database upgrade plan: %+v", plan)
+	}
+
+	var probeColumnCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenants' AND COLUMN_NAME = 'upgrade_plan_probe'`).Scan(&probeColumnCount); err != nil {
+		t.Fatal(err)
+	}
+	if probeColumnCount != 0 {
+		t.Fatal("upgrade planning executed the synthetic migration")
+	}
 }
 
 // TestFixedCharColumnsAreAsciiBin 确认 ascii_bin 真的落到了库里。
@@ -75,6 +134,40 @@ func TestFixedCharColumnsAreAsciiBin(t *testing.T) {
 		t.Fatal("没有查到任何 CHAR 列——迁移可能没跑，先执行 make migrate")
 	}
 	t.Logf("检查了 %d 个定长 CHAR 列", n)
+}
+
+func TestWebCredentialGenerationColumnsAreSafe(t *testing.T) {
+	db := openDB(t)
+
+	rows, err := db.Query(`
+		SELECT TABLE_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+		FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND COLUMN_NAME = 'auth_version'
+		  AND TABLE_NAME IN ('users', 'sessions')
+		ORDER BY TABLE_NAME`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var table, columnType, nullable string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&table, &columnType, &nullable, &defaultValue); err != nil {
+			t.Fatal(err)
+		}
+		seen[table] = true
+		if columnType != "bigint unsigned" || nullable != "NO" || !defaultValue.Valid || defaultValue.String != "1" {
+			t.Errorf("%s.auth_version has unsafe shape: type=%q nullable=%q default=%q", table, columnType, nullable, defaultValue.String)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !seen["users"] || !seen["sessions"] || len(seen) != 2 {
+		t.Fatalf("auth_version columns missing: %+v", seen)
+	}
 }
 
 // TestSpaceUniquenessConstraints 验证 02-data-model.md §2.2 的两条设计约束
@@ -204,5 +297,40 @@ func TestEmbeddingsTableShape(t *testing.T) {
 	}
 	if cols != 3 {
 		t.Errorf("uk_emb 应是 (entity_type, entity_id, model) 三列唯一键，实际 %d 列\n  它保证同一实体在同一模型下只有一行，换模型时新旧向量共存", cols)
+	}
+}
+
+func TestExternalMirrorSchemaStoresNoAuthoritativeBody(t *testing.T) {
+	db := openDB(t)
+	for _, table := range []string{"external_sources", "external_sync_runs", "external_documents", "external_document_vectors"} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?`, table).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("external mirror table %s missing: count=%d err=%v", table, count, err)
+		}
+	}
+	rows, err := db.Query(`SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('external_documents', 'external_document_vectors')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	forbidden := map[string]bool{"body": true, "content": true, "source_text": true, "raw_json": true, "metadata": true}
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			t.Fatal(err)
+		}
+		if forbidden[column] {
+			t.Errorf("external mirror must not persist authoritative body column %s", column)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	var nullable string
+	if err := db.QueryRow(`SELECT IS_NULLABLE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'external_document_vectors' AND COLUMN_NAME = 'vector'`).Scan(&nullable); err != nil {
+		t.Fatal(err)
+	}
+	if nullable != "NO" {
+		t.Fatal("external metadata and vector must publish atomically; vector cannot be a pending NULL placeholder")
 	}
 }

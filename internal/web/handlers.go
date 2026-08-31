@@ -1,12 +1,19 @@
 package web
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/continuity"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
@@ -76,12 +83,26 @@ func (h *Host) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// 登录表单不校 CSRF：此时还没有会话，也就没有可派生的 token。
 	// 「登录 CSRF」（把人登进攻击者的账号）由 SameSite=Lax 挡住。
 	username, password := r.FormValue("username"), r.FormValue("password")
+	allowed, retryAfter := h.allowLoginAttempt(r, username)
+	if !allowed {
+		seconds := int64((retryAfter + time.Second - 1) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+		w.WriteHeader(http.StatusTooManyRequests)
+		h.render(w, "login.html", pageData{
+			Title: "登录", Version: h.opts.Version,
+			Error: "登录尝试过多，请稍后再试。",
+		})
+		return
+	}
 
 	token, p, err := h.gov.Login(r.Context(), username, password)
 	if err != nil {
 		// 日志里记详细原因（可能是哈希格式坏了这类数据问题），
 		// 页面上只说一句——区分失败原因等于提供账号枚举接口
-		h.logger.Warn("登录失败", "username", username, "error", err)
+		h.logger.Warn("登录失败", "error", err)
 		w.WriteHeader(http.StatusUnauthorized)
 		h.render(w, "login.html", pageData{
 			Title: "登录", Version: h.opts.Version,
@@ -96,6 +117,69 @@ func (h *Host) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (h *Host) allowLoginAttempt(r *http.Request, username string) (bool, time.Duration) {
+	if h.opts.LoginRateLimiter == nil {
+		return true, 0
+	}
+	client := loginClientIP(r)
+	pairHash := privacySafeRateKey("pair", client+"\x00"+strings.ToLower(strings.TrimSpace(username)))
+	ipHash := privacySafeRateKey("ip", client)
+	checks := []struct {
+		key   string
+		limit int
+	}{
+		{key: pairHash, limit: h.opts.LoginRateLimit},
+		{key: ipHash, limit: h.opts.LoginRateLimit * 6},
+	}
+	allowed := true
+	var retryAfter time.Duration
+	for _, check := range checks {
+		result, err := h.opts.LoginRateLimiter.Allow(r.Context(), check.key, check.limit, h.opts.LoginRateWindow)
+		if err != nil {
+			// The injected production limiter has a local fallback. Reaching this
+			// branch means both layers failed; preserve login availability but keep
+			// the operational fault visible without logging usernames or addresses.
+			h.logger.Error("登录限流器不可用，当前请求按可用性策略继续", "error", err)
+			continue
+		}
+		if !result.Allowed {
+			allowed = false
+			if result.RetryAfter > retryAfter {
+				retryAfter = result.RetryAfter
+			}
+		}
+	}
+	return allowed, retryAfter
+}
+
+func loginClientIP(r *http.Request) string {
+	peer := parseRequestIP(r.RemoteAddr)
+	if peer != nil && peer.IsLoopback() {
+		// The supported deployment binds the app to loopback and nginx replaces
+		// X-Real-IP. Never trust this header from a direct non-loopback peer.
+		if forwarded := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); forwarded != nil {
+			return forwarded.String()
+		}
+	}
+	if peer != nil {
+		return peer.String()
+	}
+	return "unknown"
+}
+
+func parseRequestIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(remoteAddr), "[]")
+	}
+	return net.ParseIP(host)
+}
+
+func privacySafeRateKey(scope, value string) string {
+	sum := sha256.Sum256([]byte(scope + "\x00" + value))
+	return "rate:login:" + scope + ":" + hex.EncodeToString(sum[:])
 }
 
 func (h *Host) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -168,16 +252,26 @@ type overviewSpace struct {
 }
 
 type overviewTotals struct {
-	Spaces         int
-	WritableSpaces int
-	Memories       int
-	Cards          int
-	Drafts         int
+	Spaces                 int
+	WritableSpaces         int
+	Memories               int
+	Cards                  int
+	Drafts                 int
+	ActiveCards            int
+	ActiveUnqualifiedCards int
+	RecallReadyCards       int
+	RecallTriggers         int
+}
+
+type overviewSignals struct {
+	Lines          continuity.LineStats
+	Embedding      knowledge.EmbeddingHealth
+	Feedback       activity.ContextFeedbackQuality
+	SharedActivity activity.SharedActivityPulse
 }
 
 type overviewAgent struct {
 	ID           platform.ID
-	Devices      []string
 	TokenCount   int
 	ActiveTokens int
 	LastUsedAt   *time.Time
@@ -196,6 +290,7 @@ func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 		Totals      overviewTotals
 		Agents      []overviewAgent
 		RecentCards []overviewRecentCard
+		Signals     overviewSignals
 	}{pageData: h.page(r, "概览", "overview")}
 
 	scope, err := h.gov.Scope(r.Context(), governance.Identity{TenantID: p.TenantID, UserID: p.UserID})
@@ -238,33 +333,49 @@ func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		data.Totals.Memories += st.Memories
 		data.Totals.Cards += st.Cards
+		data.Totals.ActiveCards += st.ActiveCards
+		data.Totals.ActiveUnqualifiedCards += st.ActiveUnqualifiedCards
+		data.Totals.RecallReadyCards += st.RecallReadyCards
+		data.Totals.RecallTriggers += st.RecallTriggers
 		// 「本空间还有 N 条待审」正是 04 §6.1 点名的那个空白
 		data.Totals.Drafts += st.DraftCards
 	}
 
-	tokens, err := h.gov.ListTokens(r.Context(), p.TenantID, p.UserID)
+	if stats, err := h.continuity.Stats(r.Context(), p.TenantID); err != nil {
+		h.logger.Warn("读取概览共同线统计失败", "error", err)
+		data.Notice = strings.TrimSpace(data.Notice + " 共同线统计暂时不可用。")
+	} else {
+		data.Signals.Lines = stats
+	}
+	if health, err := h.know.EmbeddingHealth(r.Context(), p.TenantID, 0); err != nil {
+		h.logger.Warn("读取概览语义索引统计失败", "error", err)
+		data.Notice = strings.TrimSpace(data.Notice + " 语义索引统计暂时不可用。")
+	} else {
+		data.Signals.Embedding = health
+	}
+	if quality, err := h.activity.ContextFeedbackQuality(r.Context(), p.TenantID, 30*24*time.Hour); err != nil {
+		h.logger.Warn("读取概览自动上下文反馈失败", "error", err)
+		data.Notice = strings.TrimSpace(data.Notice + " 自动上下文反馈统计暂时不可用。")
+	} else {
+		data.Signals.Feedback = quality
+	}
+	if pulse, err := h.activity.SharedActivityPulse(r.Context(), p.TenantID, sharedReadable, 7); err != nil {
+		h.logger.Warn("读取概览共享协作统计失败", "error", err)
+		data.Notice = strings.TrimSpace(data.Notice + " 共享协作统计暂时不可用。")
+	} else {
+		data.Signals.SharedActivity = pulse
+	}
+
+	agents, err := h.gov.ListAgentAccessSummaries(r.Context(), p.TenantID, p.UserID, 6)
 	if err != nil {
 		h.logger.Warn("读取概览 agent 失败", "error", err)
-		data.Notice = "Agent 接入状态暂时不可用。"
+		data.Notice = strings.TrimSpace(data.Notice + " Agent 接入状态暂时不可用。")
 	} else {
-		byAgent := make(map[platform.ID]int)
-		for _, token := range tokens {
-			idx, ok := byAgent[token.AgentID]
-			if !ok {
-				idx = len(data.Agents)
-				byAgent[token.AgentID] = idx
-				data.Agents = append(data.Agents, overviewAgent{ID: token.AgentID})
-			}
-			agent := &data.Agents[idx]
-			agent.TokenCount++
-			agent.Devices = append(agent.Devices, token.Name)
-			if token.RevokedAt == nil {
-				agent.ActiveTokens++
-			}
-			if token.LastUsedAt != nil && (agent.LastUsedAt == nil || token.LastUsedAt.After(*agent.LastUsedAt)) {
-				lastUsed := *token.LastUsedAt
-				agent.LastUsedAt = &lastUsed
-			}
+		for _, agent := range agents {
+			data.Agents = append(data.Agents, overviewAgent{
+				ID: agent.AgentID, TokenCount: agent.TokenCount,
+				ActiveTokens: agent.ActiveTokens, LastUsedAt: agent.LastUsedAt,
+			})
 		}
 	}
 
@@ -291,7 +402,9 @@ func (h *Host) handleOverview(w http.ResponseWriter, r *http.Request) {
 
 type tokensPageData struct {
 	pageData
-	Tokens []governance.Token
+	Tokens      []governance.TokenSummary
+	HasPrevious bool
+	NextURL     string
 	// NewToken 只在刚创建后的那一次渲染里有值。明文**仅此一次展示**，
 	// 库里只有哈希，刷新页面就再也拿不到了。
 	NewToken   string
@@ -304,12 +417,19 @@ func (h *Host) handleTokensPage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Host) renderTokens(w http.ResponseWriter, r *http.Request, data tokensPageData) {
 	p, _ := principalFrom(r.Context())
-	tokens, err := h.gov.ListTokens(r.Context(), p.TenantID, p.UserID)
+	cursor := r.URL.Query().Get("cursor")
+	page, err := h.gov.ListTokenSummariesPage(r.Context(), governance.GovernancePageInput{
+		TenantID: p.TenantID, UserID: p.UserID, Cursor: cursor, Limit: 30,
+	})
 	if err != nil {
 		h.logger.Error("查询 token 失败", "error", err)
 		data.Error = "读取 token 列表失败"
 	}
-	data.Tokens = tokens
+	data.Tokens = page.Items
+	data.HasPrevious = cursor != ""
+	if page.NextCursor != "" {
+		data.NextURL = "/tokens?" + url.Values{"cursor": {page.NextCursor}}.Encode()
+	}
 	h.render(w, "tokens.html", data)
 }
 
@@ -367,23 +487,14 @@ func (h *Host) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	// agent 停掉，那是一个不该存在的能力。RevokeToken 只按 tenant 过滤，
 	// 所以这道归属检查必须在这里做。
 	tokenID := platform.ID(r.FormValue("id"))
-	mine, err := h.gov.ListTokens(r.Context(), p.TenantID, p.UserID)
-	if err != nil {
-		markWebAuditFailed(r)
-		http.Error(w, "读取 token 列表失败", http.StatusInternalServerError)
-		return
-	}
-	owned := false
-	for _, t := range mine {
-		if t.ID == tokenID {
-			owned = true
-			break
-		}
-	}
-	if !owned {
+	if _, err := h.gov.FindOwnTokenSummary(r.Context(), p.TenantID, p.UserID, tokenID); errors.Is(err, governance.ErrTokenNotFound) {
 		markWebAuditFailed(r)
 		// 不确认「这个 token 存在但不是你的」
 		http.NotFound(w, r)
+		return
+	} else if err != nil {
+		markWebAuditFailed(r)
+		http.Error(w, "读取 token 失败", http.StatusInternalServerError)
 		return
 	}
 
@@ -422,7 +533,9 @@ func mcpSnippet(url, token string) string {
 
 type membersPageData struct {
 	pageData
-	Members []governance.User
+	Members     []governance.UserSummary
+	HasPrevious bool
+	NextURL     string
 	// NewPassword 是刚创建/重置出来的初始密码，同样只展示一次。
 	NewPassword string
 	ForUser     string
@@ -434,12 +547,19 @@ func (h *Host) handleMembersPage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Host) renderMembers(w http.ResponseWriter, r *http.Request, data membersPageData) {
 	p, _ := principalFrom(r.Context())
-	users, err := h.gov.ListUsers(r.Context(), p.TenantID)
+	cursor := r.URL.Query().Get("cursor")
+	page, err := h.gov.ListUserSummariesPage(r.Context(), governance.GovernancePageInput{
+		TenantID: p.TenantID, Cursor: cursor, Limit: 30,
+	})
 	if err != nil {
 		h.logger.Error("查询成员失败", "error", err)
 		data.Error = "读取成员列表失败"
 	}
-	data.Members = users
+	data.Members = page.Items
+	data.HasPrevious = cursor != ""
+	if page.NextCursor != "" {
+		data.NextURL = "/admin/members?" + url.Values{"cursor": {page.NextCursor}}.Encode()
+	}
 	h.render(w, "members.html", data)
 }
 
@@ -536,20 +656,18 @@ func (h *Host) handleMemberReset(w http.ResponseWriter, r *http.Request) {
 // 空间与权限（管理员）
 // ---------------------------------------------------------------------------
 
-type spaceGrantView struct {
-	User       governance.User
-	Permission *governance.Permission
-}
-
-type adminSpaceView struct {
-	Space     governance.Space
-	OwnerName string
-	Grants    []spaceGrantView
-}
-
 type spacesPageData struct {
 	pageData
-	Spaces []adminSpaceView
+	Spaces        []governance.Space
+	Selected      *governance.Space
+	OwnerName     string
+	Grants        []governance.SpaceGrantSummary
+	SpaceCursor   string
+	HasPrevious   bool
+	NextSpacesURL string
+	GrantCursor   string
+	GrantPrevious bool
+	NextGrantsURL string
 }
 
 func (h *Host) handleSpacesPage(w http.ResponseWriter, r *http.Request) {
@@ -558,57 +676,55 @@ func (h *Host) handleSpacesPage(w http.ResponseWriter, r *http.Request) {
 
 func (h *Host) renderSpaces(w http.ResponseWriter, r *http.Request, data spacesPageData) {
 	p, _ := principalFrom(r.Context())
-	spaces, err := h.gov.ListSpaces(r.Context(), p.TenantID)
+	spaceCursor := r.URL.Query().Get("spaces_cursor")
+	spacePage, err := h.gov.ListSpacePage(r.Context(), governance.GovernancePageInput{
+		TenantID: p.TenantID, Cursor: spaceCursor, Limit: 20,
+	})
 	if err != nil {
 		h.logger.Error("查询空间失败", "error", err)
 		data.Error = "读取空间列表失败"
 		h.render(w, "spaces.html", data)
 		return
 	}
-	users, err := h.gov.ListUsers(r.Context(), p.TenantID)
-	if err != nil {
-		h.logger.Error("查询空间成员失败", "error", err)
-		data.Error = "读取成员列表失败"
+	data.Spaces = spacePage.Items
+	data.SpaceCursor = spaceCursor
+	data.HasPrevious = spaceCursor != ""
+	if spacePage.NextCursor != "" {
+		data.NextSpacesURL = spacesPageURL("", spacePage.NextCursor, "")
+	}
+	selectedID := platform.ID(r.URL.Query().Get("space"))
+	if selectedID == "" && len(spacePage.Items) > 0 {
+		selectedID = spacePage.Items[0].ID
+	}
+	if selectedID == "" {
 		h.render(w, "spaces.html", data)
 		return
 	}
-	permissions, err := h.gov.ListSpacePermissions(r.Context(), p.TenantID)
+	grantCursor := r.URL.Query().Get("grants_cursor")
+	grantPage, err := h.gov.ListSpaceGrantPage(r.Context(), governance.GovernancePageInput{
+		TenantID: p.TenantID, SpaceID: selectedID, Cursor: grantCursor, Limit: 30,
+	})
+	if errors.Is(err, governance.ErrSpaceNotFound) || errors.Is(err, governance.ErrSpaceForbidden) {
+		http.NotFound(w, r)
+		return
+	}
 	if err != nil {
 		h.logger.Error("查询空间授权失败", "error", err)
 		data.Error = "读取权限列表失败"
 		h.render(w, "spaces.html", data)
 		return
 	}
-
-	userByID := make(map[platform.ID]governance.User, len(users))
-	for _, user := range users {
-		userByID[user.ID] = user
+	data.Selected = &grantPage.Space
+	data.Grants = grantPage.Items
+	data.GrantCursor = grantCursor
+	data.GrantPrevious = grantCursor != ""
+	if grantPage.Space.OwnerUserID != nil {
+		if owner, err := h.gov.FindUserSummary(r.Context(), p.TenantID, *grantPage.Space.OwnerUserID); err == nil {
+			data.OwnerName = owner.DisplayName
+		}
 	}
-	permByPair := make(map[[2]platform.ID]governance.Permission, len(permissions))
-	for _, permission := range permissions {
-		permByPair[[2]platform.ID{permission.SpaceID, permission.UserID}] = permission
-	}
-	for _, space := range spaces {
-		// 个人空间的封闭性不可配置，不出现在管理员授权面。
-		if space.Type == governance.SpacePersonal {
-			continue
-		}
-		view := adminSpaceView{Space: space}
-		if space.OwnerUserID != nil {
-			view.OwnerName = userByID[*space.OwnerUserID].DisplayName
-		}
-		for _, user := range users {
-			if space.IsOwnedBy(user.ID) {
-				continue
-			}
-			grant := spaceGrantView{User: user}
-			if permission, ok := permByPair[[2]platform.ID{space.ID, user.ID}]; ok {
-				cp := permission
-				grant.Permission = &cp
-			}
-			view.Grants = append(view.Grants, grant)
-		}
-		data.Spaces = append(data.Spaces, view)
+	if grantPage.NextCursor != "" {
+		data.NextGrantsURL = spacesPageURL(selectedID, spaceCursor, grantPage.NextCursor)
 	}
 	h.render(w, "spaces.html", data)
 }
@@ -624,7 +740,7 @@ func (h *Host) handleSpaceCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setWebAuditTarget(r, "space", space.ID, space.ID)
-	http.Redirect(w, r, "/admin/spaces", http.StatusSeeOther)
+	http.Redirect(w, r, spacesPageURL(space.ID, "", ""), http.StatusSeeOther)
 }
 
 func (h *Host) handleSpaceGrant(w http.ResponseWriter, r *http.Request) {
@@ -651,7 +767,7 @@ func (h *Host) handleSpaceGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setWebAuditTarget(r, "space", spaceID, spaceID)
-	http.Redirect(w, r, "/admin/spaces", http.StatusSeeOther)
+	http.Redirect(w, r, spacesPageURL(spaceID, "", ""), http.StatusSeeOther)
 }
 
 func (h *Host) handleSpaceRevoke(w http.ResponseWriter, r *http.Request) {
@@ -665,7 +781,24 @@ func (h *Host) handleSpaceRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setWebAuditTarget(r, "space", spaceID, spaceID)
-	http.Redirect(w, r, "/admin/spaces", http.StatusSeeOther)
+	http.Redirect(w, r, spacesPageURL(spaceID, "", ""), http.StatusSeeOther)
+}
+
+func spacesPageURL(spaceID platform.ID, spaceCursor, grantCursor string) string {
+	values := url.Values{}
+	if spaceID != "" {
+		values.Set("space", string(spaceID))
+	}
+	if spaceCursor != "" {
+		values.Set("spaces_cursor", spaceCursor)
+	}
+	if grantCursor != "" {
+		values.Set("grants_cursor", grantCursor)
+	}
+	if len(values) == 0 {
+		return "/admin/spaces"
+	}
+	return "/admin/spaces?" + values.Encode()
 }
 
 // userFacing 决定错误信息能不能直接给人看。

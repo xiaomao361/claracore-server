@@ -18,6 +18,7 @@ import (
 const (
 	SourceMCP = "mcp"
 	SourceWeb = "web"
+	SourceCLI = "cli"
 
 	KindTrace      = "trace"
 	KindGovernance = "governance"
@@ -149,26 +150,75 @@ type AdminQuery struct {
 	Since          time.Time
 }
 
-// ContextFeedbackQuery selects durable automatic-context feedback. Results are
-// aggregate-only: callers never receive card IDs, actor IDs, or content.
+// ContextFeedbackQuery selects automatic-context decisions and durable feedback.
+// Results are aggregate-only: callers never receive entity IDs, actor IDs, or content.
 type ContextFeedbackQuery struct {
 	TenantID platform.ID
 	Since    time.Time
 }
 
-// ContextFeedbackQuality is an outcome histogram, not an accuracy score.
-// Missing feedback means "unknown", never "correct".
+// ContextFeedbackQuality combines the selection denominator with a submitted
+// outcome histogram. FeedbackCoveredSelections counts distinct feedback context
+// IDs that match a real selection in the same tenant and window. None of these
+// fields is an accuracy score; missing feedback means "unknown", never "correct".
 type ContextFeedbackQuality struct {
-	Since     time.Time
-	Delivered int
-	Used      int
-	Ignored   int
-	Wrong     int
-	Corrected int
+	Since                     time.Time
+	Selected                  int
+	Abstained                 int
+	AbstainReasons            ContextAbstainReasons
+	FeedbackCoveredSelections int
+	Delivered                 int
+	Used                      int
+	Ignored                   int
+	Wrong                     int
+	Corrected                 int
+}
+
+// ContextAbstainReasons is a fixed, aggregate-only histogram. It keeps the
+// operational distinction between missing evidence, ambiguous evidence and a
+// broken semantic path without exposing prompts, entities or actors.
+type ContextAbstainReasons struct {
+	NoRelevantEvidence  int
+	Ambiguous           int
+	SemanticUnavailable int
+	RetrievalTimeout    int
+	SharedLineNotReady  int
+	Other               int
+}
+
+func (r ContextAbstainReasons) Total() int {
+	return r.NoRelevantEvidence + r.Ambiguous + r.SemanticUnavailable + r.RetrievalTimeout + r.SharedLineNotReady + r.Other
 }
 
 func (q ContextFeedbackQuality) Total() int {
 	return q.Delivered + q.Used + q.Ignored + q.Wrong + q.Corrected
+}
+
+// SharedActivityQuery is the persistence contract for the dashboard's
+// collaboration pulse. It deliberately contains only already-resolved readable
+// shared spaces: personal-space activity and activity in inaccessible projects
+// must never enter the aggregate.
+type SharedActivityQuery struct {
+	TenantID               platform.ID
+	ReadableSharedSpaceIDs []platform.ID
+	Since                  time.Time
+}
+
+type DailySharedWrites struct {
+	Date   time.Time
+	Writes int
+}
+
+// SharedActivityPulse is a bounded, aggregate-only view of successful writes
+// in readable team/project spaces. Counts describe adoption, not knowledge
+// quality; content, entity IDs and actor identities never leave the store.
+type SharedActivityPulse struct {
+	Since        time.Time
+	Writes       int
+	ActiveUsers  int
+	ActiveAgents int
+	LastWriteAt  *time.Time
+	DailyWrites  []DailySharedWrites
 }
 
 // Store is the activity domain's persistence outlet.
@@ -177,5 +227,6 @@ type Store interface {
 	ListVisible(ctx context.Context, query VisibleQuery) ([]Event, error)
 	ListAdmin(ctx context.Context, query AdminQuery) ([]Event, error)
 	CountContextFeedback(ctx context.Context, query ContextFeedbackQuery) (ContextFeedbackQuality, error)
+	CountSharedActivity(ctx context.Context, query SharedActivityQuery) (SharedActivityPulse, error)
 	DeleteTracesBefore(ctx context.Context, before time.Time, limit int) (int, error)
 }

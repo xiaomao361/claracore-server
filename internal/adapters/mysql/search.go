@@ -465,15 +465,17 @@ func (s *KnowledgeStore) CountSpaceContents(ctx context.Context, tenantID platfo
 		return nil, err
 	}
 
-	// 卡片：一次查出总数、草稿数、只是摘要的数量
+	// 卡片：一次查出总量、审核积压，以及看板使用的 active 质量口径。
 	rows, err := s.ex.QueryContext(ctx,
 		`SELECT space_id, COUNT(*),
 		        SUM(status = ?),
-		        SUM(body_understanding IS NULL)
+		        SUM(body_understanding IS NULL),
+		        SUM(status = ?),
+		        SUM(status = ? AND body_understanding IS NULL)
 		 FROM cards
 		 WHERE tenant_id = ? AND space_id IN (`+in+`)
 		 GROUP BY space_id`,
-		append([]any{knowledge.CardDraft}, args...)...)
+		append([]any{knowledge.CardDraft, knowledge.CardActive, knowledge.CardActive}, args...)...)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: 统计卡片: %w", err)
 	}
@@ -481,14 +483,15 @@ func (s *KnowledgeStore) CountSpaceContents(ctx context.Context, tenantID platfo
 		defer rows.Close()
 		for rows.Next() {
 			var (
-				id                        string
-				total, draft, unqualified int
+				id                                                   string
+				total, draft, unqualified, active, activeUnqualified int
 			)
-			if err := rows.Scan(&id, &total, &draft, &unqualified); err != nil {
+			if err := rows.Scan(&id, &total, &draft, &unqualified, &active, &activeUnqualified); err != nil {
 				return fmt.Errorf("mysql: 读取卡片统计行: %w", err)
 			}
 			st := stat(platform.ID(id))
 			st.Cards, st.DraftCards, st.UnqualifiedCards = total, draft, unqualified
+			st.ActiveCards, st.ActiveUnqualifiedCards = active, activeUnqualified
 		}
 		return rows.Err()
 	}(); err != nil {
@@ -500,6 +503,30 @@ func (s *KnowledgeStore) CountSpaceContents(ctx context.Context, tenantID platfo
 		 WHERE tenant_id = ? AND space_id IN (`+in+`)
 		 GROUP BY space_id`, args,
 		func(id platform.ID, n int) { stat(id).RecallTriggers = n }); err != nil {
+		return nil, err
+	}
+
+	readyRows, err := s.ex.QueryContext(ctx,
+		`SELECT t.space_id, COUNT(DISTINCT t.card_id)
+		 FROM card_recall_triggers t
+		 JOIN cards c ON c.tenant_id = t.tenant_id AND c.id = t.card_id
+		 WHERE t.tenant_id = ? AND t.space_id IN (`+in+`) AND c.status = ?
+		 GROUP BY t.space_id`, append(append([]any{}, args...), knowledge.CardActive)...)
+	if err != nil {
+		return nil, fmt.Errorf("mysql: 统计可召回卡片: %w", err)
+	}
+	if err := func() error {
+		defer readyRows.Close()
+		for readyRows.Next() {
+			var id string
+			var count int
+			if err := readyRows.Scan(&id, &count); err != nil {
+				return fmt.Errorf("mysql: 读取可召回卡片统计行: %w", err)
+			}
+			stat(platform.ID(id)).RecallReadyCards = count
+		}
+		return readyRows.Err()
+	}(); err != nil {
 		return nil, err
 	}
 

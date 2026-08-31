@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -36,6 +37,9 @@ type reviewListData struct {
 func (h *Host) handleReviewList(w http.ResponseWriter, r *http.Request) {
 	p, _ := principalFrom(r.Context())
 	data := reviewListData{pageData: h.page(r, "卡片审核", "review")}
+	if n, err := strconv.Atoi(r.URL.Query().Get("batch")); err == nil && n > 0 && n <= knowledge.MaxBatchReviewCards {
+		data.Notice = fmt.Sprintf("已将 %d 张所选草稿标记为不需要；历史记录仍然保留。", n)
+	}
 
 	// 审核队列用**可写**空间集合：能写就能审（04 §6 拍板，不引入
 	// 新的权限概念）。用可读集合的话，人会看到一堆自己按不动的按钮。
@@ -76,6 +80,70 @@ func (h *Host) handleReviewList(w http.ResponseWriter, r *http.Request) {
 	data.Items, data.Total, data.NextCursor = res.Items, res.Total, res.NextCursor
 	data.PrevExists = r.URL.Query().Get("cursor") != ""
 	h.render(w, "review.html", data)
+}
+
+// handleReviewBatchDeprecate only removes explicitly selected drafts from the
+// queue. It deliberately has no batch-publish sibling: understanding and
+// recall triggers still require one-card-at-a-time judgment.
+func (h *Host) handleReviewBatchDeprecate(w http.ResponseWriter, r *http.Request) {
+	p, _ := principalFrom(r.Context())
+	if err := r.ParseForm(); err != nil {
+		markWebAuditFailed(r)
+		http.Error(w, "批量审核表单无效", http.StatusBadRequest)
+		return
+	}
+	selected, err := parseDraftCardSelections(r.Form["selection"])
+	if err != nil {
+		markWebAuditFailed(r)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	scope, err := h.gov.Scope(r.Context(), governance.Identity{TenantID: p.TenantID, UserID: p.UserID})
+	if err != nil {
+		markWebAuditFailed(r)
+		http.Error(w, "读取空间权限失败", http.StatusInternalServerError)
+		return
+	}
+	updated, err := h.know.DeprecateDraftCards(r.Context(), knowledge.DeprecateDraftCardsInput{
+		TenantID: p.TenantID, WritableSpaces: writableSpaceIDs(scope), Cards: selected,
+	})
+	if err != nil {
+		markWebAuditFailed(r)
+		switch {
+		case errors.Is(err, knowledge.ErrVersionConflict), errors.Is(err, knowledge.ErrInvalidArgument):
+			http.Error(w, "所选草稿已经变化或不再待审；整批均未处理，请刷新后重新选择", http.StatusConflict)
+		case errors.Is(err, knowledge.ErrNotFound):
+			http.NotFound(w, r)
+		default:
+			h.logger.Error("批量标记草稿失败", "error", err)
+			http.Error(w, "批量标记失败", http.StatusInternalServerError)
+		}
+		return
+	}
+	q := url.Values{"batch": {strconv.Itoa(len(updated))}}
+	if spaceID := strings.TrimSpace(r.FormValue("space")); spaceID != "" {
+		q.Set("space", spaceID)
+	}
+	http.Redirect(w, r, "/review?"+q.Encode(), http.StatusSeeOther)
+}
+
+func parseDraftCardSelections(raw []string) ([]knowledge.DraftCardVersion, error) {
+	if len(raw) == 0 || len(raw) > knowledge.MaxBatchReviewCards {
+		return nil, fmt.Errorf("每次请选择 1 到 %d 张草稿", knowledge.MaxBatchReviewCards)
+	}
+	out := make([]knowledge.DraftCardVersion, 0, len(raw))
+	for _, value := range raw {
+		cut := strings.LastIndexByte(value, ':')
+		if cut <= 0 || cut == len(value)-1 {
+			return nil, errors.New("所选草稿缺少有效版本，请刷新后重试")
+		}
+		version, err := strconv.Atoi(value[cut+1:])
+		if err != nil || version <= 0 {
+			return nil, errors.New("所选草稿缺少有效版本，请刷新后重试")
+		}
+		out = append(out, knowledge.DraftCardVersion{ID: platform.ID(value[:cut]), Version: version})
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

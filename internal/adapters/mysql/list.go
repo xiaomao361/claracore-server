@@ -83,7 +83,7 @@ func (s *KnowledgeStore) ListContents(ctx context.Context, q knowledge.ListQuery
 	args = append(args, q.Limit)
 
 	cols := `id, tenant_id, space_id, author_user_id, author_agent_id,
-	         title, status, copied_from_type, copied_from_id, created_at, updated_at`
+	         title, status, version, copied_from_type, copied_from_id, created_at, updated_at`
 	if table == "cards" {
 		// 卡片多取三列：类型、来源路径、以及「理解栏是否为空」。
 		// 最后那个直接在 SQL 里算成布尔，与 space_stats 的
@@ -124,7 +124,7 @@ func scanContentItem(rows *sql.Rows, kind string) (knowledge.ContentItem, error)
 		qualified         sql.NullBool
 		created, updated  time.Time
 	)
-	dest := []any{&id, &tid, &sid, &aid, &agentID, &it.Title, &it.Status,
+	dest := []any{&id, &tid, &sid, &aid, &agentID, &it.Title, &it.Status, &it.Version,
 		&fromType, &fromID, &created, &updated}
 	if kind == knowledge.EntityCard {
 		dest = append(dest, &cardType, &source, &qualified)

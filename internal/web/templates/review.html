@@ -11,11 +11,15 @@
 
 {{if ge .Total 0}}<p class="hint">共 <strong>{{.Total}}</strong> 条待审。它们不进默认检索——在有人过一遍之前，agent 看不到。</p>{{end}}
 
+<form method="post" action="/review/batch-deprecate">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="space" value="{{.SpaceID}}">
 <div class="table-scroll" role="region" aria-label="待审卡片" tabindex="0"><table class="grid">
-  <thead><tr><th scope="col">标题</th><th scope="col">空间</th><th scope="col">来源</th><th scope="col">摄入时间</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
+  <thead><tr><th scope="col">选择</th><th scope="col">标题</th><th scope="col">空间</th><th scope="col">来源</th><th scope="col">摄入时间</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
   <tbody>
   {{range .Items}}
     <tr>
+      <td><label class="selection-control"><input type="checkbox" name="selection" value="{{.Ref.ID}}:{{.Version}}"><span class="visually-hidden">选择“{{.Title}}”标记为不需要</span></label></td>
       <td><a href="/review/{{.Ref.ID}}">{{.Title}}</a></td>
       <td><span class="tag">{{.SpaceID}}</span></td>
       <td>{{if .IsIngested}}<code>{{.SourcePath}}</code>{{else}}—{{end}}</td>
@@ -23,10 +27,17 @@
       <td><a href="/review/{{.Ref.ID}}">审核 →</a></td>
     </tr>
   {{else}}
-    <tr><td colspan="5" class="empty">没有待审的卡片。</td></tr>
+    <tr><td colspan="6" class="empty">没有待审的卡片。</td></tr>
   {{end}}
   </tbody>
 </table></div>
+{{if .Items}}
+<div class="card row bulk-actions">
+  <p class="hint">只批量处理你明确勾选的草稿，当前页最多 {{len .Items}} 张。发布仍需逐张补齐理解与召回条件。</p>
+  <button type="submit" class="danger" data-confirm-message="确认将所选草稿全部标记为不需要？整批会原子处理；这些卡会退出待审队列，但历史记录仍保留。">将所选标记不需要</button>
+</div>
+{{end}}
+</form>
 
 {{if .NextCursor}}
 <p><a href="/review?space={{.SpaceID}}&cursor={{.NextCursor}}">下一页 →</a></p>

@@ -48,6 +48,26 @@ type migration struct {
 	checksum string // sha256 hex
 }
 
+// SchemaStatus 是当前二进制内置迁移与数据库账本的一致性摘要。
+// 它只包含可安全写进启动日志或健康探针的数量与版本，不暴露 SQL 或连接信息。
+type SchemaStatus struct {
+	LatestVersion string
+	Expected      int
+	Applied       int
+}
+
+// SchemaPlan is a read-only upgrade assessment. Pending migrations mean the
+// current strict-schema binary cannot be rolled back by swapping only the
+// executable after those migrations are applied.
+type SchemaPlan struct {
+	CurrentVersion string
+	TargetVersion  string
+	NextMigration  string
+	Expected       int
+	Applied        int
+	Pending        int
+}
+
 // Run 应用所有尚未应用的迁移。已是最新时为 no-op。
 func (m *Migrator) Run(ctx context.Context) error {
 	all, err := m.load()
@@ -72,19 +92,14 @@ func (m *Migrator) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if _, err := planMigrationSets(all, applied); err != nil {
+		return err
+	}
 
 	pending := 0
 	for _, mig := range all {
-		prev, done := applied[mig.version]
+		_, done := applied[mig.version]
 		if done {
-			// 已发布的迁移不可修改（docs/05-code-structure.md §5.3）。
-			// 改一个已经在别的环境跑过的文件，会让两套库的结构静默分叉。
-			if prev != mig.checksum {
-				return fmt.Errorf(
-					"迁移 %s 已应用但内容被修改（库中校验和 %s，文件 %s）\n"+
-						"  已发布的迁移不可修改，请新增一个迁移文件来变更结构",
-					mig.name, short(prev), short(mig.checksum))
-			}
 			continue
 		}
 		if err := m.apply(ctx, mig); err != nil {
@@ -97,6 +112,98 @@ func (m *Migrator) Run(ctx context.Context) error {
 		m.logger.Info("数据库结构已是最新", "migrations", len(all))
 	} else {
 		m.logger.Info("迁移完成", "applied", pending, "total", len(all))
+	}
+	return nil
+}
+
+// Plan validates every already-applied checksum and returns the pending suffix
+// without creating the ledger or executing SQL. It is safe to run against the
+// live database before an operator schedules an upgrade maintenance window.
+func (m *Migrator) Plan(ctx context.Context) (SchemaPlan, error) {
+	all, err := m.load()
+	if err != nil {
+		return SchemaPlan{}, err
+	}
+	if len(all) == 0 {
+		return SchemaPlan{}, errors.New("没有找到任何迁移文件")
+	}
+	applied, err := m.appliedChecksums(ctx)
+	if err != nil {
+		return SchemaPlan{}, fmt.Errorf("读取迁移状态: %w", err)
+	}
+	return planMigrationSets(all, applied)
+}
+
+// Check 验证数据库结构与当前二进制完全一致，但不创建表、不执行迁移。
+//
+// 服务启动与 readiness 必须使用这条只读路径。迁移只能由显式的 -migrate
+// 执行；否则滚动发布时，一个普通实例可能在接流量前悄悄改动共享结构。
+func (m *Migrator) Check(ctx context.Context) (SchemaStatus, error) {
+	all, err := m.load()
+	if err != nil {
+		return SchemaStatus{}, err
+	}
+	if len(all) == 0 {
+		return SchemaStatus{}, errors.New("没有找到任何迁移文件")
+	}
+
+	applied, err := m.appliedChecksums(ctx)
+	if err != nil {
+		return SchemaStatus{}, fmt.Errorf("读取迁移状态: %w", err)
+	}
+	return compareMigrationSets(all, applied)
+}
+
+func compareMigrationSets(all []migration, applied map[string]string) (SchemaStatus, error) {
+	plan, err := planMigrationSets(all, applied)
+	status := SchemaStatus{LatestVersion: all[len(all)-1].version, Expected: len(all), Applied: len(applied)}
+	if err != nil {
+		return status, err
+	}
+	if plan.Pending > 0 {
+		return status, fmt.Errorf("数据库迁移未完成：缺少 %s", plan.NextMigration)
+	}
+	return status, nil
+}
+
+func planMigrationSets(all []migration, applied map[string]string) (SchemaPlan, error) {
+	plan := SchemaPlan{TargetVersion: all[len(all)-1].version, Expected: len(all), Applied: len(applied)}
+	if err := rejectUnknownMigrationVersions(all, applied); err != nil {
+		return plan, err
+	}
+	seenPending := false
+	for _, mig := range all {
+		checksum, ok := applied[mig.version]
+		if !ok {
+			if plan.NextMigration == "" {
+				plan.NextMigration = mig.name
+			}
+			plan.Pending++
+			seenPending = true
+			continue
+		}
+		if seenPending {
+			return plan, fmt.Errorf("数据库迁移账本不连续：%s 已应用，但更早迁移 %s 缺失；拒绝自动补洞", mig.name, plan.NextMigration)
+		}
+		if checksum != mig.checksum {
+			return plan, fmt.Errorf(
+				"数据库迁移不兼容：%s 校验和不一致（库中 %s，二进制 %s）；已发布迁移不可修改",
+				mig.name, short(checksum), short(mig.checksum))
+		}
+		plan.CurrentVersion = mig.version
+	}
+	return plan, nil
+}
+
+func rejectUnknownMigrationVersions(all []migration, applied map[string]string) error {
+	expected := make(map[string]struct{}, len(all))
+	for _, mig := range all {
+		expected[mig.version] = struct{}{}
+	}
+	for version := range applied {
+		if _, ok := expected[version]; !ok {
+			return fmt.Errorf("数据库迁移版本 %s 不在当前二进制中；不能用旧二进制执行迁移或接流量", version)
+		}
 	}
 	return nil
 }

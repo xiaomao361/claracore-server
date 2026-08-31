@@ -138,6 +138,8 @@ func webWriteDescriptor(r *http.Request, p governance.Principal) (string, string
 		action, entityType, id = "token.revoke", "token", platform.ID(r.FormValue("id"))
 	case "POST /review/{id}":
 		action, entityType, id = "card.review", "card", platform.ID(r.PathValue("id"))
+	case "POST /review/batch-deprecate":
+		action = "card.review_batch_deprecate"
 	case "POST /continuity/{id}/status":
 		action, entityType, id = "shared_line.status", "shared_line", platform.ID(r.PathValue("id"))
 	case "POST /admin/members":
@@ -160,6 +162,10 @@ func webWriteDescriptor(r *http.Request, p governance.Principal) (string, string
 		action = "embedding.retry"
 	case "POST /admin/audit":
 		action = "admin.audit.query"
+	case "POST /admin/sources/sync":
+		action = "external.sync.queue"
+	case "POST /admin/export":
+		action, entityType, id = "admin.export.download", "tenant", p.TenantID
 	default:
 		// A new authenticated write cannot silently disappear from audit just
 		// because its richer descriptor was not added yet.

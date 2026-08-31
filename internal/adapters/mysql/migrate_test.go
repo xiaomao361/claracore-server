@@ -1,6 +1,9 @@
 package mysql
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // splitStatements 是迁移执行器里唯一有分支逻辑的部分，也是最容易
 // 「看起来对、遇到某个字面量就错」的部分。它不需要数据库，必须有测试。
@@ -105,5 +108,98 @@ CREATE TABLE spaces (
 	got := splitStatements(sql)
 	if len(got) != 2 {
 		t.Fatalf("期望 2 条语句，得到 %d 条: %q", len(got), got)
+	}
+}
+
+func TestCompareMigrationSetsRequiresExactBinaryDatabaseMatch(t *testing.T) {
+	all := []migration{
+		{version: "0001", name: "0001_governance.sql", checksum: "checksum-one"},
+		{version: "0002", name: "0002_knowledge.sql", checksum: "checksum-two"},
+	}
+
+	t.Run("current", func(t *testing.T) {
+		got, err := compareMigrationSets(all, map[string]string{
+			"0001": "checksum-one",
+			"0002": "checksum-two",
+		})
+		if err != nil {
+			t.Fatalf("当前结构不应失败: %v", err)
+		}
+		if got.LatestVersion != "0002" || got.Expected != 2 || got.Applied != 2 {
+			t.Fatalf("状态摘要不符: %+v", got)
+		}
+	})
+
+	cases := []struct {
+		name    string
+		applied map[string]string
+		want    string
+	}{
+		{
+			name:    "missing migration",
+			applied: map[string]string{"0001": "checksum-one"},
+			want:    "缺少 0002_knowledge.sql",
+		},
+		{
+			name: "modified migration",
+			applied: map[string]string{
+				"0001": "checksum-one",
+				"0002": "different-checksum",
+			},
+			want: "校验和不一致",
+		},
+		{
+			name: "database ahead of binary",
+			applied: map[string]string{
+				"0001": "checksum-one",
+				"0002": "checksum-two",
+				"0003": "checksum-three",
+			},
+			want: "不能用旧二进制执行迁移或接流量",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := compareMigrationSets(all, tc.applied)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("期望包含 %q 的错误，得到 %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestPlanMigrationSetsRequiresContiguousTrustedPrefix(t *testing.T) {
+	all := []migration{
+		{version: "0001", name: "0001_governance.sql", checksum: "checksum-one"},
+		{version: "0002", name: "0002_knowledge.sql", checksum: "checksum-two"},
+		{version: "0003", name: "0003_activity.sql", checksum: "checksum-three"},
+	}
+
+	plan, err := planMigrationSets(all, map[string]string{
+		"0001": "checksum-one",
+		"0002": "checksum-two",
+	})
+	if err != nil {
+		t.Fatalf("valid pending suffix should be plannable: %v", err)
+	}
+	if plan.CurrentVersion != "0002" || plan.TargetVersion != "0003" || plan.NextMigration != "0003_activity.sql" ||
+		plan.Applied != 2 || plan.Expected != 3 || plan.Pending != 1 {
+		t.Fatalf("unexpected upgrade plan: %+v", plan)
+	}
+
+	fresh, err := planMigrationSets(all, map[string]string{})
+	if err != nil {
+		t.Fatalf("empty fresh ledger should plan the complete suffix: %v", err)
+	}
+	if fresh.CurrentVersion != "" || fresh.Pending != 3 || fresh.NextMigration != "0001_governance.sql" {
+		t.Fatalf("unexpected fresh install plan: %+v", fresh)
+	}
+
+	_, err = planMigrationSets(all, map[string]string{
+		"0001": "checksum-one",
+		"0003": "checksum-three",
+	})
+	if err == nil || !strings.Contains(err.Error(), "账本不连续") || !strings.Contains(err.Error(), "拒绝自动补洞") {
+		t.Fatalf("migration gap must fail closed, got %v", err)
 	}
 }

@@ -88,6 +88,31 @@ func (f *fakeStore) ListLines(_ context.Context, q ListQuery) ([]Line, error) {
 	return out, nil
 }
 
+func (f *fakeStore) CountLineStats(_ context.Context, tenantID platform.ID) (LineStats, error) {
+	var stats LineStats
+	for id, line := range f.lines {
+		if line.TenantID != tenantID {
+			continue
+		}
+		switch line.Status {
+		case LineActive:
+			stats.Active++
+		case LineArchived:
+			stats.Archived++
+		}
+		if line.Status != LineActive {
+			continue
+		}
+		switch f.positions[id].InterpretationStatus {
+		case PositionNeedsReview:
+			stats.NeedsReview++
+		case PositionStale:
+			stats.Stale++
+		}
+	}
+	return stats, nil
+}
+
 func (f *fakeStore) FindLine(_ context.Context, tenantID, lineID platform.ID, activeOnly bool) (*Line, error) {
 	line, ok := f.lines[lineID]
 	if !ok || line.TenantID != tenantID || (activeOnly && line.Status != LineActive) {
@@ -377,6 +402,29 @@ func TestListPageUsesStableKeysetCursor(t *testing.T) {
 	}
 	if _, err := svc.ListPage(context.Background(), ListInput{TenantID: tenantA, AgentID: agentA, Cursor: "not-a-cursor"}); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("非法游标应拒绝，实际 %v", err)
+	}
+}
+
+func TestStatsCountsLifecycleAndAttentionExactly(t *testing.T) {
+	svc, store := newService()
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	store.lines["active-review"] = Line{ID: "active-review", TenantID: tenantA, Status: LineActive}
+	store.positions["active-review"] = Position{LineID: "active-review", InterpretationStatus: PositionNeedsReview, UpdatedAt: now}
+	store.lines["active-stale"] = Line{ID: "active-stale", TenantID: tenantA, Status: LineActive}
+	store.positions["active-stale"] = Position{LineID: "active-stale", InterpretationStatus: PositionStale, UpdatedAt: now}
+	store.lines["archived"] = Line{ID: "archived", TenantID: tenantA, Status: LineArchived}
+	store.positions["archived"] = Position{LineID: "archived", InterpretationStatus: PositionNeedsReview, UpdatedAt: now}
+	store.lines["foreign"] = Line{ID: "foreign", TenantID: "other", Status: LineActive}
+
+	stats, err := svc.Stats(context.Background(), tenantA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Active != 2 || stats.Archived != 1 || stats.NeedsReview != 1 || stats.Stale != 1 {
+		t.Fatalf("共同线看板口径不符: %+v", stats)
+	}
+	if _, err := svc.Stats(context.Background(), ""); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("空租户应拒绝，实际 %v", err)
 	}
 }
 

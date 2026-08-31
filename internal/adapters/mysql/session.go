@@ -26,9 +26,9 @@ func NewSessionStore(db *sql.DB) *SessionStore { return &SessionStore{db: db} }
 
 func (s *SessionStore) Create(ctx context.Context, sess ports.Session) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO sessions (id, tenant_id, user_id, expires_at, created_at, last_seen_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		sess.TokenHash, sess.TenantID, sess.UserID,
+		`INSERT INTO sessions (id, tenant_id, user_id, auth_version, expires_at, created_at, last_seen_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		sess.TokenHash, sess.TenantID, sess.UserID, sess.AuthVersion,
 		sess.ExpiresAt.UTC(), sess.CreatedAt.UTC(), sess.LastSeenAt.UTC())
 	if err != nil {
 		return fmt.Errorf("mysql: 创建会话: %w", err)
@@ -47,9 +47,9 @@ func (s *SessionStore) Find(ctx context.Context, tokenHash string) (ports.Sessio
 		expires, created, lastSeen time.Time
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, tenant_id, user_id, expires_at, created_at, last_seen_at
+		`SELECT id, tenant_id, user_id, auth_version, expires_at, created_at, last_seen_at
 		 FROM sessions WHERE id = ?`, tokenHash,
-	).Scan(&sess.TokenHash, &sess.TenantID, &sess.UserID, &expires, &created, &lastSeen)
+	).Scan(&sess.TokenHash, &sess.TenantID, &sess.UserID, &sess.AuthVersion, &expires, &created, &lastSeen)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		// 不存在不是错误：过期清理、主动登出、账号停用都会让它消失

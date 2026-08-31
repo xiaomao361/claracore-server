@@ -19,6 +19,10 @@ type Session struct {
 
 	TenantID string
 	UserID   string
+	// AuthVersion binds the session to the credential generation that issued
+	// it. Resume must compare it with the current user row; deleting existing
+	// sessions alone cannot revoke a concurrent late insert.
+	AuthVersion uint64
 
 	ExpiresAt  time.Time
 	CreatedAt  time.Time

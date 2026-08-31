@@ -400,6 +400,53 @@ func TestSharedLineAuditOmitsWorkContent(t *testing.T) {
 	}
 }
 
+func TestAutomaticContextAuditCorrelatesSelectionAndFeedbackWithoutContent(t *testing.T) {
+	activities := newFakeActivity()
+	srv, know := newToolHostWithActivity(t, activities)
+	know.search = knowledge.MemorySearchResult{
+		Hits:              []knowledge.MemoryHit{{Memory: know.memory, Score: 0.82, Semantic: true}},
+		SemanticAvailable: true,
+	}
+	know.recall = knowledge.CardSearchResult{SemanticAvailable: true}
+
+	out, errMsg := callTool(t, srv, "ccs_valid_clara", "gateway_auto_context", map[string]any{"prompt": "PRIVATE_CONTEXT_PROMPT_8e12"})
+	if errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	contextID, _ := out["contextId"].(string)
+	if len(contextID) != 32 {
+		t.Fatalf("交付没有生成匿名关联 ID: %+v", out)
+	}
+	if _, errMsg := callTool(t, srv, "ccs_valid_clara", "gateway_context_feedback", map[string]any{
+		"domain": "memory", "id": string(know.memory.ID), "contextId": contextID, "outcome": "used",
+	}); errMsg != "" {
+		t.Fatal(errMsg)
+	}
+
+	records := activities.snapshot()
+	autoRecord := recordForAction(t, records, "gateway_auto_context")
+	feedbackRecord := recordForAction(t, records, "gateway_context_feedback")
+	var autoMetadata struct {
+		Decision  string `json:"decision"`
+		Reason    string `json:"reason"`
+		ContextID string `json:"contextId"`
+	}
+	var feedbackMetadata struct {
+		Outcome   string `json:"feedbackOutcome"`
+		ContextID string `json:"contextId"`
+	}
+	decodeActivityMetadata(t, autoRecord, &autoMetadata)
+	decodeActivityMetadata(t, feedbackRecord, &feedbackMetadata)
+	if autoMetadata.Decision != "deliver_one" || autoMetadata.Reason != "high_confidence_top1" || autoMetadata.ContextID != contextID || feedbackMetadata.ContextID != contextID || feedbackMetadata.Outcome != "used" {
+		t.Fatalf("选择与反馈未由同一匿名 ID 关联: auto=%+v feedback=%+v", autoMetadata, feedbackMetadata)
+	}
+	for _, record := range []activity.RecordInput{autoRecord, feedbackRecord} {
+		if strings.Contains(string(record.Metadata), "PRIVATE_CONTEXT_PROMPT_8e12") || strings.Contains(string(record.Metadata), know.memory.Body) {
+			t.Fatalf("自动上下文审计不得包含 prompt 或正文: %s", record.Metadata)
+		}
+	}
+}
+
 func TestSharedWritesCaptureOutputEntityAndSpace(t *testing.T) {
 	activities := newFakeActivity()
 	srv, know := newToolHostWithActivity(t, activities)

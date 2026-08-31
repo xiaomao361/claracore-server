@@ -101,20 +101,101 @@ func appendActivityFilters(where string, args []any, action, outcome string, age
 func (s *ActivityStore) CountContextFeedback(ctx context.Context, query activity.ContextFeedbackQuery) (activity.ContextFeedbackQuality, error) {
 	quality := activity.ContextFeedbackQuality{Since: query.Since.UTC()}
 	err := s.ex.QueryRowContext(ctx,
-		`SELECT
-			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'delivered' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'used' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'ignored' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'wrong' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) = 'corrected' THEN 1 ELSE 0 END), 0)
-		 FROM audit_logs
-		 WHERE tenant_id = ? AND kind = ? AND action = ? AND outcome = ? AND created_at >= ?`,
-		string(query.TenantID), activity.KindGovernance, "gateway_context_feedback", activity.OutcomeSuccess, query.Since.UTC(),
-	).Scan(&quality.Delivered, &quality.Used, &quality.Ignored, &quality.Wrong, &quality.Corrected)
+		`WITH relevant AS (
+			SELECT kind, action,
+				JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.decision')) AS decision,
+				JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.reason')) AS reason,
+				JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.contextId')) AS context_id,
+				JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.feedbackOutcome')) AS feedback_outcome
+			FROM audit_logs
+			WHERE tenant_id = ? AND outcome = ? AND created_at >= ?
+				AND action IN ('gateway_auto_context', 'gateway_context_feedback')
+		), selections AS (
+			SELECT context_id
+			FROM relevant
+			WHERE kind = 'trace' AND action = 'gateway_auto_context'
+				AND decision = 'deliver_one' AND context_id IS NOT NULL AND context_id <> ''
+		), feedback AS (
+			SELECT context_id, feedback_outcome
+			FROM relevant
+			WHERE kind = 'governance' AND action = 'gateway_context_feedback'
+		)
+		SELECT
+			(SELECT COUNT(*) FROM relevant WHERE kind = 'trace' AND action = 'gateway_auto_context' AND decision = 'deliver_one'),
+			(SELECT COUNT(*) FROM relevant WHERE kind = 'trace' AND action = 'gateway_auto_context' AND decision = 'abstain'),
+			(SELECT COALESCE(SUM(reason IN ('no_candidates', 'low_relevance', 'no_high_confidence_evidence')), 0) FROM relevant WHERE kind = 'trace' AND action = 'gateway_auto_context' AND decision = 'abstain'),
+			(SELECT COALESCE(SUM(reason IN ('ambiguous_top_results', 'ambiguous_domains')), 0) FROM relevant WHERE kind = 'trace' AND action = 'gateway_auto_context' AND decision = 'abstain'),
+			(SELECT COALESCE(SUM(reason = 'semantic_unavailable'), 0) FROM relevant WHERE kind = 'trace' AND action = 'gateway_auto_context' AND decision = 'abstain'),
+			(SELECT COALESCE(SUM(reason = 'retrieval_timeout'), 0) FROM relevant WHERE kind = 'trace' AND action = 'gateway_auto_context' AND decision = 'abstain'),
+			(SELECT COALESCE(SUM(reason = 'shared_line_not_ready'), 0) FROM relevant WHERE kind = 'trace' AND action = 'gateway_auto_context' AND decision = 'abstain'),
+			(SELECT COALESCE(SUM(reason IS NULL OR reason NOT IN ('no_candidates', 'low_relevance', 'no_high_confidence_evidence', 'ambiguous_top_results', 'ambiguous_domains', 'semantic_unavailable', 'retrieval_timeout', 'shared_line_not_ready')), 0) FROM relevant WHERE kind = 'trace' AND action = 'gateway_auto_context' AND decision = 'abstain'),
+			(SELECT COUNT(DISTINCT feedback.context_id) FROM feedback INNER JOIN selections ON selections.context_id = feedback.context_id),
+			(SELECT COALESCE(SUM(feedback_outcome = 'delivered'), 0) FROM feedback),
+			(SELECT COALESCE(SUM(feedback_outcome = 'used'), 0) FROM feedback),
+			(SELECT COALESCE(SUM(feedback_outcome = 'ignored'), 0) FROM feedback),
+			(SELECT COALESCE(SUM(feedback_outcome = 'wrong'), 0) FROM feedback),
+			(SELECT COALESCE(SUM(feedback_outcome = 'corrected'), 0) FROM feedback)`,
+		string(query.TenantID), activity.OutcomeSuccess, query.Since.UTC(),
+	).Scan(
+		&quality.Selected, &quality.Abstained,
+		&quality.AbstainReasons.NoRelevantEvidence, &quality.AbstainReasons.Ambiguous,
+		&quality.AbstainReasons.SemanticUnavailable, &quality.AbstainReasons.RetrievalTimeout,
+		&quality.AbstainReasons.SharedLineNotReady, &quality.AbstainReasons.Other,
+		&quality.FeedbackCoveredSelections,
+		&quality.Delivered, &quality.Used, &quality.Ignored, &quality.Wrong, &quality.Corrected,
+	)
 	if err != nil {
-		return activity.ContextFeedbackQuality{}, fmt.Errorf("mysql: 汇总自动上下文反馈: %w", err)
+		return activity.ContextFeedbackQuality{}, fmt.Errorf("mysql: 汇总自动上下文质量: %w", err)
 	}
 	return quality, nil
+}
+
+// CountSharedActivity aggregates only successful writes in caller-resolved
+// readable shared spaces. The space predicate is applied in SQL so inaccessible
+// project and personal activity never enters application memory, even as rows.
+func (s *ActivityStore) CountSharedActivity(ctx context.Context, query activity.SharedActivityQuery) (activity.SharedActivityPulse, error) {
+	pulse := activity.SharedActivityPulse{Since: query.Since.UTC()}
+	if len(query.ReadableSharedSpaceIDs) == 0 {
+		return pulse, nil
+	}
+	where := ` WHERE tenant_id = ? AND outcome = ? AND access = ? AND created_at >= ? AND space_id IN (` + placeholders(len(query.ReadableSharedSpaceIDs)) + `)`
+	args := []any{string(query.TenantID), activity.OutcomeSuccess, activity.AccessWrite, query.Since.UTC()}
+	args = append(args, idArgs(query.ReadableSharedSpaceIDs)...)
+
+	var lastWrite sql.NullTime
+	if err := s.ex.QueryRowContext(ctx,
+		`SELECT COUNT(*), COUNT(DISTINCT user_id), COUNT(DISTINCT agent_id), MAX(created_at)
+		 FROM audit_logs`+where, args...).Scan(
+		&pulse.Writes, &pulse.ActiveUsers, &pulse.ActiveAgents, &lastWrite,
+	); err != nil {
+		return activity.SharedActivityPulse{}, fmt.Errorf("mysql: 汇总共享空间活动: %w", err)
+	}
+	if lastWrite.Valid {
+		at := lastWrite.Time.UTC()
+		pulse.LastWriteAt = &at
+	}
+
+	rows, err := s.ex.QueryContext(ctx,
+		`SELECT DATE(created_at), COUNT(*)
+		 FROM audit_logs`+where+`
+		 GROUP BY DATE(created_at)
+		 ORDER BY DATE(created_at) ASC`, args...)
+	if err != nil {
+		return activity.SharedActivityPulse{}, fmt.Errorf("mysql: 按日汇总共享空间活动: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var daily activity.DailySharedWrites
+		if err := rows.Scan(&daily.Date, &daily.Writes); err != nil {
+			return activity.SharedActivityPulse{}, fmt.Errorf("mysql: 读取共享空间活动日桶: %w", err)
+		}
+		daily.Date = daily.Date.UTC()
+		pulse.DailyWrites = append(pulse.DailyWrites, daily)
+	}
+	if err := rows.Err(); err != nil {
+		return activity.SharedActivityPulse{}, fmt.Errorf("mysql: 遍历共享空间活动日桶: %w", err)
+	}
+	return pulse, nil
 }
 
 func (s *ActivityStore) list(

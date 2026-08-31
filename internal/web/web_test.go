@@ -19,10 +19,42 @@ import (
 
 	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/continuity"
+	"claracore-server/internal/domain/external"
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
+	"claracore-server/internal/ports"
 )
+
+type fakeBackupStatusReader struct {
+	status ports.BackupStatus
+	err    error
+}
+
+func (f fakeBackupStatusReader) Read() (ports.BackupStatus, error) { return f.status, f.err }
+
+type fakeRestoreStatusReader struct {
+	status ports.RestoreStatus
+	err    error
+}
+
+func (f fakeRestoreStatusReader) Read() (ports.RestoreStatus, error) { return f.status, f.err }
+
+type fakeIntegrityStatusReader struct {
+	status ports.IntegrityStatus
+	err    error
+}
+
+func (f fakeIntegrityStatusReader) Read() (ports.IntegrityStatus, error) { return f.status, f.err }
+
+type fakeTenantCapacityReader struct {
+	snapshot ports.TenantCapacitySnapshot
+	err      error
+}
+
+func (f fakeTenantCapacityReader) ReadTenantCapacity(context.Context, platform.ID) (ports.TenantCapacitySnapshot, error) {
+	return f.snapshot, f.err
+}
 
 // fakeGov 是治理域的替身。
 //
@@ -37,6 +69,10 @@ type fakeGov struct {
 	users       []governance.User
 	spaces      []governance.Space
 	permissions []governance.Permission
+	userNext    string
+	tokenNext   string
+	spaceNext   string
+	grantNext   string
 	lastReset   platform.ID
 	lastStatus  struct {
 		user   platform.ID
@@ -133,6 +169,26 @@ func (f *fakeGov) ListUsers(_ context.Context, _ platform.ID) ([]governance.User
 	return f.users, nil
 }
 
+func (f *fakeGov) ListUserSummariesPage(_ context.Context, in governance.GovernancePageInput) (governance.UserSummaryPage, error) {
+	items := make([]governance.UserSummary, 0, len(f.users))
+	for _, user := range f.users {
+		if user.TenantID != in.TenantID {
+			continue
+		}
+		items = append(items, userSummary(user))
+	}
+	return governance.UserSummaryPage{Items: items, NextCursor: f.userNext}, nil
+}
+
+func (f *fakeGov) FindUserSummary(_ context.Context, tenantID, userID platform.ID) (governance.UserSummary, error) {
+	for _, user := range f.users {
+		if user.TenantID == tenantID && user.ID == userID {
+			return userSummary(user), nil
+		}
+	}
+	return governance.UserSummary{}, governance.ErrUserNotFound
+}
+
 func (f *fakeGov) CreateUser(_ context.Context, in governance.CreateUserInput) (governance.User, governance.Space, error) {
 	f.calls++
 	f.created = in
@@ -141,6 +197,49 @@ func (f *fakeGov) CreateUser(_ context.Context, in governance.CreateUserInput) (
 
 func (f *fakeGov) ListSpaces(_ context.Context, _ platform.ID) ([]governance.Space, error) {
 	return f.spaces, nil
+}
+
+func (f *fakeGov) ListSpacePage(_ context.Context, in governance.GovernancePageInput) (governance.SpacePage, error) {
+	items := make([]governance.Space, 0, len(f.spaces))
+	for _, space := range f.spaces {
+		if space.TenantID == in.TenantID && space.Type != governance.SpacePersonal {
+			items = append(items, space)
+		}
+	}
+	return governance.SpacePage{Items: items, NextCursor: f.spaceNext}, nil
+}
+
+func (f *fakeGov) ListSpaceGrantPage(_ context.Context, in governance.GovernancePageInput) (governance.SpaceGrantPage, error) {
+	var selected governance.Space
+	found := false
+	for _, space := range f.spaces {
+		if space.TenantID == in.TenantID && space.ID == in.SpaceID {
+			selected, found = space, true
+			break
+		}
+	}
+	if !found {
+		return governance.SpaceGrantPage{}, governance.ErrSpaceNotFound
+	}
+	if selected.Type == governance.SpacePersonal {
+		return governance.SpaceGrantPage{}, governance.ErrSpaceForbidden
+	}
+	items := make([]governance.SpaceGrantSummary, 0, len(f.users))
+	for _, user := range f.users {
+		if user.TenantID != in.TenantID || selected.OwnerUserID != nil && user.ID == *selected.OwnerUserID {
+			continue
+		}
+		var permission *governance.Permission
+		for i := range f.permissions {
+			if f.permissions[i].SpaceID == selected.ID && f.permissions[i].UserID == user.ID {
+				copy := f.permissions[i]
+				permission = &copy
+				break
+			}
+		}
+		items = append(items, governance.SpaceGrantSummary{User: userSummary(user), Permission: permission})
+	}
+	return governance.SpaceGrantPage{Space: selected, Items: items, NextCursor: f.grantNext}, nil
 }
 
 func (f *fakeGov) ListSpacePermissions(_ context.Context, _ platform.ID) ([]governance.Permission, error) {
@@ -197,6 +296,76 @@ func (f *fakeGov) ListTokens(_ context.Context, _, _ platform.ID) ([]governance.
 	return f.tokens, nil
 }
 
+func (f *fakeGov) ListTokenSummariesPage(_ context.Context, in governance.GovernancePageInput) (governance.TokenSummaryPage, error) {
+	items := make([]governance.TokenSummary, 0, len(f.tokens))
+	for _, token := range f.tokens {
+		if token.TenantID != "" && token.TenantID != in.TenantID || token.UserID != "" && token.UserID != in.UserID {
+			continue
+		}
+		items = append(items, tokenSummary(token))
+	}
+	return governance.TokenSummaryPage{Items: items, NextCursor: f.tokenNext}, nil
+}
+
+func (f *fakeGov) FindOwnTokenSummary(_ context.Context, tenantID, userID, tokenID platform.ID) (governance.TokenSummary, error) {
+	for _, token := range f.tokens {
+		if token.ID != tokenID || token.TenantID != "" && token.TenantID != tenantID || token.UserID != "" && token.UserID != userID {
+			continue
+		}
+		return tokenSummary(token), nil
+	}
+	return governance.TokenSummary{}, governance.ErrTokenNotFound
+}
+
+func (f *fakeGov) ListAgentAccessSummaries(_ context.Context, tenantID, userID platform.ID, limit int) ([]governance.AgentAccessSummary, error) {
+	byAgent := make(map[platform.ID]*governance.AgentAccessSummary)
+	for _, token := range f.tokens {
+		if token.TenantID != "" && token.TenantID != tenantID || token.UserID != "" && token.UserID != userID {
+			continue
+		}
+		summary := byAgent[token.AgentID]
+		if summary == nil {
+			summary = &governance.AgentAccessSummary{AgentID: token.AgentID, LastIssuedAt: token.CreatedAt}
+			byAgent[token.AgentID] = summary
+		}
+		summary.TokenCount++
+		if token.RevokedAt == nil {
+			summary.ActiveTokens++
+		}
+		if token.LastUsedAt != nil && (summary.LastUsedAt == nil || token.LastUsedAt.After(*summary.LastUsedAt)) {
+			lastUsed := *token.LastUsedAt
+			summary.LastUsedAt = &lastUsed
+		}
+		if token.CreatedAt.After(summary.LastIssuedAt) {
+			summary.LastIssuedAt = token.CreatedAt
+		}
+	}
+	items := make([]governance.AgentAccessSummary, 0, len(byAgent))
+	for _, summary := range byAgent {
+		items = append(items, *summary)
+		if len(items) == limit {
+			break
+		}
+	}
+	return items, nil
+}
+
+func userSummary(user governance.User) governance.UserSummary {
+	return governance.UserSummary{
+		ID: user.ID, TenantID: user.TenantID, Username: user.Username,
+		DisplayName: user.DisplayName, Role: user.Role, MustChangePw: user.MustChangePw,
+		Status: user.Status, CreatedAt: user.CreatedAt,
+	}
+}
+
+func tokenSummary(token governance.Token) governance.TokenSummary {
+	return governance.TokenSummary{
+		ID: token.ID, TenantID: token.TenantID, UserID: token.UserID, AgentID: token.AgentID,
+		Name: token.Name, Prefix: token.Prefix, ExpiresAt: token.ExpiresAt,
+		LastUsedAt: token.LastUsedAt, RevokedAt: token.RevokedAt, CreatedAt: token.CreatedAt,
+	}
+}
+
 func (f *fakeGov) RevokeToken(_ context.Context, _, tokenID platform.ID) error {
 	f.calls++
 	f.revoked = tokenID
@@ -211,6 +380,7 @@ type fakeKnow struct {
 	memory       knowledge.Memory
 	lastList     knowledge.ListContentsInput
 	lastUpdate   knowledge.UpdateCardInput
+	lastBatch    knowledge.DeprecateDraftCardsInput
 	lastIngest   knowledge.IngestInput
 	ingestReport knowledge.IngestReport
 	ingestErr    error
@@ -218,8 +388,10 @@ type fakeKnow struct {
 	backfill     knowledge.BackfillReport
 	retried      int
 	updateErr    error
+	batchErr     error
 	getErr       error
 	duplicates   []knowledge.CardDuplicateCandidate
+	spaceStats   []knowledge.SpaceStats
 	calls        int
 }
 
@@ -232,17 +404,28 @@ type fakeActivity struct {
 	recordErr      error
 	visibleErr     error
 	adminErr       error
+	quality        activity.ContextFeedbackQuality
+	qualityErr     error
+	qualityTenant  platform.ID
+	qualityWindow  time.Duration
+	sharedPulse    activity.SharedActivityPulse
+	sharedErr      error
+	sharedTenant   platform.ID
+	sharedSpaces   []platform.ID
+	sharedDays     int
 	listAdminCalls int
 	order          []string
 }
 
 type fakeContinuity struct {
-	lines      []continuity.LineSummary
-	lastInput  continuity.ListInput
-	lastGet    continuity.GetInput
-	lastStatus continuity.SetStatusInput
-	packet     continuity.ResumePacket
-	err        error
+	lines       []continuity.LineSummary
+	lastInput   continuity.ListInput
+	lastGet     continuity.GetInput
+	lastStatus  continuity.SetStatusInput
+	packet      continuity.ResumePacket
+	stats       continuity.LineStats
+	statsTenant platform.ID
+	err         error
 }
 
 func newFakeContinuity() *fakeContinuity {
@@ -266,7 +449,7 @@ func newFakeContinuity() *fakeContinuity {
 		Status: continuity.LineActive, Summary: "共同线 Web 入口与筛选交互正在验证。",
 		InterpretationStatus: continuity.PositionConfirmed, NextStep: "部署后人工刷新页面确认。",
 		UpdatedAt: now,
-	}}, packet: continuity.ResumePacket{Line: line, RecentHandoff: &handoff, PositionHistory: []continuity.Position{*line.Position}, HandoffHistory: []continuity.Handoff{handoff}}}
+	}}, packet: continuity.ResumePacket{Line: line, RecentHandoff: &handoff, PositionHistory: []continuity.Position{*line.Position}, HandoffHistory: []continuity.Handoff{handoff}}, stats: continuity.LineStats{Active: 1}}
 }
 
 func (f *fakeContinuity) List(_ context.Context, in continuity.ListInput) ([]continuity.LineSummary, error) {
@@ -296,6 +479,11 @@ func (f *fakeContinuity) ListPage(_ context.Context, in continuity.ListInput) (c
 		page.NextCursor = "next-cursor"
 	}
 	return page, f.err
+}
+
+func (f *fakeContinuity) Stats(_ context.Context, tenantID platform.ID) (continuity.LineStats, error) {
+	f.statsTenant = tenantID
+	return f.stats, f.err
 }
 
 func (f *fakeContinuity) Get(_ context.Context, in continuity.GetInput) (continuity.ResumePacket, error) {
@@ -331,10 +519,26 @@ func (f *fakeActivity) ListAdmin(_ context.Context, in activity.ListAdminInput) 
 	return f.adminPage, f.adminErr
 }
 
-func (*fakeKnow) SpaceStats(_ context.Context, _ platform.ID, spaces []platform.ID) ([]knowledge.SpaceStats, error) {
+func (f *fakeActivity) ContextFeedbackQuality(_ context.Context, tenantID platform.ID, window time.Duration) (activity.ContextFeedbackQuality, error) {
+	f.qualityTenant, f.qualityWindow = tenantID, window
+	return f.quality, f.qualityErr
+}
+
+func (f *fakeActivity) SharedActivityPulse(_ context.Context, tenantID platform.ID, spaces []platform.ID, days int) (activity.SharedActivityPulse, error) {
+	f.sharedTenant, f.sharedSpaces, f.sharedDays = tenantID, append([]platform.ID(nil), spaces...), days
+	return f.sharedPulse, f.sharedErr
+}
+
+func (f *fakeKnow) SpaceStats(_ context.Context, _ platform.ID, spaces []platform.ID) ([]knowledge.SpaceStats, error) {
+	if f.spaceStats != nil {
+		return f.spaceStats, nil
+	}
 	out := make([]knowledge.SpaceStats, 0, len(spaces))
 	for _, id := range spaces {
-		out = append(out, knowledge.SpaceStats{SpaceID: id, Memories: 3, Cards: 2, DraftCards: 1, UnqualifiedCards: 1, RecallTriggers: 4})
+		out = append(out, knowledge.SpaceStats{
+			SpaceID: id, Memories: 3, Cards: 2, DraftCards: 1, UnqualifiedCards: 1, RecallTriggers: 4,
+			ActiveCards: 1, ActiveUnqualifiedCards: 0, RecallReadyCards: 1,
+		})
 	}
 	return out, nil
 }
@@ -443,6 +647,44 @@ func post(t *testing.T, srv *httptest.Server, path string, form url.Values, with
 	return resp
 }
 
+func TestWebWriteBoundaryRejectsOversizedAndUnsupportedBodies(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{
+		Version: "test", MaxFormBytes: 128,
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		body        string
+		wantStatus  int
+	}{
+		{name: "oversized urlencoded form", contentType: "application/x-www-form-urlencoded", body: "username=" + strings.Repeat("x", 256), wantStatus: http.StatusRequestEntityTooLarge},
+		{name: "unsupported json", contentType: "application/json", body: `{}`, wantStatus: http.StatusUnsupportedMediaType},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, srv.URL+"/login", strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Content-Type", tc.contentType)
+			resp, err := client(srv).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+		})
+	}
+	if gov.calls != 0 {
+		t.Fatalf("oversized or unsupported writes reached governance: calls = %d", gov.calls)
+	}
+}
+
 func body(t *testing.T, resp *http.Response) string {
 	t.Helper()
 	defer resp.Body.Close()
@@ -464,7 +706,7 @@ func body(t *testing.T, resp *http.Response) string {
 func TestUnauthenticatedIsRedirectedEverywhere(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, false)
 
-	for _, path := range []string{"/", "/tokens", "/password", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit"} {
+	for _, path := range []string{"/", "/tokens", "/password", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit", "/admin/system", "/admin/sources", "/admin/export"} {
 		t.Run(path, func(t *testing.T) {
 			resp := get(t, srv, path, false)
 			defer resp.Body.Close()
@@ -481,7 +723,7 @@ func TestUnauthenticatedIsRedirectedEverywhere(t *testing.T) {
 func TestMemberCannotSeeAdminPages(t *testing.T) {
 	srv, gov := newTestWeb(t, governance.RoleMember, false)
 
-	for _, path := range []string{"/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit"} {
+	for _, path := range []string{"/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit", "/admin/system", "/admin/sources", "/admin/export"} {
 		resp := get(t, srv, path, true)
 		defer resp.Body.Close()
 		// 404 而不是 403：不确认「这个管理页存在」
@@ -497,7 +739,7 @@ func TestMemberCannotSeeAdminPages(t *testing.T) {
 func TestMemberCannotPostToAdminEndpoints(t *testing.T) {
 	srv, gov := newTestWeb(t, governance.RoleMember, false)
 
-	for _, path := range []string{"/admin/members", "/admin/members/status", "/admin/members/reset", "/admin/spaces", "/admin/spaces/grant", "/admin/spaces/revoke", "/admin/ingest", "/admin/indexing/backfill", "/admin/indexing/retry", "/admin/audit"} {
+	for _, path := range []string{"/admin/members", "/admin/members/status", "/admin/members/reset", "/admin/spaces", "/admin/spaces/grant", "/admin/spaces/revoke", "/admin/ingest", "/admin/indexing/backfill", "/admin/indexing/retry", "/admin/audit", "/admin/sources/sync", "/admin/export"} {
 		t.Run(path, func(t *testing.T) {
 			resp := post(t, srv, path, url.Values{"id": {string(userOther)}, "status": {"disabled"}}, true, true)
 			defer resp.Body.Close()
@@ -518,7 +760,7 @@ func TestMemberCannotPostToAdminEndpoints(t *testing.T) {
 func TestMustChangePasswordBlocksEverythingElse(t *testing.T) {
 	srv, _ := newTestWeb(t, governance.RoleAdmin, true)
 
-	for _, path := range []string{"/", "/tokens", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit"} {
+	for _, path := range []string{"/", "/tokens", "/activity", "/admin/members", "/admin/spaces", "/admin/ingest", "/admin/indexing", "/admin/audit", "/admin/system", "/admin/sources", "/admin/export"} {
 		resp := get(t, srv, path, true)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/password" {
@@ -560,6 +802,8 @@ func TestWritesRequireCSRF(t *testing.T) {
 		"/admin/indexing/backfill":           {},
 		"/admin/indexing/retry":              {},
 		"/admin/audit":                       {},
+		"/admin/sources/sync":                {},
+		"/admin/export":                      {"confirm": {tenantExportConfirmation}},
 	}
 	for path, form := range writes {
 		t.Run(path, func(t *testing.T) {
@@ -605,6 +849,40 @@ func TestAdminCanManageProjectSpacesAndPermissions(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusSeeOther || gov.lastRevoke.space != spProject || gov.lastRevoke.user != userOther {
 		t.Fatalf("撤销授权没有正确下沉到领域层: status=%d revoke=%+v", resp.StatusCode, gov.lastRevoke)
+	}
+}
+
+func TestGovernancePagesExposeBoundedKeysetNavigation(t *testing.T) {
+	srv, gov := newTestWeb(t, governance.RoleAdmin, false)
+	gov.userNext = "next-member"
+	gov.tokenNext = "next-token"
+	gov.spaceNext = "next-space"
+	gov.grantNext = "next-grant"
+	gov.tokens = []governance.Token{{ID: "01TOKENAAAAAAAAAAAAAAAAAAA", Name: "Laptop", Prefix: "ccs_safe"}}
+
+	members := body(t, get(t, srv, "/admin/members?cursor=current-member", true))
+	for _, want := range []string{"返回第一页", "/admin/members?cursor=next-member", "下一页"} {
+		if !strings.Contains(members, want) {
+			t.Errorf("member page missing bounded navigation %q", want)
+		}
+	}
+	tokens := body(t, get(t, srv, "/tokens?cursor=current-token", true))
+	for _, want := range []string{"返回第一页", "/tokens?cursor=next-token", "下一页"} {
+		if !strings.Contains(tokens, want) {
+			t.Errorf("token page missing bounded navigation %q", want)
+		}
+	}
+	spaces := body(t, get(t, srv, "/admin/spaces?space="+string(spProject)+"&spaces_cursor=current-space&grants_cursor=current-grant", true))
+	for _, want := range []string{
+		"每页最多 20 个", "返回第一页", "spaces_cursor=next-space", "返回成员第一页",
+		"grants_cursor=next-grant", "space=" + string(spProject), "spaces_cursor=current-space",
+	} {
+		if !strings.Contains(spaces, want) {
+			t.Errorf("space page missing bounded navigation %q", want)
+		}
+	}
+	if strings.Contains(spaces, "创建者：毛仔") && strings.Contains(spaces, `aria-label="团队的成员权限"`) {
+		t.Fatal("space governance must expand only the selected space's member matrix")
 	}
 }
 
@@ -972,13 +1250,85 @@ func TestOverviewShowsAgentsAndRecentSharedCards(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	page := body(t, get(t, srv, "/", true))
-	for _, want := range []string{"我的 Agent", "MacBook", "团队近期卡片", "团队发布卡片", "团队"} {
+	for _, want := range []string{"我的 Agent", "01AGENTAAAAAAAAAAAAAAAAAAA", "共签发 1 个 token", "团队近期卡片", "团队发布卡片", "团队"} {
 		if !strings.Contains(page, want) {
 			t.Errorf("概览缺少 %q", want)
 		}
 	}
 	if know.lastList.Kind != knowledge.EntityCard || len(know.lastList.Statuses) != 1 || know.lastList.Statuses[0] != knowledge.CardActive || len(know.lastList.Spaces) != 1 || know.lastList.Spaces[0] != spTeam {
 		t.Fatalf("概览近期动态必须只查共享空间 active 卡片，实际 %+v", know.lastList)
+	}
+}
+
+func TestOverviewShowsActionableRuntimeAndQualitySignals(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	know := &fakeKnow{
+		spaceStats: []knowledge.SpaceStats{{
+			SpaceID: spTeam, Cards: 12, ActiveCards: 10, ActiveUnqualifiedCards: 2,
+			RecallReadyCards: 7, RecallTriggers: 15,
+		}},
+		embedHealth: knowledge.EmbeddingHealth{
+			Enabled: true, Model: "bge-m3",
+			Stats: knowledge.EmbeddingStats{Pending: 5, Ready: 20, Failed: 2, Exhausted: 1},
+		},
+	}
+	lines := newFakeContinuity()
+	lines.stats = continuity.LineStats{Active: 4, Archived: 3, NeedsReview: 1, Stale: 2}
+	activities := &fakeActivity{quality: activity.ContextFeedbackQuality{
+		Selected: 18, Abstained: 7, FeedbackCoveredSelections: 9,
+		AbstainReasons: activity.ContextAbstainReasons{
+			NoRelevantEvidence: 2, Ambiguous: 2, SemanticUnavailable: 1,
+			RetrievalTimeout: 1, SharedLineNotReady: 1,
+		},
+		Delivered: 3, Used: 6, Wrong: 2, Corrected: 1,
+	}, sharedPulse: activity.SharedActivityPulse{
+		Writes: 11, ActiveUsers: 3, ActiveAgents: 2,
+		DailyWrites: []activity.DailySharedWrites{
+			{Date: time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC), Writes: 0},
+			{Date: time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC), Writes: 1},
+			{Date: time.Date(2026, 8, 24, 0, 0, 0, 0, time.UTC), Writes: 2},
+			{Date: time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC), Writes: 0},
+			{Date: time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC), Writes: 3},
+			{Date: time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC), Writes: 1},
+			{Date: time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC), Writes: 4},
+		},
+	}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, lines, activities, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/", true))
+	for _, want := range []string{
+		`aria-labelledby="operations-heading"`, "运行与质量", "进行中的共同线", "待复核 1 · 已陈旧 2",
+		"有召回条件的卡片", "7 / 10", "2 张已发布卡片缺少", "语义索引失败", "等待 5 · 已耗尽重试 1",
+		"近 30 天已关联反馈的选择", "9 / 18", "自动放弃 7：无相关证据 2 · 歧义 2 · 语义不可用 1 · 超时 1", "Shared Line 未就绪 1 · 其他/旧记录 0 · 错误反馈 2 · 已纠正 1", "匹配本窗口真实选择", "不等于自动上下文准确率",
+		"近 7 天共享协作", "共享写入", ">11<", "活跃成员", ">3<", "活跃 Agent", ">2<", "08-28", "4</strong><small>次写入", "不含个人空间",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("概览看板缺少 %q", want)
+		}
+	}
+	if lines.statsTenant != tenantA || activities.qualityTenant != tenantA || activities.qualityWindow != 30*24*time.Hour ||
+		activities.sharedTenant != tenantA || activities.sharedDays != 7 || len(activities.sharedSpaces) != 1 || activities.sharedSpaces[0] != spTeam {
+		t.Fatalf("看板统计必须按当前租户、可读共享空间与固定窗口查询: lineTenant=%s feedbackTenant=%s feedbackWindow=%s sharedTenant=%s sharedSpaces=%v sharedDays=%d", lines.statsTenant, activities.qualityTenant, activities.qualityWindow, activities.sharedTenant, activities.sharedSpaces, activities.sharedDays)
+	}
+}
+
+func TestOverviewKeepsRenderingWhenOptionalSignalsFail(t *testing.T) {
+	gov := newFakeGov(governance.RoleMember, false)
+	know := &fakeKnow{ingestErr: errors.New("embedding stats unavailable")}
+	lines := newFakeContinuity()
+	lines.err = errors.New("line stats unavailable")
+	activities := &fakeActivity{qualityErr: errors.New("feedback stats unavailable"), sharedErr: errors.New("shared activity unavailable")}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, lines, activities, logger, Options{Version: "test"}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/", true))
+	for _, want := range []string{"运行与质量", "共同线统计暂时不可用", "语义索引统计暂时不可用", "自动上下文反馈统计暂时不可用", "共享协作统计暂时不可用", "空间明细"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("局部统计失败时概览缺少 %q", want)
+		}
 	}
 }
 
@@ -1014,22 +1364,337 @@ func TestWorkspaceShellKeepsNavigationAndAccessibilityContracts(t *testing.T) {
 	}
 }
 
+func TestAdminSourcesPageQueuesOneAuditedSyncAndShowsReceipts(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	act := &fakeActivity{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	finished := now.Add(-time.Minute)
+	queued := 0
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), act, logger, Options{
+		Version: "test", Now: func() time.Time { return now }, ExternalConfigured: true,
+		ExternalSources: func(context.Context, platform.ID) ([]external.SourceHealth, error) {
+			return []external.SourceHealth{{Name: "atlas-docs", System: "shared-docs", LastSyncStatus: external.SyncSucceeded, LastSucceededAt: &finished, DocumentCount: 37}}, nil
+		},
+		ExternalSyncRuns: func(_ context.Context, tenantID platform.ID, limit int) ([]external.SyncRunReceipt, error) {
+			if tenantID != tenantA || limit != externalReceiptLimit {
+				t.Fatalf("unexpected receipt scope: tenant=%s limit=%d", tenantID, limit)
+			}
+			return []external.SyncRunReceipt{{ID: "run-1", SourceName: "atlas-docs", SourceSystem: "shared-docs", Status: external.SyncSucceeded, Seen: 37, Indexed: 4, Unchanged: 33, StartedAt: now.Add(-2 * time.Minute), FinishedAt: &finished}}, nil
+		},
+		QueueExternalSync: func(_ context.Context, tenantID platform.ID) (bool, error) {
+			if tenantID != tenantA {
+				t.Fatalf("unexpected queue tenant: %s", tenantID)
+			}
+			queued++
+			return queued == 1, nil
+		},
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/admin/sources", true))
+	for _, want := range []string{"外部来源", "Atlas 同步", "开始同步", "atlas-docs", "37 份有效镜像", "最近运行", "新索引 4", "外部正文"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("外部来源页缺少 %q", want)
+		}
+	}
+	resp := post(t, srv, "/admin/sources/sync", url.Values{}, true, true)
+	first := body(t, resp)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(first, "同步请求已记录") || queued != 1 {
+		t.Fatalf("first queue request failed: status=%d queued=%d body=%.300s", resp.StatusCode, queued, first)
+	}
+	resp = post(t, srv, "/admin/sources/sync", url.Values{}, true, true)
+	second := body(t, resp)
+	if !strings.Contains(second, "已有一轮手动同步在等待") || queued != 2 {
+		t.Fatalf("duplicate queue feedback missing: queued=%d body=%.300s", queued, second)
+	}
+	if len(act.records) != 2 || act.records[0].Action != "external.sync.queue" || act.records[0].Outcome != activity.OutcomeSuccess {
+		t.Fatalf("manual sync queue must be audited without form data: records=%+v", act.records)
+	}
+}
+
+func TestExternalSourceRequestStatusIsExplicit(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	pending := now.Add(-time.Minute)
+	active := now.Add(time.Minute)
+	expired := now.Add(-time.Second)
+	for _, tc := range []struct {
+		name   string
+		health external.SourceHealth
+		want   string
+	}{
+		{name: "pending", health: external.SourceHealth{SyncRequestedAt: &pending}, want: "等待处理"},
+		{name: "active claim", health: external.SourceHealth{SyncClaimed: true, SyncClaimUntil: &active}, want: "正在处理"},
+		{name: "expired claim", health: external.SourceHealth{SyncClaimed: true, SyncClaimUntil: &expired}, want: "等待其他实例接管"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := makeSourceHealthView(tc.health, true, now).Request; got != tc.want {
+				t.Fatalf("request status = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAdminSystemPageReportsActualRuntimeShape(t *testing.T) {
 	gov := newFakeGov(governance.RoleAdmin, false)
 	know := &fakeKnow{embedHealth: knowledge.EmbeddingHealth{Enabled: true, Model: "bge-m3", Stats: knowledge.EmbeddingStats{Ready: 12, Failed: 1}}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	startedAt := time.Date(2026, 8, 29, 6, 0, 0, 0, time.UTC)
 	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), &fakeActivity{}, logger, Options{
-		Version: "v-test", Env: "development", RedisConfigured: true, EmbeddingProvider: "ollama",
-		DatabaseHealth:      func(context.Context) error { return nil },
+		Version: "v-test", SourceDigest: strings.Repeat("a", 64), BinaryDigest: strings.Repeat("b", 64), Env: "development", RedisConfigured: true, EmbeddingProvider: "ollama",
+		MySQLTransport: "TLS 1.2+，验证服务端身份", RedisTransport: "TLS 1.2+，验证服务端身份",
+		EmbeddingTransport: "HTTPS，验证服务端身份", ExternalTransport: "HTTPS，验证服务端身份",
+		DatabaseHealth: func(context.Context) error { return nil },
+		SchemaHealth:   func(context.Context) (string, error) { return "0008", nil },
+		DatabasePoolStats: func() DatabasePoolStats {
+			return DatabasePoolStats{
+				MaxOpenConnections: 20, OpenConnections: 19, InUse: 18, Idle: 1,
+				WaitCount: 7, WaitDuration: 1500 * time.Millisecond,
+				MaxIdleClosed: 2, MaxIdleTimeClosed: 3, MaxLifetimeClosed: 4,
+			}
+		},
+		SchemaVersion:       "0008",
+		StartedAt:           startedAt,
+		Now:                 func() time.Time { return startedAt.Add(2*time.Hour + 3*time.Minute + 4*time.Second) },
+		ShutdownDrain:       5 * time.Second,
+		RedisHealth:         func(context.Context) error { return nil },
 		EmbeddingCacheStats: func() (uint64, uint64, bool) { return 7, 3, true },
+		LoginRateLimiter:    &scriptedRateLimiter{},
+		LoginRateLimit:      10,
+		LoginRateWindow:     15 * time.Minute,
+		MCPRateLimit:        300,
+		MCPTenantRateLimit:  3000,
+		MCPRateWindow:       time.Minute,
+		MetricsAddr:         "127.0.0.1:51892",
+		HTTPRequestStats: func() HTTPRequestStats {
+			return HTTPRequestStats{
+				Available: true, Window: 5 * time.Minute, Requests: 42, ClientErrors: 3,
+				ServerErrors: 1, Panics: 0, AverageLatency: 37 * time.Millisecond,
+				P95Latency: 250 * time.Millisecond, InFlight: 2,
+			}
+		},
+		BackupStatus: fakeBackupStatusReader{status: ports.BackupStatus{
+			Database: "claracore_server", Archive: "claracore-server_claracore_server_20260829T070000Z.sql.gz",
+			CreatedAt: startedAt.Add(time.Hour), VerifiedAt: startedAt.Add(time.Hour + time.Minute),
+			MaxAge: 26 * time.Hour, IntegrityVerified: true, Recoverability: "not_proven",
+		}},
+		RestoreStatus: fakeRestoreStatusReader{status: ports.RestoreStatus{
+			Database: "claracore_server", Archive: "claracore-server_claracore_server_20260822T090000Z.sql.gz",
+			Report:     "claracore-server_claracore_server_20260822T090000Z.sql.gz.restore-report.tsv",
+			RestoredAt: startedAt.Add(-6 * 24 * time.Hour), MaxAge: 30 * 24 * time.Hour,
+			TableCount: 25, MigrationCount: 10, LatestMigration: "0010",
+			TechnicalRestoreVerified: true, SemanticInspection: "not_proven",
+		}},
+		IntegrityStatus: fakeIntegrityStatusReader{status: ports.IntegrityStatus{
+			Verified: true, SchemaVersion: "0008", CheckedAt: startedAt.Add(90 * time.Minute), MaxAge: 25 * time.Hour, RulesChecked: 29,
+		}},
+		TenantCapacity: fakeTenantCapacityReader{snapshot: ports.TenantCapacitySnapshot{
+			MeasuredAt: startedAt.Add(2 * time.Hour), Members: 8, Agents: 11, Spaces: 5,
+			Memories: 34, Cards: 21, RecallTriggers: 40, Labels: 18, Links: 7, KnowledgeLogicalBytes: 2048,
+			ContinuityLines: 6, ContinuityPositions: 5, ContinuityHistory: 19, ContinuityHandoffs: 4, ContinuityLogicalBytes: 1024,
+			Embeddings: 95, EmbeddingLogicalBytes: 512,
+			ExternalSources: 1, ExternalSyncRuns: 9, ExternalDocuments: 37, ExternalVectors: 37, ExternalLogicalBytes: 256,
+			AuditEvents: 123, AuditLogicalBytes: 128,
+		}},
+		ExternalConfigured: true,
+		ExternalSources: func(context.Context, platform.ID) ([]external.SourceHealth, error) {
+			succeeded := startedAt.Add(90 * time.Minute)
+			return []external.SourceHealth{{
+				Name: "atlas-docs", System: "shared-docs", LastSyncStatus: external.SyncSucceeded,
+				LastSucceededAt: &succeeded, DocumentCount: 37,
+			}}, nil
+		},
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := strings.ReplaceAll(body(t, get(t, srv, "/admin/system", true)), "&#43;", "+")
+	for _, want := range []string{"系统状态", "v-test", strings.Repeat("a", 64), "aaaaaaaaaaaa", strings.Repeat("b", 64), "bbbbbbbbbbbb", "development", "迁移 0008", "与当前二进制一致", "连接正常", "TLS 1.2+，验证服务端身份", "HTTPS，验证服务端身份", "使用 18 / 20", "接近上限", "累计等待 7 次 / 1.5s", "累计回收 9", "2 小时 3 分钟", "等待 5s 摘流", "跨实例登录与 MCP 限流已启用，embedding 缓存与索引租约已启用", "IP 与账号组合 10 次/15 分钟", "每 agent 300 次/1 分钟", "每租户合计 3000 次/1 分钟", "token 与新增 agent 都不能绕过对应预算", "本机 127.0.0.1:51892 提供 Prometheus 文本指标", "多实例基础协调已装配", "HTTP 最近窗口", "存在服务端错误", "本实例5 分钟内完成 42", "4xx 3", "5xx 1", "panic 0", "P95上界 250ms", "平均 37ms", "当前在途 2", "bge-m3", "命中 7", "数据关系检查通过", "29 条固定规则", "最近备份按期完成", "claracore-server_claracore_server_20260829T070000Z.sql.gz", "年龄 1 小时 3 分钟 / 上限 26 小时", "完整性已验证；可恢复性尚未证明", "技术恢复演练有效", "claracore-server_claracore_server_20260822T090000Z.sql.gz", "年龄 6 天 2 小时 / 上限 30 天", "25 张表", "10 条迁移（最新 0010）", "技术恢复已验证", "代表性 Memory、Card 与 Shared Line 仍需人工抽查", "外部知识源", "atlas-docs", "shared-docs", "37 份有效镜像", "本地不保存外部正文", "同步正常", "存储与成员配额", "已有精确逻辑容量基线", "不等同于内容存储、成员数或账单配额", "租户容量快照", "3.9 KiB", "8 名成员", "11 个 Agent", "5 个空间", "Memory 34", "Card 21", "共同线 6", "语义索引", "95 行", "活动与审计", "123 行", "不等于 InnoDB 磁盘占用", "不会进入高频 Prometheus 抓取路径"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("系统页缺少 %q", want)
+		}
+	}
+}
+
+func TestAdminSystemPageReportsIntegrityViolationStaleAndInvalid(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		reader ports.IntegrityStatusReader
+		want   []string
+	}{
+		{name: "violations", reader: fakeIntegrityStatusReader{status: ports.IntegrityStatus{SchemaVersion: "0010", CheckedAt: now.Add(-time.Hour), MaxAge: 25 * time.Hour, RulesChecked: 29, Violations: 8, Issues: []ports.IntegrityIssue{{Domain: "knowledge", Rule: "memory_tenant", Violations: 2}, {Domain: "knowledge", Rule: "memory_space", Violations: 2}, {Domain: "knowledge", Rule: "memory_author_user", Violations: 2}, {Domain: "knowledge", Rule: "memory_author_agent", Violations: 2}}}}, want: []string{"发现 8 次关系违规", "4 类", "knowledge.memory_tenant", "同一行可能命中多条规则"}},
+		{name: "stale", reader: fakeIntegrityStatusReader{status: ports.IntegrityStatus{Verified: true, SchemaVersion: "0010", CheckedAt: now.Add(-26 * time.Hour), MaxAge: 25 * time.Hour, RulesChecked: 29}}, want: []string{"完整性检查已过期", "年龄 1 天 2 小时 / 上限 25 小时"}},
+		{name: "invalid", reader: fakeIntegrityStatusReader{err: errors.New("bad receipt")}, want: []string{"无有效回执", "完整性 timer、oneshot"}},
+		{name: "schema mismatch", reader: fakeIntegrityStatusReader{status: ports.IntegrityStatus{Verified: true, SchemaVersion: "0009", CheckedAt: now, MaxAge: 25 * time.Hour, RulesChecked: 27}}, want: []string{"回执版本不匹配", "回执 schema 0009", "当前二进制 schema 0010"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{Now: func() time.Time { return now }, SchemaVersion: "0010", IntegrityStatus: tc.reader}).Handler())
+			t.Cleanup(srv.Close)
+			page := body(t, get(t, srv, "/admin/system", true))
+			for _, want := range tc.want {
+				if !strings.Contains(page, want) {
+					t.Errorf("page missing %q", want)
+				}
+			}
+		})
+	}
+}
+
+func TestAdminSystemPageReportsStaleOrInvalidBackupReceipt(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+	t.Run("stale", func(t *testing.T) {
+		srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{
+			Now: func() time.Time { return now },
+			BackupStatus: fakeBackupStatusReader{status: ports.BackupStatus{
+				Database: "claracore_server", Archive: "claracore-server_claracore_server_20260827T060000Z.sql.gz",
+				CreatedAt: now.Add(-54 * time.Hour), VerifiedAt: now.Add(-54*time.Hour + time.Minute),
+				MaxAge: 26 * time.Hour, IntegrityVerified: true, Recoverability: "not_proven",
+			}},
+		}).Handler())
+		t.Cleanup(srv.Close)
+		page := body(t, get(t, srv, "/admin/system", true))
+		for _, want := range []string{"最新备份已过期", "年龄 2 天 6 小时 / 上限 26 小时", "可恢复性尚未证明"} {
+			if !strings.Contains(page, want) {
+				t.Errorf("过期备份状态缺少 %q", want)
+			}
+		}
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{
+			Now:          func() time.Time { return now },
+			BackupStatus: fakeBackupStatusReader{err: errors.New("malformed receipt")},
+		}).Handler())
+		t.Cleanup(srv.Close)
+		page := body(t, get(t, srv, "/admin/system", true))
+		for _, want := range []string{"无有效回执", "回执缺失、不可读或格式无效", "无法确认最新归档"} {
+			if !strings.Contains(page, want) {
+				t.Errorf("无效备份回执状态缺少 %q", want)
+			}
+		}
+	})
+}
+
+func TestAdminSystemPageReportsStaleOrInvalidRestoreReceipt(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+	t.Run("stale", func(t *testing.T) {
+		srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{
+			Now: func() time.Time { return now },
+			RestoreStatus: fakeRestoreStatusReader{status: ports.RestoreStatus{
+				RestoredAt: now.Add(-31 * 24 * time.Hour), MaxAge: 30 * 24 * time.Hour,
+				TableCount: 25, MigrationCount: 10, LatestMigration: "0010",
+				TechnicalRestoreVerified: true, SemanticInspection: "not_proven",
+			}},
+		}).Handler())
+		t.Cleanup(srv.Close)
+		page := body(t, get(t, srv, "/admin/system", true))
+		for _, want := range []string{"恢复演练已过期", "年龄 31 天 / 上限 30 天", "技术恢复已验证", "仍需人工抽查"} {
+			if !strings.Contains(page, want) {
+				t.Errorf("过期恢复状态缺少 %q", want)
+			}
+		}
+	})
+
+	t.Run("invalid", func(t *testing.T) {
+		srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{
+			Now:           func() time.Time { return now },
+			RestoreStatus: fakeRestoreStatusReader{err: errors.New("malformed receipt")},
+		}).Handler())
+		t.Cleanup(srv.Close)
+		page := body(t, get(t, srv, "/admin/system", true))
+		for _, want := range []string{"无有效回执", "隔离恢复任务、回传路径", "无法确认归档曾完整导入"} {
+			if !strings.Contains(page, want) {
+				t.Errorf("无效恢复回执状态缺少 %q", want)
+			}
+		}
+	})
+}
+
+func TestAdminSystemPageShowsPersistedMirrorWhenConnectorIsDisabled(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	lastSuccess := time.Date(2026, 8, 29, 8, 0, 0, 0, time.UTC)
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{
+		ExternalConfigured: false,
+		ExternalSources: func(context.Context, platform.ID) ([]external.SourceHealth, error) {
+			return []external.SourceHealth{{Name: "atlas-docs", System: "shared-docs", LastSyncStatus: external.SyncSucceeded, LastSucceededAt: &lastSuccess, DocumentCount: 12}}, nil
+		},
+	}).Handler())
+	t.Cleanup(srv.Close)
+	page := body(t, get(t, srv, "/admin/system", true))
+	for _, want := range []string{"仅镜像", "仅镜像（不刷新）", "12 份有效镜像", "连接关闭，检索继续但不会刷新", "atlas-docs"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("镜像降级状态缺少 %q", want)
+		}
+	}
+}
+
+func TestAdminSystemPageReportsSchemaDriftAsUnsafe(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{
+		SchemaVersion:  "0008",
+		DatabaseHealth: func(context.Context) error { return nil },
+		SchemaHealth:   func(context.Context) (string, error) { return "", errors.New("checksum mismatch") },
 	}).Handler())
 	t.Cleanup(srv.Close)
 
 	page := body(t, get(t, srv, "/admin/system", true))
-	for _, want := range []string{"系统状态", "v-test", "development", "连接正常", "尚未装配 Redis", "bge-m3", "命中 7", "租户配额"} {
+	for _, want := range []string{"数据库迁移状态异常", "与当前二进制不一致", "不能安全接收流量"} {
 		if !strings.Contains(page, want) {
-			t.Errorf("系统页缺少 %q", want)
+			t.Errorf("schema 漂移页缺少 %q", want)
 		}
+	}
+}
+
+func TestAdminSystemPageReportsRedisFallback(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	know := &fakeKnow{embedHealth: knowledge.EmbeddingHealth{Enabled: true, Model: "bge-m3"}}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, know, newFakeContinuity(), &fakeActivity{}, logger, Options{
+		RedisConfigured: true, EmbeddingProvider: "ollama",
+		DatabaseHealth:   func(context.Context) error { return nil },
+		RedisHealth:      func(context.Context) error { return errors.New("unreachable") },
+		LoginRateLimiter: &scriptedRateLimiter{},
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/admin/system", true))
+	for _, want := range []string{"Redis 当前不可用", "已配置但当前不可达", "登录与 MCP 限流退回进程内保护", "多实例协调当前降级", "核心读写不受影响"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("Redis 降级状态缺少 %q", want)
+		}
+	}
+}
+
+func TestAdminSystemPageDoesNotOverclaimMultiInstanceWithoutRedis(t *testing.T) {
+	gov := newFakeGov(governance.RoleAdmin, false)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(NewHost(gov, &fakeKnow{}, newFakeContinuity(), &fakeActivity{}, logger, Options{
+		EmbeddingProvider: "disabled",
+		DatabaseHealth:    func(context.Context) error { return nil },
+		LoginRateLimiter:  &scriptedRateLimiter{},
+		LoginRateLimit:    10,
+		LoginRateWindow:   15 * time.Minute,
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	page := body(t, get(t, srv, "/admin/system", true))
+	for _, want := range []string{"登录与 MCP 限流使用进程内计数", "IP 与账号组合 10 次/15 分钟", "单实例完整；多实例需配置 Redis"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("无 Redis 的运行形态缺少 %q", want)
+		}
+	}
+	if strings.Contains(page, "多实例基础协调已装配") {
+		t.Fatal("未配置 Redis 时不得声称多实例协调已装配")
 	}
 }
 
@@ -1056,8 +1721,16 @@ func TestSecurityHeadersArePresent(t *testing.T) {
 	resp := get(t, srv, "/login", false)
 	defer resp.Body.Close()
 	csp := resp.Header.Get("Content-Security-Policy")
-	if !strings.Contains(csp, "default-src 'self'") {
-		t.Fatalf("缺少 CSP，实际 %q", csp)
+	for _, want := range []string{
+		"default-src 'none'", "script-src 'self'", "style-src 'self'",
+		"form-action 'self'", "frame-ancestors 'none'", "base-uri 'none'", "object-src 'none'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Fatalf("CSP 缺少 %q，实际 %q", want, csp)
+		}
+	}
+	if strings.Contains(csp, "default-src 'self'") {
+		t.Fatalf("CSP 不应回退到宽泛同源默认，实际 %q", csp)
 	}
 	// 模板是纯 SSR，没有内联脚本也不打算有——CSP 里出现 unsafe-inline
 	// 说明有人开始往页面里塞 <script> 了
@@ -1066,6 +1739,38 @@ func TestSecurityHeadersArePresent(t *testing.T) {
 	}
 	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatal("缺少 nosniff")
+	}
+	for name, want := range map[string]string{
+		"X-Frame-Options":                   "DENY",
+		"Referrer-Policy":                   "no-referrer",
+		"Cross-Origin-Opener-Policy":        "same-origin",
+		"Cross-Origin-Resource-Policy":      "same-origin",
+		"X-Permitted-Cross-Domain-Policies": "none",
+		"Cache-Control":                     "no-store, private",
+		"Pragma":                            "no-cache",
+		"X-Robots-Tag":                      "noindex, nofollow, noarchive",
+	} {
+		if got := resp.Header.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	permissions := resp.Header.Get("Permissions-Policy")
+	for _, disabled := range []string{"camera=()", "geolocation=()", "microphone=()", "payment=()", "usb=()"} {
+		if !strings.Contains(permissions, disabled) {
+			t.Errorf("Permissions-Policy missing %q: %q", disabled, permissions)
+		}
+	}
+}
+
+func TestStaticAssetsUseOnlyShortPublicCache(t *testing.T) {
+	srv, _ := newTestWeb(t, governance.RoleAdmin, false)
+	resp := get(t, srv, "/static/app.js", false)
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Cache-Control"); got != "public, max-age=300" {
+		t.Fatalf("static cache = %q", got)
+	}
+	if got := resp.Header.Get("X-Robots-Tag"); got != "" {
+		t.Fatalf("static asset unexpectedly has page indexing policy: %q", got)
 	}
 }
 
@@ -1121,6 +1826,21 @@ func (f *fakeKnow) UpdateCard(_ context.Context, in knowledge.UpdateCardInput) (
 	return f.card, nil
 }
 
+func (f *fakeKnow) DeprecateDraftCards(_ context.Context, in knowledge.DeprecateDraftCardsInput) ([]knowledge.Card, error) {
+	f.lastBatch = in
+	f.calls++
+	if f.batchErr != nil {
+		return nil, f.batchErr
+	}
+	out := make([]knowledge.Card, 0, len(in.Cards))
+	for _, item := range in.Cards {
+		card := f.card
+		card.ID, card.Status, card.Version = item.ID, knowledge.CardDeprecated, item.Version+1
+		out = append(out, card)
+	}
+	return out, nil
+}
+
 func (f *fakeKnow) Ingest(_ context.Context, in knowledge.IngestInput) (knowledge.IngestReport, error) {
 	f.lastIngest = in
 	f.calls++
@@ -1170,6 +1890,78 @@ func TestReviewQueueUsesWritableSpaces(t *testing.T) {
 			t.Fatal("团队空间只可读不可写，不该出现在审核队列的空间集合里")
 		}
 	}
+}
+
+func TestReviewQueueOffersOnlyExplicitBatchDeprecation(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+	know.items = []knowledge.ContentItem{{
+		Ref:     knowledge.Ref{Type: knowledge.EntityCard, ID: "01CARDAAAAAAAAAAAAAAAAAAAA"},
+		SpaceID: spPers, Title: "部署回滚检查", Status: knowledge.CardDraft, Version: 7,
+	}}
+	page, errMsg := getBody(t, srv, "/review")
+	if errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	for _, want := range []string{
+		`action="/review/batch-deprecate"`, `name="selection"`, `value="01CARDAAAAAAAAAAAAAAAAAAAA:7"`,
+		`选择“部署回滚检查”标记为不需要`, `data-confirm-message=`, `发布仍需逐张`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("批量审核页缺少 %q", want)
+		}
+	}
+	if strings.Contains(page, "批量发布") {
+		t.Fatal("批量操作不得绕过逐张理解与召回条件审核")
+	}
+}
+
+func TestReviewBatchDeprecateUsesVersionsWritableScopeAndPreservesFilter(t *testing.T) {
+	srv, _, know := newContentWeb(t, governance.RoleMember)
+	resp := post(t, srv, "/review/batch-deprecate", url.Values{
+		"selection": {"01CARDAAAAAAAAAAAAAAAAAAAA:3", "01CARDBBBBBBBBBBBBBBBBBBB:9"},
+		"space":     {string(spPers)},
+	}, true, true)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("成功应回到队列，实际 %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Location"); got != "/review?batch=2&space="+url.QueryEscape(string(spPers)) {
+		t.Fatalf("应保留筛选并显示结果数量，实际 %q", got)
+	}
+	if know.lastBatch.TenantID != tenantA || len(know.lastBatch.Cards) != 2 {
+		t.Fatalf("批量输入没有完整下推: %+v", know.lastBatch)
+	}
+	if know.lastBatch.Cards[0].Version != 3 || know.lastBatch.Cards[1].Version != 9 {
+		t.Fatalf("每张卡的乐观锁版本必须下推: %+v", know.lastBatch.Cards)
+	}
+	for _, id := range know.lastBatch.WritableSpaces {
+		if id == spTeam {
+			t.Fatal("只读团队空间不得进入批量写范围")
+		}
+	}
+}
+
+func TestReviewBatchDeprecateFailsClosed(t *testing.T) {
+	t.Run("empty selection", func(t *testing.T) {
+		srv, _, know := newContentWeb(t, governance.RoleMember)
+		resp := post(t, srv, "/review/batch-deprecate", url.Values{}, true, true)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest || len(know.lastBatch.Cards) != 0 {
+			t.Fatalf("空选择必须在领域调用前拒绝: status=%d batch=%+v", resp.StatusCode, know.lastBatch)
+		}
+	})
+
+	t.Run("stale version", func(t *testing.T) {
+		srv, _, know := newContentWeb(t, governance.RoleMember)
+		know.batchErr = &knowledge.VersionConflictError{Expected: 1, Current: 2}
+		resp := post(t, srv, "/review/batch-deprecate", url.Values{
+			"selection": {"01CARDAAAAAAAAAAAAAAAAAAAA:1"},
+		}, true, true)
+		page := body(t, resp)
+		if resp.StatusCode != http.StatusConflict || !strings.Contains(page, "整批均未处理") {
+			t.Fatalf("并发冲突必须明确整批回滚: status=%d body=%q", resp.StatusCode, page)
+		}
+	})
 }
 
 func TestReviewPublishGoesThroughUpdateCard(t *testing.T) {
@@ -1659,6 +2451,7 @@ func TestAuthenticatedWebWritesAreAuditedWithoutSensitivePayloads(t *testing.T) 
 		{"token issue", "/tokens", "token.issue", url.Values{"agent": {"secret-agent-slug"}, "name": {"Secret Device"}}},
 		{"token revoke", "/tokens/revoke", "token.revoke", url.Values{"id": {"01TOKENAAAAAAAAAAAAAAAAAAA"}}},
 		{"review", "/review/01CARDAAAAAAAAAAAAAAAAAAAA", "card.review", url.Values{"action": {"reject"}, "title": {"secret-card-title"}}},
+		{"batch review", "/review/batch-deprecate", "card.review_batch_deprecate", url.Values{"selection": {"01CARDAAAAAAAAAAAAAAAAAAAA:1"}}},
 		{"shared line status", "/continuity/01LINEAAAAAAAAAAAAAAAAAAAA/status", "shared_line.status", url.Values{"status": {continuity.LineArchived}}},
 		{"member create", "/admin/members", "member.create", url.Values{"username": {"secret-user"}, "display": {"Secret User"}, "role": {"member"}}},
 		{"member status", "/admin/members/status", "member.status", url.Values{"id": {string(userOther)}, "status": {"disabled"}}},

@@ -506,6 +506,15 @@ func (f *fakeStore) CountSpaceContents(_ context.Context, tenantID platform.ID, 
 		if !c.IsQualified() {
 			st.UnqualifiedCards++
 		}
+		if c.Status == CardActive {
+			st.ActiveCards++
+			if !c.IsQualified() {
+				st.ActiveUnqualifiedCards++
+			}
+			if len(f.triggers[c.ID]) > 0 {
+				st.RecallReadyCards++
+			}
+		}
 		st.RecallTriggers += len(f.triggers[c.ID])
 	}
 	out := make([]SpaceStats, 0, len(byID))
@@ -563,7 +572,7 @@ func (f *fakeStore) listMatches(q ListQuery) []ContentItem {
 			}
 			add(ContentItem{
 				Ref: Ref{EntityMemory, m.ID}, SpaceID: m.SpaceID, Title: m.Title,
-				Status: m.Status, AuthorUserID: m.AuthorUserID, AuthorAgentID: m.AuthorAgentID,
+				Status: m.Status, Version: m.Version, AuthorUserID: m.AuthorUserID, AuthorAgentID: m.AuthorAgentID,
 				CopiedFrom: m.CopiedFrom, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 			})
 		}
@@ -577,7 +586,7 @@ func (f *fakeStore) listMatches(q ListQuery) []ContentItem {
 			}
 			add(ContentItem{
 				Ref: Ref{EntityCard, c.ID}, SpaceID: c.SpaceID, Title: c.Title,
-				Status: c.Status, CardType: c.CardType, Qualified: c.IsQualified(),
+				Status: c.Status, Version: c.Version, CardType: c.CardType, Qualified: c.IsQualified(),
 				AuthorUserID: c.AuthorUserID, AuthorAgentID: c.AuthorAgentID,
 				CopiedFrom: c.CopiedFrom, SourcePath: c.Source,
 				CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt,

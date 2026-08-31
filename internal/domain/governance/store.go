@@ -7,6 +7,56 @@ import (
 	"claracore-server/internal/platform"
 )
 
+// AuthToken / AuthUser / AuthAgent / AuthTenant are the exact projections
+// needed to authenticate an MCP request. They deliberately cannot carry token
+// or password hashes: the lookup predicate needs the presented token hash, but
+// no credential material is part of the result.
+type AuthToken struct {
+	ID         platform.ID
+	TenantID   platform.ID
+	UserID     platform.ID
+	AgentID    platform.ID
+	ExpiresAt  *time.Time
+	LastUsedAt *time.Time
+	RevokedAt  *time.Time
+}
+
+func (t AuthToken) Validate(now time.Time) error {
+	if t.RevokedAt != nil {
+		return ErrTokenRevoked
+	}
+	if t.ExpiresAt != nil && !now.Before(*t.ExpiresAt) {
+		return ErrTokenExpired
+	}
+	return nil
+}
+
+type AuthUser struct {
+	ID          platform.ID
+	TenantID    platform.ID
+	Username    string
+	DisplayName string
+	Role        string
+	Status      string
+}
+
+func (u AuthUser) IsActive() bool { return u.Status == StatusActive }
+
+type AuthAgent struct {
+	ID          platform.ID
+	TenantID    platform.ID
+	UserID      platform.ID
+	Slug        string
+	DisplayName string
+}
+
+type AuthTenant struct {
+	ID     platform.ID
+	Status string
+}
+
+func (t AuthTenant) IsActive() bool { return t.Status == StatusActive }
+
 // AuthContext 是一次认证所需的全部数据行。
 //
 // 合成一个方法而非四个 Find，是因为认证在**每一次 MCP 调用**上都会发生：
@@ -17,10 +67,10 @@ import (
 // 全部由领域层的 Service.Authenticate 决定。SQL 里不写 `WHERE revoked_at IS NULL`：
 // 那会让「为什么我的 token 不能用」退化成一句无法区分的「token 不存在」。
 type AuthContext struct {
-	Token  Token
-	User   User
-	Agent  Agent
-	Tenant Tenant
+	Token  AuthToken
+	User   AuthUser
+	Agent  AuthAgent
+	Tenant AuthTenant
 }
 
 // Store 是治理域的持久化出口。
@@ -81,11 +131,27 @@ type Store interface {
 	// mustChange 为真表示这是管理员重置的临时密码，本人登录后必须改掉。
 	UpdateUserPassword(ctx context.Context, tenantID, userID platform.ID, hash string, mustChange bool, at time.Time) error
 
+	// UpgradeUserPasswordHash conditionally replaces only the derived hash.
+	// It keeps must_change_pw and auth_version unchanged because the plaintext
+	// credential did not change. The expected hash + generation CAS prevents a
+	// login verified against stale data from overwriting a concurrent reset.
+	UpgradeUserPasswordHash(ctx context.Context, tenantID, userID platform.ID, expectedHash, newHash string, expectedAuthVersion uint64) (bool, error)
+
 	UpdateUserStatus(ctx context.Context, tenantID, userID platform.ID, status string, at time.Time) error
 
 	// ListTokens 返回该用户的全部 token（含已吊销的，用于审计展示）。
 	// 明文无从取回，返回值中只有 prefix。
 	ListTokens(ctx context.Context, tenantID, userID platform.ID) ([]Token, error)
+
+	// Bounded governance projections. These deliberately exclude password and
+	// token hashes and power every human-facing list.
+	ListUserSummaries(ctx context.Context, query GovernancePageQuery) ([]UserSummary, error)
+	FindUserSummary(ctx context.Context, tenantID, userID platform.ID) (UserSummary, error)
+	ListTokenSummaries(ctx context.Context, query GovernancePageQuery) ([]TokenSummary, error)
+	FindTokenSummary(ctx context.Context, tenantID, userID, tokenID platform.ID) (TokenSummary, error)
+	ListGovernedSpaces(ctx context.Context, query GovernancePageQuery) ([]Space, error)
+	ListSpaceGrantSummaries(ctx context.Context, query GovernancePageQuery) ([]SpaceGrantSummary, error)
+	ListAgentAccessSummaries(ctx context.Context, tenantID, userID platform.ID, limit int) ([]AgentAccessSummary, error)
 
 	// RevokeToken 幂等：已吊销的再次吊销不报错，不覆盖原时间。
 	RevokeToken(ctx context.Context, tenantID, tokenID platform.ID, at time.Time) error

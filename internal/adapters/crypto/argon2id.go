@@ -46,6 +46,15 @@ type Argon2id struct {
 	params Argon2idParams
 }
 
+type encodedHash struct {
+	version     int
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	salt        []byte
+	key         []byte
+}
+
 var _ ports.PasswordHasher = (*Argon2id)(nil)
 
 func NewArgon2id(p Argon2idParams) *Argon2id {
@@ -61,6 +70,13 @@ func NewArgon2id(p Argon2idParams) *Argon2id {
 // 塞进去的假值、或者从别的系统迁移过来的 bcrypt），后者是用户问题。
 // 混在一起会让一次数据迁移事故表现成「所有人突然密码都错了」。
 var ErrMalformedHash = errors.New("crypto: 密码哈希格式无法识别")
+
+const (
+	maxEncodedMemoryKiB  = 1024 * 1024
+	maxEncodedIterations = 20
+	maxEncodedSaltBytes  = 1024
+	maxEncodedKeyBytes   = 1024
+)
 
 // Hash 产出标准的 PHC 字符串：
 //
@@ -89,40 +105,77 @@ func (a *Argon2id) Hash(plaintext string) (string, error) {
 // 远程时序攻击里未必好用，但 subtle.ConstantTimeCompare 是免费的，
 // 而「这里为什么不能用 ==」是个每次 review 都要重新解释的问题。
 func (a *Argon2id) Verify(plaintext, hash string) (bool, error) {
+	encoded, err := parseHash(hash)
+	if err != nil {
+		return false, err
+	}
+
+	// 用**存下来的**参数重算，不是用当前配置——那正是调参之后
+	// 老用户还能登录的原因。
+	got := argon2.IDKey([]byte(plaintext), encoded.salt, encoded.iterations, encoded.memory, encoded.parallelism, uint32(len(encoded.key)))
+	return subtle.ConstantTimeCompare(got, encoded.key) == 1, nil
+}
+
+// NeedsRehash reports whether the stored PHC parameters can be upgraded to
+// the current configuration without weakening any dimension. Exact-current
+// and stronger/incomparable hashes remain untouched; an accidental config
+// rollback must never silently downgrade credentials on login.
+func (a *Argon2id) NeedsRehash(hash string) (bool, error) {
+	encoded, err := parseHash(hash)
+	if err != nil {
+		return false, err
+	}
+	current := a.params
+	componentWiseSafe := encoded.memory <= current.Memory &&
+		encoded.iterations <= current.Iterations &&
+		encoded.parallelism <= current.Parallelism &&
+		uint32(len(encoded.salt)) <= current.SaltLength &&
+		uint32(len(encoded.key)) <= current.KeyLength
+	if !componentWiseSafe {
+		return false, nil
+	}
+	return encoded.memory < current.Memory ||
+		encoded.iterations < current.Iterations ||
+		encoded.parallelism < current.Parallelism ||
+		uint32(len(encoded.salt)) < current.SaltLength ||
+		uint32(len(encoded.key)) < current.KeyLength, nil
+}
+
+func parseHash(hash string) (encodedHash, error) {
 	parts := strings.Split(hash, "$")
 	// 形如 ["", "argon2id", "v=19", "m=...,t=...,p=...", salt, key]
 	if len(parts) != 6 || parts[1] != "argon2id" {
-		return false, fmt.Errorf("%w: %q", ErrMalformedHash, truncate(hash))
+		return encodedHash{}, fmt.Errorf("%w: %q", ErrMalformedHash, truncate(hash))
 	}
 
 	var version int
 	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil {
-		return false, fmt.Errorf("%w: 版本段无法解析", ErrMalformedHash)
+		return encodedHash{}, fmt.Errorf("%w: 版本段无法解析", ErrMalformedHash)
 	}
 	if version != argon2.Version {
 		// 换 argon2 版本是件大事，不能当作「密码错了」悄悄放过
-		return false, fmt.Errorf("%w: argon2 版本 %d 与本实现的 %d 不符", ErrMalformedHash, version, argon2.Version)
+		return encodedHash{}, fmt.Errorf("%w: argon2 版本 %d 与本实现的 %d 不符", ErrMalformedHash, version, argon2.Version)
 	}
 
 	var memory, iterations uint32
 	var parallelism uint8
 	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &iterations, &parallelism); err != nil {
-		return false, fmt.Errorf("%w: 参数段无法解析", ErrMalformedHash)
+		return encodedHash{}, fmt.Errorf("%w: 参数段无法解析", ErrMalformedHash)
 	}
 
 	salt, err := base64.RawStdEncoding.Strict().DecodeString(parts[4])
 	if err != nil {
-		return false, fmt.Errorf("%w: 盐不是合法 base64", ErrMalformedHash)
+		return encodedHash{}, fmt.Errorf("%w: 盐不是合法 base64", ErrMalformedHash)
 	}
 	want, err := base64.RawStdEncoding.Strict().DecodeString(parts[5])
 	if err != nil {
-		return false, fmt.Errorf("%w: 哈希不是合法 base64", ErrMalformedHash)
+		return encodedHash{}, fmt.Errorf("%w: 哈希不是合法 base64", ErrMalformedHash)
 	}
-
-	// 用**存下来的**参数重算，不是用当前配置——那正是调参之后
-	// 老用户还能登录的原因。
-	got := argon2.IDKey([]byte(plaintext), salt, iterations, memory, parallelism, uint32(len(want)))
-	return subtle.ConstantTimeCompare(got, want) == 1, nil
+	if memory == 0 || memory > maxEncodedMemoryKiB || iterations == 0 || iterations > maxEncodedIterations ||
+		parallelism == 0 || len(salt) == 0 || len(salt) > maxEncodedSaltBytes || len(want) == 0 || len(want) > maxEncodedKeyBytes {
+		return encodedHash{}, fmt.Errorf("%w: 参数、盐或哈希超出安全边界", ErrMalformedHash)
+	}
+	return encodedHash{version: version, memory: memory, iterations: iterations, parallelism: parallelism, salt: salt, key: want}, nil
 }
 
 // truncate 让错误信息里不出现完整的哈希串。

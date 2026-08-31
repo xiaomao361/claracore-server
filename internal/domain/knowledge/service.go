@@ -507,6 +507,77 @@ func (s *Service) UpdateCard(ctx context.Context, in UpdateCardInput) (Card, err
 	return next, nil
 }
 
+const MaxBatchReviewCards = 50
+
+type DraftCardVersion struct {
+	ID      platform.ID
+	Version int
+}
+
+type DeprecateDraftCardsInput struct {
+	TenantID       platform.ID
+	WritableSpaces []platform.ID
+	Cards          []DraftCardVersion
+}
+
+// DeprecateDraftCards is the only batch review action. Publishing remains a
+// one-card workflow because understanding and recall triggers require human
+// judgment. The whole selected set is validated and updated atomically.
+func (s *Service) DeprecateDraftCards(ctx context.Context, in DeprecateDraftCardsInput) ([]Card, error) {
+	if err := requireSpaces(in.WritableSpaces); err != nil {
+		return nil, err
+	}
+	if len(in.Cards) == 0 || len(in.Cards) > MaxBatchReviewCards {
+		return nil, fmt.Errorf("%w: 批量审核每次必须选择 1 到 %d 张卡片", ErrInvalidArgument, MaxBatchReviewCards)
+	}
+	seen := make(map[platform.ID]struct{}, len(in.Cards))
+	for _, item := range in.Cards {
+		if item.ID == "" || item.Version <= 0 {
+			return nil, fmt.Errorf("%w: 批量审核缺少卡片 ID 或有效版本", ErrInvalidArgument)
+		}
+		if _, ok := seen[item.ID]; ok {
+			return nil, fmt.Errorf("%w: 批量审核包含重复卡片 %s", ErrInvalidArgument, item.ID)
+		}
+		seen[item.ID] = struct{}{}
+	}
+
+	now := s.clock.Now()
+	updated := make([]Card, 0, len(in.Cards))
+	err := s.store.Atomically(ctx, func(st Store) error {
+		for _, item := range in.Cards {
+			cur, err := st.FindCard(ctx, in.TenantID, item.ID, in.WritableSpaces)
+			if err != nil {
+				return err
+			}
+			if err := checkTenant(in.TenantID, cur.TenantID); err != nil {
+				return err
+			}
+			if cur.Status != CardDraft {
+				return fmt.Errorf("%w: 卡片 %s 已不是待审草稿", ErrInvalidArgument, item.ID)
+			}
+			if cur.Version != item.Version {
+				return &VersionConflictError{Expected: item.Version, Current: cur.Version}
+			}
+			next := *cur
+			next.Status = CardDeprecated
+			next.Version = cur.Version + 1
+			next.UpdatedAt = now
+			if err := next.validate(); err != nil {
+				return err
+			}
+			if err := st.UpdateCard(ctx, next, item.Version); err != nil {
+				return err
+			}
+			updated = append(updated, next)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
 // ---------------------------------------------------------------------------
 // Link
 // ---------------------------------------------------------------------------

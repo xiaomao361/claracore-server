@@ -11,9 +11,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"claracore-server/internal/domain/governance"
 	"claracore-server/internal/platform"
+	"claracore-server/internal/ports"
 )
 
 // fakeGov 是治理域的替身。
@@ -58,7 +60,7 @@ const (
 	agentClara = "01AGENTCLARAAAAAAAAAAAAAAA"
 )
 
-func newTestHost(t *testing.T) (*httptest.Server, *fakeGov) {
+func newTestHost(t *testing.T, options ...HostOptions) (*httptest.Server, *fakeGov) {
 	t.Helper()
 
 	owner := platform.ID(userClar)
@@ -98,9 +100,36 @@ func newTestHost(t *testing.T) (*httptest.Server, *fakeGov) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(NewHost(gov, newFakeKnow(), newFakeContinuity(), newFakeActivity(), logger, HostOptions{Version: "test"}).Handler())
+	opts := HostOptions{Version: "test"}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	srv := httptest.NewServer(NewHost(gov, newFakeKnow(), newFakeContinuity(), newFakeActivity(), logger, opts).Handler())
 	t.Cleanup(srv.Close)
 	return srv, gov
+}
+
+func TestRequestBodyLimitRejectsOversizedJSON(t *testing.T) {
+	srv, gov := newTestHost(t, HostOptions{Version: "test", MaxRequestBodyBytes: 128})
+	payload := `{"jsonrpc":"2.0","id":1,"method":"server_status","padding":"` + strings.Repeat("x", 256) + `"}`
+	req, err := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer ccs_valid_clara")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	if gov.authCalls != 1 {
+		t.Fatalf("auth calls = %d, want 1", gov.authCalls)
+	}
 }
 
 // newToolHost 与 newTestHost 同一套夹具，但把核心域的替身也交出来，
@@ -161,6 +190,7 @@ func newToolHostWithActivityAndContinuity(t *testing.T, activities activityServi
 type rpcResponse struct {
 	status int
 	body   map[string]any
+	header http.Header
 	// raw 是未经解析的响应体。认证失败走 SDK 的 http.Error，返回的是纯文本
 	// 而非 JSON——只比较解析后的 body 会让「响应体是否一致」的断言恒真。
 	raw string
@@ -202,7 +232,7 @@ func call(t *testing.T, srv *httptest.Server, token, method string, params any, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return rpcResponse{status: resp.StatusCode, body: parseBody(t, raw), raw: string(raw)}
+	return rpcResponse{status: resp.StatusCode, body: parseBody(t, raw), raw: string(raw), header: resp.Header.Clone()}
 }
 
 // parseBody 兼容两种响应体：纯 JSON 与 SSE（stateless 下 POST 的响应
@@ -310,6 +340,153 @@ func TestWhoAmIReturnsIdentityAndSpaces(t *testing.T) {
 		t.Errorf("defaultSpaceId 应为个人空间 %s，实际 %q", spPers, out.DefaultSpaceID)
 	}
 }
+
+func TestMCPResponsesAreNeverCacheable(t *testing.T) {
+	srv, _ := newTestHost(t)
+	for _, token := range []string{"ccs_valid_clara", "ccs_invalid"} {
+		resp := call(t, srv, token, "tools/list", nil)
+		for name, want := range map[string]string{
+			"Cache-Control":          "no-store, no-transform",
+			"Pragma":                 "no-cache",
+			"X-Content-Type-Options": "nosniff",
+			"X-Robots-Tag":           "noindex, nofollow, noarchive",
+		} {
+			if got := resp.header.Get(name); got != want {
+				t.Errorf("token=%q %s = %q, want %q", token, name, got, want)
+			}
+		}
+	}
+}
+
+type recordingMCPLimiter struct {
+	results []ports.RateLimitResult
+	keys    []string
+	limits  []int
+	windows []time.Duration
+}
+
+func (l *recordingMCPLimiter) Allow(_ context.Context, key string, limit int, window time.Duration) (ports.RateLimitResult, error) {
+	l.keys = append(l.keys, key)
+	l.limits = append(l.limits, limit)
+	l.windows = append(l.windows, window)
+	if len(l.results) == 0 {
+		return ports.RateLimitResult{Allowed: true}, nil
+	}
+	result := l.results[0]
+	l.results = l.results[1:]
+	return result, nil
+}
+
+func TestMCPRateLimitUsesAuthenticatedAgentWithoutLeakingIdentity(t *testing.T) {
+	limiter := &recordingMCPLimiter{results: []ports.RateLimitResult{
+		{Allowed: true},
+		{Allowed: true},
+		{Allowed: true},
+		{Allowed: true},
+		{Allowed: true},
+		{Allowed: false, RetryAfter: 1500 * time.Millisecond},
+		{Allowed: true},
+	}}
+	srv, gov := newTestHost(t, HostOptions{
+		Version: "test", RequestLimiter: limiter, RequestRateLimit: 42, TenantRequestRateLimit: 420, RequestRateWindow: 2 * time.Minute,
+	})
+	// A second token for the same agent must share the first token's budget.
+	gov.byToken["ccs_same_agent"] = gov.byToken["ccs_valid_clara"]
+
+	if first := call(t, srv, "ccs_valid_clara", "tools/list", nil); first.status != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200", first.status)
+	}
+	blocked := call(t, srv, "ccs_same_agent", "tools/list", nil)
+	if blocked.status != http.StatusTooManyRequests || blocked.header.Get("Retry-After") != "2" {
+		t.Fatalf("blocked response = %d retry=%q, want 429 retry=2", blocked.status, blocked.header.Get("Retry-After"))
+	}
+	if got := blocked.header.Get("Cache-Control"); got != "no-store, no-transform" {
+		t.Fatalf("rate-limit response cache policy = %q", got)
+	}
+	// Authentication failures count only against the bounded source bucket;
+	// random token values never create persistent keys.
+	if invalid := call(t, srv, "ccs_invalid", "tools/list", nil); invalid.status != http.StatusUnauthorized {
+		t.Fatalf("invalid token status = %d, want 401", invalid.status)
+	}
+	if len(limiter.keys) != 7 {
+		t.Fatalf("limiter calls = %d, want source+agent+tenant, source+agent+tenant, source: %v", len(limiter.keys), limiter.keys)
+	}
+	if limiter.keys[0] != limiter.keys[3] || limiter.keys[0] != limiter.keys[6] {
+		t.Fatalf("same network source must share one key: %v", limiter.keys)
+	}
+	if limiter.keys[1] != limiter.keys[4] {
+		t.Fatalf("same agent must share one key: %v", limiter.keys)
+	}
+	if limiter.keys[2] != limiter.keys[5] {
+		t.Fatalf("same tenant must share one aggregate key: %v", limiter.keys)
+	}
+	if limiter.limits[0] != 42*6 || limiter.limits[1] != 42 || limiter.limits[2] != 420 || limiter.windows[0] != 2*time.Minute {
+		t.Fatalf("limiter configuration not preserved: limits=%v windows=%v", limiter.limits, limiter.windows)
+	}
+	for _, secret := range []string{"ccs_valid_clara", "ccs_same_agent", agentClara, userClar, tenantA} {
+		if strings.Contains(strings.Join(limiter.keys, "\n"), secret) {
+			t.Fatalf("persistent limiter key leaks identity %q: %v", secret, limiter.keys)
+		}
+	}
+	if !strings.HasPrefix(limiter.keys[0], "rate:mcp:source:") || !strings.HasPrefix(limiter.keys[1], "rate:mcp:agent:") || !strings.HasPrefix(limiter.keys[2], "rate:mcp:tenant:") {
+		t.Fatalf("limiter keys lack explicit namespaces: %v", limiter.keys)
+	}
+}
+
+func TestMCPTenantRateLimitCannotBeBypassedWithAnotherAgent(t *testing.T) {
+	limiter := &recordingMCPLimiter{results: []ports.RateLimitResult{
+		{Allowed: true}, {Allowed: true}, {Allowed: true},
+		{Allowed: true}, {Allowed: true}, {Allowed: false, RetryAfter: time.Second},
+	}}
+	srv, _ := newTestHost(t, HostOptions{
+		Version: "test", RequestLimiter: limiter, RequestRateLimit: 42, TenantRequestRateLimit: 420, RequestRateWindow: time.Minute,
+	})
+	if first := call(t, srv, "ccs_valid_clara", "tools/list", nil); first.status != http.StatusOK {
+		t.Fatalf("first agent status = %d, want 200", first.status)
+	}
+	blocked := call(t, srv, "ccs_valid_codex", "tools/list", nil)
+	if blocked.status != http.StatusTooManyRequests || blocked.header.Get("Retry-After") != "1" {
+		t.Fatalf("second agent must share tenant budget: status=%d retry=%q", blocked.status, blocked.header.Get("Retry-After"))
+	}
+	if limiter.keys[1] == limiter.keys[4] || limiter.keys[2] != limiter.keys[5] {
+		t.Fatalf("different agents must have distinct agent keys and one tenant key: %v", limiter.keys)
+	}
+}
+
+func TestMCPAgentDenialStopsBeforeConsumingTenantBudget(t *testing.T) {
+	limiter := &recordingMCPLimiter{results: []ports.RateLimitResult{
+		{Allowed: true},
+		{Allowed: false, RetryAfter: time.Second},
+	}}
+	srv, _ := newTestHost(t, HostOptions{
+		Version: "test", RequestLimiter: limiter, RequestRateLimit: 42, TenantRequestRateLimit: 420, RequestRateWindow: time.Minute,
+	})
+	blocked := call(t, srv, "ccs_valid_clara", "tools/list", nil)
+	if blocked.status != http.StatusTooManyRequests {
+		t.Fatalf("agent denial status = %d, want 429", blocked.status)
+	}
+	if len(limiter.keys) != 2 || !strings.HasPrefix(limiter.keys[1], "rate:mcp:agent:") {
+		t.Fatalf("tenant budget must not be consumed after agent denial: %v", limiter.keys)
+	}
+}
+
+func TestMCPSourceLimitDoesNotTrustForwardedIPFromDirectPeer(t *testing.T) {
+	trusted := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	trusted.RemoteAddr = "127.0.0.1:12345"
+	trusted.Header.Set("X-Real-IP", "203.0.113.10")
+	if got := mcpClientIP(trusted); got != "203.0.113.10" {
+		t.Fatalf("loopback proxy source = %q", got)
+	}
+
+	direct := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	direct.RemoteAddr = "198.51.100.8:54321"
+	direct.Header.Set("X-Real-IP", "203.0.113.10")
+	if got := mcpClientIP(direct); got != "198.51.100.8" {
+		t.Fatalf("direct peer must ignore forwarded header, got %q", got)
+	}
+}
+
+var _ ports.RateLimiter = (*recordingMCPLimiter)(nil)
 
 // TestIdentityComesOnlyFromToken 是铁律 4 的可执行形式。
 func TestIdentityComesOnlyFromToken(t *testing.T) {

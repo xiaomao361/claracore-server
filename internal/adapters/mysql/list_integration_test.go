@@ -200,4 +200,7 @@ func TestListCardsCarryQualifiedAndSource(t *testing.T) {
 	if !byID[summary.ID].IsIngested() {
 		t.Fatal("摄取产物应能被标注出来")
 	}
+	if byID[qualified.ID].Version != qualified.Version || byID[summary.ID].Version != summary.Version {
+		t.Fatalf("审核列表必须带乐观锁版本: qualified=%d summary=%d", byID[qualified.ID].Version, byID[summary.ID].Version)
+	}
 }

@@ -24,6 +24,8 @@ type fakeStore struct {
 	deleteCount   int
 	feedbackQuery ContextFeedbackQuery
 	feedback      ContextFeedbackQuality
+	sharedQuery   SharedActivityQuery
+	sharedPulse   SharedActivityPulse
 
 	err error
 }
@@ -66,6 +68,14 @@ func (f *fakeStore) CountContextFeedback(_ context.Context, query ContextFeedbac
 	}
 	f.feedbackQuery = query
 	return f.feedback, nil
+}
+
+func (f *fakeStore) CountSharedActivity(_ context.Context, query SharedActivityQuery) (SharedActivityPulse, error) {
+	if f.err != nil {
+		return SharedActivityPulse{}, f.err
+	}
+	f.sharedQuery = query
+	return f.sharedPulse, nil
 }
 
 func newTestService(store Store) (*Service, time.Time) {
@@ -165,7 +175,7 @@ func TestRecordRejectsInvalidInputs(t *testing.T) {
 		{"缺租户", func(in *RecordInput) { in.TenantID = "" }},
 		{"缺用户", func(in *RecordInput) { in.UserID = "" }},
 		{"空 agent ID", func(in *RecordInput) { empty := platform.ID(""); in.AgentID = &empty }},
-		{"未知来源", func(in *RecordInput) { in.Source = "cli" }},
+		{"未知来源", func(in *RecordInput) { in.Source = "terminal" }},
 		{"未知类型", func(in *RecordInput) { in.Kind = "debug" }},
 		{"未知访问类型", func(in *RecordInput) { in.Access = "execute" }},
 		{"未知结果", func(in *RecordInput) { in.Outcome = "maybe" }},
@@ -203,7 +213,10 @@ func TestRecordPropagatesStoreError(t *testing.T) {
 }
 
 func TestContextFeedbackQualityBuildsTenantScopedUTCQuery(t *testing.T) {
-	store := &fakeStore{feedback: ContextFeedbackQuality{Used: 3, Wrong: 1}}
+	store := &fakeStore{feedback: ContextFeedbackQuality{
+		Used: 3, Wrong: 1,
+		Abstained: 4, AbstainReasons: ContextAbstainReasons{NoRelevantEvidence: 2, Ambiguous: 1, Other: 1},
+	}}
 	svc, _ := newTestService(store)
 
 	quality, err := svc.ContextFeedbackQuality(context.Background(), "tenant-1", 30*24*time.Hour)
@@ -212,6 +225,9 @@ func TestContextFeedbackQualityBuildsTenantScopedUTCQuery(t *testing.T) {
 	}
 	if quality.Total() != 4 {
 		t.Fatalf("total = %d, want 4", quality.Total())
+	}
+	if quality.AbstainReasons.Total() != quality.Abstained {
+		t.Fatalf("abstain reason histogram must reconcile: %+v", quality)
 	}
 	wantSince := time.Date(2026, 7, 12, 1, 30, 0, 123456789, time.UTC)
 	if store.feedbackQuery.TenantID != "tenant-1" || !store.feedbackQuery.Since.Equal(wantSince) || store.feedbackQuery.Since.Location() != time.UTC {
@@ -222,6 +238,77 @@ func TestContextFeedbackQualityBuildsTenantScopedUTCQuery(t *testing.T) {
 	}
 	if _, err := svc.ContextFeedbackQuality(context.Background(), "tenant-1", 0); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("missing window should fail: %v", err)
+	}
+}
+
+func TestSharedActivityPulseBuildsPrivacyScopedCompleteUTCDays(t *testing.T) {
+	store := &fakeStore{sharedPulse: SharedActivityPulse{
+		Writes: 6, ActiveUsers: 2, ActiveAgents: 1,
+		DailyWrites: []DailySharedWrites{
+			{Date: time.Date(2026, 8, 6, 0, 0, 0, 0, time.FixedZone("west", -7*60*60)), Writes: 2},
+			{Date: time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC), Writes: 4},
+		},
+	}}
+	svc, _ := newTestService(store)
+
+	pulse, err := svc.SharedActivityPulse(context.Background(), "tenant-1", []platform.ID{"team", "project", "team"}, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSince := time.Date(2026, 8, 5, 0, 0, 0, 0, time.UTC)
+	if store.sharedQuery.TenantID != "tenant-1" || !store.sharedQuery.Since.Equal(wantSince) {
+		t.Fatalf("query should be tenant-scoped to seven UTC calendar days: %+v", store.sharedQuery)
+	}
+	if got := store.sharedQuery.ReadableSharedSpaceIDs; len(got) != 2 || got[0] != "team" || got[1] != "project" {
+		t.Fatalf("readable shared spaces should be stably deduplicated: %v", got)
+	}
+	if len(pulse.DailyWrites) != 7 || pulse.DailyWrites[0].Date != wantSince || pulse.DailyWrites[0].Writes != 0 || pulse.DailyWrites[6].Writes != 4 {
+		t.Fatalf("pulse should fill every UTC day without inventing writes: %+v", pulse.DailyWrites)
+	}
+	// The west-zone midnight belongs to 2026-08-06 UTC after normalization.
+	if pulse.DailyWrites[1].Writes != 2 {
+		t.Fatalf("store dates must be normalized to UTC: %+v", pulse.DailyWrites)
+	}
+	if pulse.Writes != 6 || pulse.ActiveUsers != 2 || pulse.ActiveAgents != 1 {
+		t.Fatalf("aggregate counts should survive day completion: %+v", pulse)
+	}
+}
+
+func TestSharedActivityPulseWithNoSharedSpacesDoesNotQueryStore(t *testing.T) {
+	store := &fakeStore{}
+	svc, _ := newTestService(store)
+	pulse, err := svc.SharedActivityPulse(context.Background(), "tenant-1", nil, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.sharedQuery.TenantID != "" || len(pulse.DailyWrites) != 7 || pulse.Writes != 0 {
+		t.Fatalf("empty shared scope should return an explicit zero series without querying storage: query=%+v pulse=%+v", store.sharedQuery, pulse)
+	}
+	for _, daily := range pulse.DailyWrites {
+		if daily.Writes != 0 {
+			t.Fatalf("empty shared scope invented activity: %+v", pulse.DailyWrites)
+		}
+	}
+}
+
+func TestSharedActivityPulseRejectsInvalidScopeAndWindow(t *testing.T) {
+	svc, _ := newTestService(&fakeStore{})
+	for _, tc := range []struct {
+		name   string
+		tenant platform.ID
+		spaces []platform.ID
+		days   int
+	}{
+		{"missing tenant", "", []platform.ID{"team"}, 7},
+		{"zero days", "tenant", []platform.ID{"team"}, 0},
+		{"unbounded days", "tenant", []platform.ID{"team"}, maxPulseDays + 1},
+		{"empty space id", "tenant", []platform.ID{""}, 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := svc.SharedActivityPulse(context.Background(), tc.tenant, tc.spaces, tc.days); !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("expected ErrInvalidArgument, got %v", err)
+			}
+		})
 	}
 }
 

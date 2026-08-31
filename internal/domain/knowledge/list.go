@@ -74,6 +74,7 @@ type ContentItem struct {
 	SpaceID platform.ID
 	Title   string
 	Status  string
+	Version int
 
 	// CardType 与 Qualified 只有卡片有。Qualified 由服务端算好——
 	// 「理解栏是否为空」那条质量分界线只该有一处定义。

@@ -126,6 +126,10 @@ func (s *traceCleanupStore) CountContextFeedback(context.Context, activity.Conte
 	panic("unexpected CountContextFeedback call")
 }
 
+func (s *traceCleanupStore) CountSharedActivity(context.Context, activity.SharedActivityQuery) (activity.SharedActivityPulse, error) {
+	panic("unexpected CountSharedActivity call")
+}
+
 func (s *traceCleanupStore) DeleteTracesBefore(_ context.Context, before time.Time, limit int) (int, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, traceDeleteCall{before: before, limit: limit})

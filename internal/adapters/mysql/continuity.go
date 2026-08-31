@@ -68,6 +68,28 @@ func (s *ContinuityStore) ListLines(ctx context.Context, q continuity.ListQuery)
 	return out, nil
 }
 
+func (s *ContinuityStore) CountLineStats(ctx context.Context, tenantID platform.ID) (continuity.LineStats, error) {
+	var stats continuity.LineStats
+	err := s.ex.QueryRowContext(ctx,
+		`SELECT
+		   COALESCE(SUM(l.status = ?), 0),
+		   COALESCE(SUM(l.status = ?), 0),
+		   COALESCE(SUM(l.status = ? AND p.interpretation_status = ?), 0),
+		   COALESCE(SUM(l.status = ? AND p.interpretation_status = ?), 0)
+		 FROM continuity_lines l
+		 LEFT JOIN continuity_positions p ON p.tenant_id = l.tenant_id AND p.line_id = l.id
+		 WHERE l.tenant_id = ?`,
+		continuity.LineActive, continuity.LineArchived,
+		continuity.LineActive, continuity.PositionNeedsReview,
+		continuity.LineActive, continuity.PositionStale,
+		string(tenantID),
+	).Scan(&stats.Active, &stats.Archived, &stats.NeedsReview, &stats.Stale)
+	if err != nil {
+		return continuity.LineStats{}, fmt.Errorf("mysql: 统计 Shared Line: %w", err)
+	}
+	return stats, nil
+}
+
 func (s *ContinuityStore) FindLine(ctx context.Context, tenantID, lineID platform.ID, activeOnly bool) (*continuity.Line, error) {
 	status := ""
 	args := []any{string(tenantID), string(lineID)}

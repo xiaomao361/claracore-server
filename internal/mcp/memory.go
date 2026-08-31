@@ -2,9 +2,12 @@ package mcp
 
 import (
 	"context"
+	"slices"
+	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"claracore-server/internal/domain/external"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
 )
@@ -182,17 +185,54 @@ type memoryHitOut struct {
 
 type memoriaSearchOut struct {
 	Hits []memoryHitOut `json:"hits"`
+	// Matches is the forward-compatible unified view. Semantic matches from
+	// Memory, Card, and body-free external mirrors share one score space. Text
+	// fallbacks remain explicitly grouped because MySQL scores from separate
+	// indexes are not comparable.
+	Matches []knowledgeMatchOut `json:"matches"`
 
 	// SemanticAvailable = false 表示这次没用上向量（没配 embedding 服务，
 	// 或者算查询向量时外部服务失败）。**必须看这个字段**：
 	// 「没搜到」和「语义那一半根本没跑」是完全不同的两件事。
-	SemanticAvailable bool `json:"semanticAvailable"`
+	SemanticAvailable     bool `json:"semanticAvailable"`
+	CardSemanticAvailable bool `json:"cardSemanticAvailable"`
 
 	// CardMatches 是「另有 N 条卡片命中，用 card_search 查看」。
 	// -1 表示这次没统计（memory 命中已经够多了）。
 	// 它解决的是真实风险：agent 搜一次 memory 没找到就以为没有，
 	// 而知识卡片才是这个产品的核心载体。
-	CardMatches int `json:"cardMatches"`
+	CardMatches               int    `json:"cardMatches"`
+	ExternalStatus            string `json:"externalStatus"`
+	ExternalSemanticAvailable bool   `json:"externalSemanticAvailable"`
+}
+
+type externalHitOut struct {
+	ID                string   `json:"id"`
+	Space             spaceRef `json:"space"`
+	Title             string   `json:"title"`
+	Kind              string   `json:"kind"`
+	SourceName        string   `json:"sourceName"`
+	SourceSystem      string   `json:"sourceSystem"`
+	SourceRef         string   `json:"sourceRef"`
+	Revision          string   `json:"revision"`
+	UpstreamUpdatedAt string   `json:"upstreamUpdatedAt,omitempty"`
+	IndexedAt         string   `json:"indexedAt"`
+	LastSucceededAt   string   `json:"lastSucceededAt,omitempty"`
+	LastSyncStatus    string   `json:"lastSyncStatus"`
+	Freshness         string   `json:"freshness"`
+}
+
+type knowledgeMatchOut struct {
+	Type     string          `json:"type"`
+	Group    string          `json:"group"`
+	Score    float64         `json:"score"`
+	Semantic bool            `json:"semantic"`
+	Memory   *memoryOut      `json:"memory,omitempty"`
+	Card     *cardOut        `json:"card,omitempty"`
+	External *externalHitOut `json:"external,omitempty"`
+	spaceID  platform.ID
+	recency  time.Time
+	id       platform.ID
 }
 
 func (h *Host) handleMemoriaSearch(ctx context.Context, _ *sdk.CallToolRequest, in memoriaSearchInput) (*sdk.CallToolResult, memoriaSearchOut, error) {
@@ -216,6 +256,41 @@ func (h *Host) handleMemoriaSearch(ctx context.Context, _ *sdk.CallToolRequest, 
 	if err != nil {
 		return nil, memoriaSearchOut{}, toolError(h.logger, "memoria_search", err)
 	}
+	cardRes := knowledge.CardSearchResult{}
+	if in.TimeView != "historical" {
+		cardRes, err = h.know.SearchCards(ctx, knowledge.SearchCardsInput{
+			TenantID: r.identity.TenantID, Spaces: spaces, Query: in.Query, Labels: in.Labels, Limit: in.Limit,
+		})
+		if err != nil {
+			return nil, memoriaSearchOut{}, toolError(h.logger, "memoria_search", err)
+		}
+	}
+	externalStatus := "unconfigured"
+	externalRes := external.SearchResult{}
+	if h.external != nil {
+		externalStatus = "mirror_only"
+		if h.externalConfigured {
+			externalStatus = "available"
+		}
+		if in.TimeView == "historical" {
+			externalStatus = "excluded_by_historical_view"
+		} else if len(in.Labels) > 0 {
+			externalStatus = "excluded_by_label_filter"
+		} else {
+			ids := make([]platform.ID, 0, len(spaces))
+			for _, sp := range spaces {
+				ids = append(ids, sp.ID)
+			}
+			externalRes, err = h.external.Search(ctx, external.SearchInput{
+				TenantID: r.identity.TenantID, SpaceIDs: ids, Query: in.Query, Limit: in.Limit,
+			})
+			if err != nil {
+				h.logger.Error("外部知识检索降级", "error", err)
+				externalStatus = "degraded"
+				externalRes = external.SearchResult{}
+			}
+		}
+	}
 
 	hits := make([]memoryHitOut, 0, len(res.Hits))
 	for _, hit := range res.Hits {
@@ -225,11 +300,115 @@ func (h *Host) handleMemoriaSearch(ctx context.Context, _ *sdk.CallToolRequest, 
 			Semantic:  hit.Semantic,
 		})
 	}
+	matches := r.encodeKnowledgeMatches(res.Hits, cardRes.Hits, externalRes.Hits, spaces, in.Limit)
 	return nil, memoriaSearchOut{
-		Hits:              hits,
-		SemanticAvailable: res.SemanticAvailable,
-		CardMatches:       res.CardMatches,
+		Hits:                      hits,
+		Matches:                   matches,
+		SemanticAvailable:         res.SemanticAvailable,
+		CardSemanticAvailable:     cardRes.SemanticAvailable,
+		CardMatches:               res.CardMatches,
+		ExternalStatus:            externalStatus,
+		ExternalSemanticAvailable: externalRes.SemanticAvailable,
 	}, nil
+}
+
+func (r request) encodeKnowledgeMatches(memories []knowledge.MemoryHit, cards []knowledge.CardHit, externals []external.SearchHit, spaces []knowledge.SearchSpace, requestedLimit int) []knowledgeMatchOut {
+	limit := requestedLimit
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	ranks := make(map[platform.ID]int, len(spaces))
+	var semantic, memoryText, cardText []knowledgeMatchOut
+	for _, sp := range spaces {
+		ranks[sp.ID] = sp.Rank
+	}
+	for _, hit := range memories {
+		encoded := r.encodeMemory(hit.Memory, nil)
+		item := knowledgeMatchOut{Type: "memory", Score: hit.Score, Semantic: hit.Semantic, Memory: &encoded, spaceID: hit.Memory.SpaceID, recency: hit.Memory.UpdatedAt, id: hit.Memory.ID}
+		if hit.Semantic {
+			item.Group = "semantic"
+			semantic = append(semantic, item)
+		} else {
+			item.Group = "memory_text"
+			memoryText = append(memoryText, item)
+		}
+	}
+	for _, hit := range cards {
+		encoded := r.encodeCard(hit.Card, nil)
+		item := knowledgeMatchOut{Type: "card", Score: hit.Score, Semantic: hit.Semantic, Card: &encoded, spaceID: hit.Card.SpaceID, recency: hit.Card.UpdatedAt, id: hit.Card.ID}
+		if hit.Semantic {
+			item.Group = "semantic"
+			semantic = append(semantic, item)
+		} else {
+			item.Group = "card_text"
+			cardText = append(cardText, item)
+		}
+	}
+	for _, hit := range externals {
+		encoded := r.encodeExternalHit(hit)
+		semantic = append(semantic, knowledgeMatchOut{Type: "external", Group: "semantic", Score: hit.Score, Semantic: true, External: &encoded, spaceID: hit.Document.SpaceID, recency: hit.Document.UpdatedAt, id: hit.Document.ID})
+	}
+	slices.SortFunc(semantic, func(a, b knowledgeMatchOut) int {
+		if c := knowledge.CompareSemanticScore(a.Score, b.Score); c != 0 {
+			return c
+		}
+		if ranks[a.spaceID] != ranks[b.spaceID] {
+			if ranks[a.spaceID] > ranks[b.spaceID] {
+				return -1
+			}
+			return 1
+		}
+		if !a.recency.Equal(b.recency) {
+			if a.recency.After(b.recency) {
+				return -1
+			}
+			return 1
+		}
+		if a.Type != b.Type {
+			return stringCompare(a.Type, b.Type)
+		}
+		return stringCompare(string(a.id), string(b.id))
+	})
+	out := append(semantic, memoryText...)
+	out = append(out, cardText...)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func stringCompare(a, b string) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
+}
+
+func (r request) encodeExternalHit(hit external.SearchHit) externalHitOut {
+	freshness := "last_sync_succeeded"
+	if hit.LastSyncStatus == external.SyncRunning {
+		freshness = "refresh_running_from_last_success"
+	}
+	if hit.LastSyncStatus == external.SyncFailed {
+		freshness = "last_success_preserved_after_failure"
+	}
+	out := externalHitOut{
+		ID: string(hit.Document.ID), Space: r.spaceRefOf(hit.Document.SpaceID), Title: hit.Document.Title,
+		Kind: hit.Document.Kind, SourceName: hit.SourceName, SourceSystem: hit.SourceSystem,
+		SourceRef: hit.Document.SourceRef, Revision: hit.Document.Revision,
+		UpstreamUpdatedAt: hit.Document.UpstreamUpdatedAt, IndexedAt: stamp(hit.Document.UpdatedAt),
+		LastSyncStatus: hit.LastSyncStatus, Freshness: freshness,
+	}
+	if hit.LastSucceededAt != nil {
+		out.LastSucceededAt = stamp(*hit.LastSucceededAt)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

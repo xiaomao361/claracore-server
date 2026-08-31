@@ -297,6 +297,13 @@ type AutomaticRecallResult struct {
 	PolicyAvailable   bool
 }
 
+type AutomaticMemoryRecallResult struct {
+	Hit               *MemoryHit
+	Reason            string
+	SemanticAvailable bool
+	PolicyAvailable   bool
+}
+
 type AutomaticRecallPolicy struct {
 	MinScore  float64
 	MinMargin float64
@@ -322,6 +329,38 @@ func (s *Service) RecallCardForContext(ctx context.Context, in RecallCardsInput)
 		return AutomaticRecallResult{}, err
 	}
 	out := AutomaticRecallResult{SemanticAvailable: res.SemanticAvailable, PolicyAvailable: res.SemanticAvailable}
+	if !res.SemanticAvailable {
+		out.Reason = "semantic_unavailable"
+		return out, nil
+	}
+	if len(res.Hits) == 0 {
+		out.Reason = "no_candidates"
+		return out, nil
+	}
+	top := res.Hits[0]
+	if !top.Semantic || top.Score < s.autoRecallPolicy.MinScore {
+		out.Reason = "low_relevance"
+		return out, nil
+	}
+	if len(res.Hits) > 1 && res.Hits[1].Semantic && top.Score-res.Hits[1].Score < s.autoRecallPolicy.MinMargin {
+		out.Reason = "ambiguous_top_results"
+		return out, nil
+	}
+	out.Hit, out.Reason = &top, "high_confidence_top1"
+	return out, nil
+}
+
+// RecallMemoryForContext applies the same conservative Stage B gates to
+// current Memory. Memory and Card keep separate top-2 ambiguity checks; the
+// application layer may then fail closed when both domains produce a winner.
+func (s *Service) RecallMemoryForContext(ctx context.Context, in SearchMemoriesInput) (AutomaticMemoryRecallResult, error) {
+	in.Limit = 3
+	in.TimeView = "current"
+	res, err := s.SearchMemories(ctx, in)
+	if err != nil {
+		return AutomaticMemoryRecallResult{}, err
+	}
+	out := AutomaticMemoryRecallResult{SemanticAvailable: res.SemanticAvailable, PolicyAvailable: res.SemanticAvailable}
 	if !res.SemanticAvailable {
 		out.Reason = "semantic_unavailable"
 		return out, nil
@@ -604,6 +643,11 @@ func rank[T any](cands []scored[T], spaces []SearchSpace, limit int) []scored[T]
 
 func bucket(score float64) float64 { return math.Round(score / scoreTieEpsilon) }
 
+// CompareSemanticScore exposes the one score-closeness rule to the application
+// layer that fuses Memory/Card with other domains. Returning this comparator is
+// safer than copying scoreTieEpsilon into MCP and letting the two rankings drift.
+func CompareSemanticScore(a, b float64) int { return compareDesc(bucket(a), bucket(b)) }
+
 func compareDesc(a, b float64) int {
 	switch {
 	case a > b:
@@ -675,9 +719,12 @@ type SpaceStats struct {
 	Cards    int
 	// DraftCards 是摄取产生、还没人过目的卡。它们不进默认检索，
 	// 所以这个数字直接等于「积压了多少待审内容」。
-	DraftCards       int
-	UnqualifiedCards int
-	RecallTriggers   int
+	DraftCards             int
+	UnqualifiedCards       int
+	RecallTriggers         int
+	ActiveCards            int
+	ActiveUnqualifiedCards int
+	RecallReadyCards       int
 }
 
 // SpaceStats 统计给定空间集合里的内容量。

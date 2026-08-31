@@ -18,6 +18,10 @@ const (
 const (
 	RoleAdmin  = "admin"
 	RoleMember = "member"
+
+	// InitialAuthVersion is the first Web credential generation. Zero remains
+	// reserved for incomplete fixtures and is normalized by the SQL adapter.
+	InitialAuthVersion uint64 = 1
 )
 
 type Tenant struct {
@@ -34,6 +38,10 @@ type User struct {
 	TenantID     platform.ID
 	Username     string
 	PasswordHash string
+	// AuthVersion advances whenever credentials or an account-disable event
+	// must invalidate every Web session. A session stores the version observed
+	// at issue time, closing the reset-vs-login race that DELETE alone cannot.
+	AuthVersion  uint64
 	DisplayName  string
 	Role         string
 	MustChangePw bool

@@ -70,6 +70,61 @@ func (f kfixture) card(ids *platform.IDGenerator, space platform.ID, now time.Ti
 	}
 }
 
+func TestDeprecateDraftCardsIsAtomicOnMySQL(t *testing.T) {
+	db := openTestDB(t)
+	store := mysql.NewKnowledgeStore(db)
+	ctx := context.Background()
+	ids := platform.NewIDGenerator(platform.SystemClock{})
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	f := newKFixture(ids)
+	cleanupTenant(t, db, f.tenant, f.foreign)
+
+	draft := f.card(ids, f.spaceMine, now)
+	draft.Title, draft.Status = "待审一", knowledge.CardDraft
+	active := f.card(ids, f.spaceMine, now)
+	active.Title = "已发布"
+	secondDraft := f.card(ids, f.spaceMine, now)
+	secondDraft.Title, secondDraft.Status = "待审二", knowledge.CardDraft
+	for _, card := range []knowledge.Card{draft, active, secondDraft} {
+		if err := store.CreateCard(ctx, card); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := knowledge.NewService(store, &platform.FixedClock{T: now.Add(time.Minute)}, ids, nil)
+
+	_, err := svc.DeprecateDraftCards(ctx, knowledge.DeprecateDraftCardsInput{
+		TenantID: f.tenant, WritableSpaces: f.visible(),
+		Cards: []knowledge.DraftCardVersion{{ID: draft.ID, Version: 1}, {ID: active.ID, Version: 1}},
+	})
+	if !errors.Is(err, knowledge.ErrInvalidArgument) {
+		t.Fatalf("混入非草稿应拒绝整批: %v", err)
+	}
+	rolledBack, err := store.FindCard(ctx, f.tenant, draft.ID, f.visible())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolledBack.Status != knowledge.CardDraft || rolledBack.Version != 1 {
+		t.Fatalf("真实事务未回滚第一张: %+v", rolledBack)
+	}
+
+	updated, err := svc.DeprecateDraftCards(ctx, knowledge.DeprecateDraftCardsInput{
+		TenantID: f.tenant, WritableSpaces: f.visible(),
+		Cards: []knowledge.DraftCardVersion{{ID: draft.ID, Version: 1}, {ID: secondDraft.ID, Version: 1}},
+	})
+	if err != nil || len(updated) != 2 {
+		t.Fatalf("两张草稿应原子更新: updated=%+v err=%v", updated, err)
+	}
+	for _, id := range []platform.ID{draft.ID, secondDraft.ID} {
+		got, err := store.FindCard(ctx, f.tenant, id, f.visible())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != knowledge.CardDeprecated || got.Version != 2 || !got.UpdatedAt.Equal(now.Add(time.Minute)) {
+			t.Fatalf("真实写回不完整: %+v", got)
+		}
+	}
+}
+
 func TestKnowledgeStoreContract(t *testing.T) {
 	db := openTestDB(t)
 	store := mysql.NewKnowledgeStore(db)
@@ -433,6 +488,38 @@ func TestKnowledgeStoreContract(t *testing.T) {
 			}
 			if _, err := st.FindMemory(ctx, f.tenant, m.ID, f.visible()); err != nil {
 				t.Fatalf("嵌套事务写入的记忆应当可见: %v", err)
+			}
+		})
+
+		t.Run("看板卡片质量统计只按已发布状态计算", func(t *testing.T) {
+			statsFixture := newKFixture(ids)
+			create := func(status, understanding string, withTrigger bool) {
+				card := statsFixture.card(ids, statsFixture.spaceMine, now)
+				card.Status, card.Understanding = status, understanding
+				if err := st.CreateCard(ctx, card); err != nil {
+					t.Fatal(err)
+				}
+				if withTrigger {
+					if err := st.ReplaceRecallTriggers(ctx, statsFixture.tenant, card.ID, []knowledge.RecallTrigger{{
+						ID: ids.New(), TenantID: statsFixture.tenant, CardID: card.ID, SpaceID: card.SpaceID,
+						Text: "需要这张卡时", CreatedAt: now,
+					}}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			create(knowledge.CardActive, "完整理解", true)
+			create(knowledge.CardActive, "", false)
+			create(knowledge.CardDraft, "", true)
+			create(knowledge.CardDeprecated, "完整理解", true)
+
+			stats, err := st.CountSpaceContents(ctx, statsFixture.tenant, []platform.ID{statsFixture.spaceMine})
+			if err != nil || len(stats) != 1 {
+				t.Fatalf("统计失败: stats=%+v err=%v", stats, err)
+			}
+			got := stats[0]
+			if got.Cards != 4 || got.DraftCards != 1 || got.ActiveCards != 2 || got.ActiveUnqualifiedCards != 1 || got.RecallReadyCards != 1 || got.RecallTriggers != 3 {
+				t.Fatalf("看板卡片质量口径不符: %+v", got)
 			}
 		})
 

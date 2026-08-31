@@ -178,19 +178,13 @@ func TestGovernanceStoreContract(t *testing.T) {
 				auth.Agent.ID != f.agent.ID || auth.Tenant.ID != f.tenant.ID {
 				t.Fatalf("取回的四个实体对不上: %+v", auth)
 			}
-			if auth.Token.Name != "MacBook" || auth.Token.Prefix != "ccs_abc" {
-				t.Errorf("token 标量字段未正确回读: %+v", auth.Token)
-			}
 			if auth.Token.ExpiresAt == nil || !auth.Token.ExpiresAt.Equal(*f.token.ExpiresAt) {
 				t.Errorf("expires_at 回读不一致: %v，期望 %v", auth.Token.ExpiresAt, f.token.ExpiresAt)
 			}
 			if auth.Token.LastUsedAt != nil || auth.Token.RevokedAt != nil {
 				t.Errorf("未使用未吊销的 token 不该有时间戳: %+v", auth.Token)
 			}
-			if !auth.Token.CreatedAt.Equal(now) || auth.Token.CreatedAt.Location() != time.UTC {
-				t.Errorf("created_at 应当是 UTC 且与写入一致: %v", auth.Token.CreatedAt)
-			}
-			if !auth.User.MustChangePw || auth.User.Role != governance.RoleMember {
+			if auth.User.Username != f.user.Username || auth.User.DisplayName != f.user.DisplayName || auth.User.Role != governance.RoleMember || auth.User.Status != governance.StatusActive {
 				t.Errorf("用户标量字段回读错误: %+v", auth.User)
 			}
 		})
@@ -498,6 +492,74 @@ func TestGovernanceStoreContract(t *testing.T) {
 			}
 			if auth.Agent.Slug != "codex" {
 				t.Errorf("回读的 agent 不对: %+v", auth.Agent)
+			}
+		})
+
+		t.Run("有界治理读模型隔离租户且不读取凭据", func(t *testing.T) {
+			users, err := st.ListUserSummaries(ctx, governance.GovernancePageQuery{TenantID: f.tenant.ID, Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(users) != 2 || users[0].TenantID != f.tenant.ID || users[1].TenantID != f.tenant.ID {
+				t.Fatalf("member summaries must contain exactly this tenant's users: %+v", users)
+			}
+			if users[0].ID <= users[1].ID {
+				t.Fatalf("member summaries must use descending keyset order: %+v", users)
+			}
+
+			spaces, err := st.ListGovernedSpaces(ctx, governance.GovernancePageQuery{TenantID: f.tenant.ID, Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(spaces) != 4 {
+				t.Fatalf("governance spaces must exclude two personal and all foreign spaces: %+v", spaces)
+			}
+			for _, space := range spaces {
+				if space.TenantID != f.tenant.ID || space.Type == governance.SpacePersonal {
+					t.Fatalf("space page leaked an out-of-scope row: %+v", space)
+				}
+			}
+
+			if err := st.GrantPermission(ctx, governance.Permission{
+				SpaceID: f.team.ID, UserID: f.other.ID, CanRead: true, CanWrite: true,
+				GrantedBy: f.user.ID, CreatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			grants, err := st.ListSpaceGrantSummaries(ctx, governance.GovernancePageQuery{TenantID: f.tenant.ID, SpaceID: f.team.ID, Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(grants) != 2 {
+				t.Fatalf("grant page must contain this tenant's two members: %+v", grants)
+			}
+			for _, grant := range grants {
+				if grant.User.ID == f.other.ID && (grant.Permission == nil || !grant.Permission.CanWrite) {
+					t.Fatalf("selected space permission missing from projection: %+v", grant)
+				}
+				if grant.User.ID == f.foreignUser.ID {
+					t.Fatalf("foreign member leaked into grant page: %+v", grant)
+				}
+			}
+
+			tokens, err := st.ListTokenSummaries(ctx, governance.GovernancePageQuery{TenantID: f.tenant.ID, UserID: f.user.ID, Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tokens) < 2 {
+				t.Fatalf("token projection should contain all own tokens created by the contract: %+v", tokens)
+			}
+			for _, token := range tokens {
+				if token.TenantID != f.tenant.ID || token.UserID != f.user.ID {
+					t.Fatalf("token projection leaked another owner or tenant: %+v", token)
+				}
+			}
+			if _, err := st.FindTokenSummary(ctx, f.tenant.ID, f.other.ID, f.token.ID); !errors.Is(err, governance.ErrTokenNotFound) {
+				t.Fatalf("token ownership lookup must fail closed, got %v", err)
+			}
+			agents, err := st.ListAgentAccessSummaries(ctx, f.tenant.ID, f.user.ID, 1)
+			if err != nil || len(agents) != 1 {
+				t.Fatalf("agent aggregate must honor its hard limit: %+v err=%v", agents, err)
 			}
 		})
 

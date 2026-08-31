@@ -1,0 +1,15 @@
+# 复制到 release 目录之外的受保护位置，并 chmod 0600。
+# 备份账号只授予完成逻辑导出所需的只读权限；恢复演练使用隔离 MySQL 的独立账号。
+[client]
+host=127.0.0.1
+port=3306
+user=claracore_backup
+password=REPLACE_WITH_SECRET
+protocol=tcp
+default-character-set=utf8mb4
+# 连接远程 MySQL 时取消注释并提供受信任 CA；不要使用 VERIFY_CA 或跳过主机名验证。
+# ssl-mode=VERIFY_IDENTITY
+# ssl-ca=/etc/claracore-server/mysql-ca.pem
+# 可选 mTLS：
+# ssl-cert=/etc/claracore-server/mysql-client.pem
+# ssl-key=/etc/claracore-server/mysql-client-key.pem

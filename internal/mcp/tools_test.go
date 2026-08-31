@@ -11,9 +11,21 @@ import (
 
 	"claracore-server/internal/domain/activity"
 	"claracore-server/internal/domain/continuity"
+	"claracore-server/internal/domain/external"
 	"claracore-server/internal/domain/knowledge"
 	"claracore-server/internal/platform"
 )
+
+type fakeExternalSearch struct {
+	last   external.SearchInput
+	result external.SearchResult
+	err    error
+}
+
+func (f *fakeExternalSearch) Search(_ context.Context, in external.SearchInput) (external.SearchResult, error) {
+	f.last = in
+	return f.result, f.err
+}
 
 // fakeKnow 是核心域的替身，**只记录 Host 传了什么**。
 //
@@ -171,6 +183,18 @@ func (f *fakeKnow) SearchMemories(_ context.Context, in knowledge.SearchMemories
 	return f.search, nil
 }
 
+func (f *fakeKnow) RecallMemoryForContext(_ context.Context, in knowledge.SearchMemoriesInput) (knowledge.AutomaticMemoryRecallResult, error) {
+	f.lastSearch = in
+	if err := f.bump(); err != nil {
+		return knowledge.AutomaticMemoryRecallResult{}, err
+	}
+	if len(f.search.Hits) == 0 {
+		return knowledge.AutomaticMemoryRecallResult{Reason: "no_candidates", SemanticAvailable: f.search.SemanticAvailable, PolicyAvailable: f.search.SemanticAvailable}, nil
+	}
+	hit := f.search.Hits[0]
+	return knowledge.AutomaticMemoryRecallResult{Hit: &hit, Reason: "high_confidence_top1", SemanticAvailable: f.search.SemanticAvailable, PolicyAvailable: f.search.SemanticAvailable}, nil
+}
+
 func (f *fakeKnow) CreateCard(_ context.Context, in knowledge.CreateCardInput) (knowledge.Card, error) {
 	f.lastCreateCard = in
 	if err := f.bump(); err != nil {
@@ -219,7 +243,7 @@ func (f *fakeKnow) RecallCardForContext(_ context.Context, in knowledge.RecallCa
 		return knowledge.AutomaticRecallResult{}, err
 	}
 	if len(f.recall.Hits) == 0 {
-		return knowledge.AutomaticRecallResult{Reason: "no_candidates", SemanticAvailable: f.recall.SemanticAvailable, PolicyAvailable: true}, nil
+		return knowledge.AutomaticRecallResult{Reason: "no_candidates", SemanticAvailable: f.recall.SemanticAvailable, PolicyAvailable: f.recall.SemanticAvailable}, nil
 	}
 	hit := f.recall.Hits[0]
 	return knowledge.AutomaticRecallResult{Hit: &hit, Reason: "high_confidence_top1", SemanticAvailable: f.recall.SemanticAvailable, PolicyAvailable: true}, nil
@@ -605,6 +629,66 @@ func TestSearchResultCarriesSemanticSignals(t *testing.T) {
 	}
 }
 
+func TestMemoriaSearchReturnsUnifiedPermissionScopedMatches(t *testing.T) {
+	lastSuccess := time.Date(2026, 8, 29, 8, 0, 0, 0, time.UTC)
+	ext := &fakeExternalSearch{result: external.SearchResult{
+		SemanticAvailable: true,
+		Hits: []external.SearchHit{{
+			Document:   external.MirrorDocument{ID: "01EXTERNALAAAAAAAAAAAAAAAA", TenantID: tenantA, SpaceID: spTeam, Title: "Atlas Runbook", Kind: "yuque_document", SourceRef: "https://atlas.example/doc", Revision: "rev-2", UpstreamUpdatedAt: "2026-08-29T07:00:00Z", UpdatedAt: lastSuccess},
+			SourceName: "atlas-docs", SourceSystem: "shared-docs", LastSyncStatus: external.SyncFailed, LastSucceededAt: &lastSuccess, Score: 0.91,
+		}},
+	}}
+	srv, know, _ := newToolHostWithActivityAndContinuity(t, newFakeActivity(), HostOptions{Version: "test", SemanticSearch: true, ExternalSearch: ext, ExternalConfigured: true})
+	know.search = knowledge.MemorySearchResult{Hits: []knowledge.MemoryHit{{Memory: know.memory, Score: 0.80, Semantic: true}}, SemanticAvailable: true, CardMatches: 1}
+	know.recall = knowledge.CardSearchResult{Hits: []knowledge.CardHit{{Card: know.card, Score: 0.85, Semantic: true}}, SemanticAvailable: true}
+	out, errMsg := callTool(t, srv, "ccs_valid_clara", "memoria_search", map[string]any{"query": "部署", "limit": 3})
+	if errMsg != "" {
+		t.Fatal(errMsg)
+	}
+	var result memoriaSearchOut
+	decodeInto(t, out, &result)
+	if len(result.Matches) != 3 || result.Matches[0].Type != "external" || result.Matches[1].Type != "card" || result.Matches[2].Type != "memory" {
+		t.Fatalf("semantic matches must share one ranking: %+v", result.Matches)
+	}
+	if result.Matches[0].External == nil || result.Matches[0].External.Freshness != "last_success_preserved_after_failure" || result.Matches[0].External.SourceRef == "" {
+		t.Fatalf("external source and freshness must be explicit: %+v", result.Matches[0])
+	}
+	if ext.last.TenantID != tenantA || len(ext.last.SpaceIDs) != 3 || ext.last.Query != "部署" {
+		t.Fatalf("resolved read scope must reach external search: %+v", ext.last)
+	}
+	if result.ExternalStatus != "available" || !result.ExternalSemanticAvailable || !result.CardSemanticAvailable {
+		t.Fatalf("external retrieval state must be explicit: %+v", result)
+	}
+	if result.Matches[0].External.Space.Type != "team" {
+		t.Fatalf("external hit must carry authoritative space metadata: %+v", result.Matches[0].External.Space)
+	}
+}
+
+func TestUnifiedSearchDoesNotBypassLabelOrHistoricalFilters(t *testing.T) {
+	ext := &fakeExternalSearch{}
+	for _, tc := range []struct {
+		args   map[string]any
+		status string
+	}{
+		{map[string]any{"query": "x", "labels": []string{"private"}}, "excluded_by_label_filter"},
+		{map[string]any{"query": "x", "timeView": "historical"}, "excluded_by_historical_view"},
+	} {
+		srv, _, _ := newToolHostWithActivityAndContinuity(t, newFakeActivity(), HostOptions{Version: "test", ExternalSearch: ext})
+		out, errMsg := callTool(t, srv, "ccs_valid_clara", "memoria_search", tc.args)
+		if errMsg != "" {
+			t.Fatal(errMsg)
+		}
+		var result memoriaSearchOut
+		decodeInto(t, out, &result)
+		if result.ExternalStatus != tc.status {
+			t.Fatalf("status=%s want=%s", result.ExternalStatus, tc.status)
+		}
+	}
+	if ext.last.Query != "" {
+		t.Fatalf("external search must not run through unsupported filters: %+v", ext.last)
+	}
+}
+
 func TestRecallCarriesMatchedTrigger(t *testing.T) {
 	srv, know := newToolHost(t)
 	know.recall = knowledge.CardSearchResult{
@@ -863,7 +947,12 @@ func TestContextQualityStatusReportsSubmittedFeedbackWithoutClaimingAccuracy(t *
 	since := time.Date(2026, 7, 29, 1, 2, 3, 0, time.UTC)
 	activities := newFakeActivity()
 	activities.quality = activity.ContextFeedbackQuality{
-		Since: since, Delivered: 2, Used: 3, Ignored: 1, Wrong: 1, Corrected: 1,
+		Since: since, Selected: 11, Abstained: 19, FeedbackCoveredSelections: 6,
+		AbstainReasons: activity.ContextAbstainReasons{
+			NoRelevantEvidence: 9, Ambiguous: 4, SemanticUnavailable: 2,
+			RetrievalTimeout: 1, SharedLineNotReady: 2, Other: 1,
+		},
+		Delivered: 2, Used: 3, Ignored: 1, Wrong: 1, Corrected: 1,
 	}
 	srv, _ := newToolHostWithActivity(t, activities)
 
@@ -871,8 +960,12 @@ func TestContextQualityStatusReportsSubmittedFeedbackWithoutClaimingAccuracy(t *
 	if errMsg != "" {
 		t.Fatal(errMsg)
 	}
-	if out["submitted"] != float64(8) || out["used"] != float64(3) || out["wrong"] != float64(1) {
+	if out["submitted"] != float64(8) || out["selected"] != float64(11) || out["abstained"] != float64(19) || out["feedbackCoveredSelections"] != float64(6) || out["used"] != float64(3) || out["wrong"] != float64(1) {
 		t.Fatalf("反馈计数不完整: %+v", out)
+	}
+	reasons, _ := out["abstainReasons"].(map[string]any)
+	if reasons["noRelevantEvidence"] != float64(9) || reasons["ambiguous"] != float64(4) || reasons["semanticUnavailable"] != float64(2) || reasons["retrievalTimeout"] != float64(1) || reasons["sharedLineNotReady"] != float64(2) || reasons["other"] != float64(1) {
+		t.Fatalf("放弃原因计数不完整: %+v", out)
 	}
 	if caveat, _ := out["caveat"].(string); !strings.Contains(caveat, "不是自动上下文准确率") {
 		t.Fatalf("必须明确反馈计数不等于准确率: %+v", out)
@@ -882,6 +975,97 @@ func TestContextQualityStatusReportsSubmittedFeedbackWithoutClaimingAccuracy(t *
 	activities.mu.Unlock()
 	if tenant != tenantA || window != 30*24*time.Hour {
 		t.Fatalf("查询必须来自 token 租户并限制到 30 天: tenant=%s window=%s", tenant, window)
+	}
+}
+
+func TestGatewayAutoContextSelectsExactlyOneDomain(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		srv, know := newToolHost(t)
+		know.memory.Body = strings.Repeat("长", contextPrimaryTextRunes+500)
+		know.search = knowledge.MemorySearchResult{
+			Hits: []knowledge.MemoryHit{{Memory: know.memory, Score: 0.82, Semantic: true}}, SemanticAvailable: true,
+		}
+		know.recall = knowledge.CardSearchResult{SemanticAvailable: true}
+		out, errMsg := callTool(t, srv, "ccs_valid_clara", "gateway_auto_context", map[string]any{"prompt": "连接池如何配置"})
+		if errMsg != "" {
+			t.Fatal(errMsg)
+		}
+		block, _ := out["block"].(map[string]any)
+		if out["decision"] != "deliver_one" || block["domain"] != "memory" || block["id"] != string(know.memory.ID) {
+			t.Fatalf("应交付唯一 Memory 块: %+v", out)
+		}
+		contextID, _ := out["contextId"].(string)
+		if len(contextID) != 32 {
+			t.Fatalf("每次交付必须带匿名关联 ID: %+v", out)
+		}
+		body, _ := block["body"].(string)
+		if !strings.Contains(body, "[truncated]") || !strings.Contains(body, "terminal Agent") || len([]rune(body)) > contextPrimaryTextRunes+500 {
+			t.Fatalf("Memory 证据必须有界且保留最终判断说明，长度=%d", len([]rune(body)))
+		}
+		if know.lastSearch.TimeView != "" || know.lastSearch.Query != "连接池如何配置" {
+			t.Fatalf("Host 只传真实 prompt，current 约束由领域路径固定: %+v", know.lastSearch)
+		}
+	})
+
+	t.Run("cross domain ambiguity", func(t *testing.T) {
+		srv, know := newToolHost(t)
+		know.search = knowledge.MemorySearchResult{
+			Hits: []knowledge.MemoryHit{{Memory: know.memory, Score: 0.82, Semantic: true}}, SemanticAvailable: true,
+		}
+		know.recall = knowledge.CardSearchResult{
+			Hits: []knowledge.CardHit{{Card: know.card, Score: 0.83, Semantic: true, Trigger: "连接池变更时"}}, SemanticAvailable: true,
+		}
+		out, errMsg := callTool(t, srv, "ccs_valid_clara", "gateway_auto_context", map[string]any{"prompt": "连接池如何配置"})
+		if errMsg != "" {
+			t.Fatal(errMsg)
+		}
+		if out["decision"] != "abstain" || out["reason"] != "ambiguous_domains" || out["block"] != nil || out["contextId"] != nil {
+			t.Fatalf("两域都高置信时必须 fail closed: %+v", out)
+		}
+	})
+
+	t.Run("explicit shared line", func(t *testing.T) {
+		srv, know, cont := newToolHostWithActivityAndContinuity(t, newFakeActivity())
+		out, errMsg := callTool(t, srv, "ccs_valid_clara", "gateway_auto_context", map[string]any{"lineId": "01LINEAAAAAAAAAAAAAAAAAAAA"})
+		if errMsg != "" {
+			t.Fatal(errMsg)
+		}
+		block, _ := out["block"].(map[string]any)
+		if out["decision"] != "deliver_one" || block["domain"] != "shared_line" || cont.lastGet.LineID != "01LINEAAAAAAAAAAAAAAAAAAAA" {
+			t.Fatalf("明确 lineId 应精确交付当前位置: %+v lastGet=%+v", out, cont.lastGet)
+		}
+		if contextID, _ := out["contextId"].(string); len(contextID) != 32 {
+			t.Fatalf("显式 Shared Line 交付必须带匿名关联 ID: %+v", out)
+		}
+		if know.calls != 0 {
+			t.Fatalf("显式 Shared Line 不应再竞争 Memory/Card，实际调用 %d 次", know.calls)
+		}
+	})
+}
+
+func TestGatewayContextFeedbackSupportsAllDeliveredDomains(t *testing.T) {
+	srv, _, cont := newToolHostWithActivityAndContinuity(t, newFakeActivity())
+	contextID := "ABCDEF0123456789ABCDEF0123456789"
+	for _, tc := range []struct {
+		domain string
+		id     string
+	}{
+		{"memory", "01MEMORYAAAAAAAAAAAAAAAAAA"},
+		{"shared_line", "01LINEAAAAAAAAAAAAAAAAAAAA"},
+	} {
+		out, errMsg := callTool(t, srv, "ccs_valid_clara", "gateway_context_feedback", map[string]any{"domain": tc.domain, "id": tc.id, "contextId": contextID, "outcome": "used"})
+		if errMsg != "" {
+			t.Fatalf("%s: %s", tc.domain, errMsg)
+		}
+		if out["domain"] != tc.domain || out["id"] != tc.id || out["contextId"] != strings.ToLower(contextID) || out["outcome"] != "used" {
+			t.Fatalf("%s 反馈未按实体回显: %+v", tc.domain, out)
+		}
+	}
+	if cont.lastGet.LineID != "01LINEAAAAAAAAAAAAAAAAAAAA" {
+		t.Fatalf("Shared Line 反馈必须先验证租户内实体: %+v", cont.lastGet)
+	}
+	if _, errMsg := callTool(t, srv, "ccs_valid_clara", "gateway_context_feedback", map[string]any{"domain": "memory", "id": "01MEMORYAAAAAAAAAAAAAAAAAA", "contextId": "not-an-id", "outcome": "used"}); !strings.Contains(errMsg, codeInvalid) {
+		t.Fatalf("畸形 contextId 必须被拒绝，实际 %q", errMsg)
 	}
 }
 

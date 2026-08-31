@@ -19,6 +19,7 @@ type ListQuery struct {
 
 type Store interface {
 	ListLines(ctx context.Context, q ListQuery) ([]Line, error)
+	CountLineStats(ctx context.Context, tenantID platform.ID) (LineStats, error)
 	FindLine(ctx context.Context, tenantID, lineID platform.ID, activeOnly bool) (*Line, error)
 	CreateLine(ctx context.Context, line Line) error
 	UpdateLineStatus(ctx context.Context, tenantID, lineID platform.ID, status string, at time.Time) error

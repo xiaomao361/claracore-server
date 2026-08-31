@@ -113,7 +113,7 @@ func checkAuthConsistency(auth *AuthContext) error {
 //
 // last_used_at 是运维辅助信号，不是授权依据。让它的写失败拒绝一次合法调用，
 // 是把次要信号放到了主路径上。
-func (s *Service) touchToken(ctx context.Context, token Token, now time.Time) {
+func (s *Service) touchToken(ctx context.Context, token AuthToken, now time.Time) {
 	if token.LastUsedAt != nil && now.Sub(*token.LastUsedAt) < tokenTouchInterval {
 		return
 	}
@@ -204,6 +204,7 @@ func (s *Service) ProvisionTenant(ctx context.Context, in ProvisionTenantInput) 
 		TenantID:     tenant.ID,
 		Username:     in.AdminUsername,
 		PasswordHash: hash,
+		AuthVersion:  InitialAuthVersion,
 		DisplayName:  defaultIfEmpty(in.AdminDisplay, in.AdminUsername),
 		Role:         RoleAdmin,
 		MustChangePw: true, // 首次登录强制改密
@@ -279,6 +280,7 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUserInput) (User, Spa
 		TenantID:     in.TenantID,
 		Username:     in.Username,
 		PasswordHash: hash,
+		AuthVersion:  InitialAuthVersion,
 		DisplayName:  defaultIfEmpty(in.DisplayName, in.Username),
 		Role:         role,
 		MustChangePw: true,

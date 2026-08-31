@@ -145,8 +145,50 @@ func (s *Service) Login(ctx context.Context, username, password string) (Session
 	if !ok || !user.IsActive() || !tenant.IsActive() {
 		return "", Principal{}, ErrInvalidCredentials
 	}
+	upgraded, err := s.upgradePasswordHashOnLogin(ctx, *user, password)
+	if err != nil {
+		// A CAS miss is re-verified below, so any remaining error is either a
+		// storage failure or credentials that changed concurrently. Keep the
+		// public response indistinguishable while preserving the cause for logs.
+		return "", Principal{}, fmt.Errorf("%w: %v", ErrInvalidCredentials, err)
+	}
 
-	return s.issueSession(ctx, *user)
+	return s.issueSession(ctx, upgraded)
+}
+
+func (s *Service) upgradePasswordHashOnLogin(ctx context.Context, user User, plaintext string) (User, error) {
+	needs, err := s.hasher.NeedsRehash(user.PasswordHash)
+	if err != nil {
+		return User{}, err
+	}
+	if !needs {
+		return user, nil
+	}
+	newHash, err := s.hasher.Hash(plaintext)
+	if err != nil {
+		return User{}, err
+	}
+	updated, err := s.store.UpgradeUserPasswordHash(ctx, user.TenantID, user.ID, user.PasswordHash, newHash, user.AuthVersion)
+	if err != nil {
+		return User{}, err
+	}
+	if updated {
+		user.PasswordHash = newHash
+		return user, nil
+	}
+
+	// Another instance may have upgraded the same hash, or an administrator
+	// may have reset the credential after our first read. Re-read and verify;
+	// never overwrite or issue a session from the stale result.
+	current, err := s.store.FindUserByID(ctx, user.TenantID, user.ID)
+	if err != nil {
+		return User{}, ErrInvalidCredentials
+	}
+	ok, err := s.hasher.Verify(plaintext, current.PasswordHash)
+	if err != nil || !ok || !current.IsActive() {
+		return User{}, ErrInvalidCredentials
+	}
+	return *current, nil
 }
 
 // Tenant 返回这个部署对应的租户。
@@ -195,12 +237,13 @@ func (s *Service) issueSession(ctx context.Context, user User) (SessionToken, Pr
 	now := s.clock.Now()
 	expires := now.Add(sessionTTL)
 	if err := s.sessions.Create(ctx, ports.Session{
-		TokenHash:  hashSessionToken(plaintext),
-		TenantID:   string(user.TenantID),
-		UserID:     string(user.ID),
-		ExpiresAt:  expires,
-		CreatedAt:  now,
-		LastSeenAt: now,
+		TokenHash:   hashSessionToken(plaintext),
+		TenantID:    string(user.TenantID),
+		UserID:      string(user.ID),
+		AuthVersion: user.AuthVersion,
+		ExpiresAt:   expires,
+		CreatedAt:   now,
+		LastSeenAt:  now,
 	}); err != nil {
 		return "", Principal{}, err
 	}
@@ -249,6 +292,13 @@ func (s *Service) ResumeSession(ctx context.Context, token string) (Principal, e
 	}
 	if !user.IsActive() {
 		// 会话还在但人已经停用：顺手清掉，别让它继续占着
+		_ = s.sessions.Delete(ctx, hash)
+		return Principal{}, ErrSessionInvalid
+	}
+	if sess.AuthVersion != user.AuthVersion {
+		// Password reset/change may race with a login that already verified the
+		// old hash but has not inserted its session yet. DELETE sessions cannot
+		// catch that late insert; the persisted generation check does.
 		_ = s.sessions.Delete(ctx, hash)
 		return Principal{}, ErrSessionInvalid
 	}

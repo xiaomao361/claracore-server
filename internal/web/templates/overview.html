@@ -9,13 +9,72 @@
   <div class="metric {{if gt .Totals.Drafts 0}}attention{{end}}"><span>等待审核</span><strong>{{.Totals.Drafts}}</strong><small>{{if gt .Totals.Drafts 0}}需要人工判断{{else}}队列已清空{{end}}</small></div>
 </section>
 
+<section aria-labelledby="operations-heading">
+  <div class="section-heading">
+    <div><h2 id="operations-heading">运行与质量</h2><p class="hint">知识质量按你的可读空间；共同线、索引与反馈按当前团队。这里只放会改变下一步的信号。</p></div>
+  </div>
+  <div class="metric-grid signal-grid">
+    <article class="metric {{if or (gt .Signals.Lines.NeedsReview 0) (gt .Signals.Lines.Stale 0)}}attention{{end}}">
+      <h3>进行中的共同线</h3>
+      <strong>{{.Signals.Lines.Active}}</strong>
+      <small>{{if or (gt .Signals.Lines.NeedsReview 0) (gt .Signals.Lines.Stale 0)}}待复核 {{.Signals.Lines.NeedsReview}} · 已陈旧 {{.Signals.Lines.Stale}}{{else}}没有待复核或陈旧状态{{end}}</small>
+      <a href="/continuity">查看共同线 →</a>
+    </article>
+    <article class="metric {{if gt .Totals.ActiveUnqualifiedCards 0}}attention{{end}}">
+      <h3>有召回条件的卡片</h3>
+      <strong>{{.Totals.RecallReadyCards}} / {{.Totals.ActiveCards}}</strong>
+      <small>{{if gt .Totals.ActiveUnqualifiedCards 0}}{{.Totals.ActiveUnqualifiedCards}} 张已发布卡片缺少“理解”{{else}}已发布卡片均已补充“理解”{{end}}</small>
+      <a href="/browse?kind=card&amp;status=active">检查已发布卡片 →</a>
+    </article>
+    <article class="metric {{if gt .Signals.Embedding.Stats.Failed 0}}attention{{end}}">
+      {{if .Signals.Embedding.Enabled}}
+      <h3>语义索引失败</h3>
+      <strong>{{.Signals.Embedding.Stats.Failed}}</strong>
+      <small>等待 {{.Signals.Embedding.Stats.Pending}} · 已耗尽重试 {{.Signals.Embedding.Stats.Exhausted}}</small>
+      {{else}}
+      <h3>检索模式</h3>
+      <strong class="metric-word">全文</strong>
+      <small>未配置 Embedding，核心读写仍可用</small>
+      {{end}}
+      {{if .Principal.IsAdmin}}<a href="/admin/indexing">查看语义索引 →</a>{{end}}
+    </article>
+	<article class="metric {{if or (gt .Signals.Feedback.Wrong .Signals.Feedback.Corrected) (gt .Signals.Feedback.AbstainReasons.SemanticUnavailable 0) (gt .Signals.Feedback.AbstainReasons.RetrievalTimeout 0)}}attention{{end}}">
+	  <h3>近 30 天已关联反馈的选择</h3>
+	  <strong>{{.Signals.Feedback.FeedbackCoveredSelections}} / {{.Signals.Feedback.Selected}}</strong>
+	  <small>自动放弃 {{.Signals.Feedback.Abstained}}：无相关证据 {{.Signals.Feedback.AbstainReasons.NoRelevantEvidence}} · 歧义 {{.Signals.Feedback.AbstainReasons.Ambiguous}} · 语义不可用 {{.Signals.Feedback.AbstainReasons.SemanticUnavailable}} · 超时 {{.Signals.Feedback.AbstainReasons.RetrievalTimeout}}</small>
+	  <small>Shared Line 未就绪 {{.Signals.Feedback.AbstainReasons.SharedLineNotReady}} · 其他/旧记录 {{.Signals.Feedback.AbstainReasons.Other}} · 错误反馈 {{.Signals.Feedback.Wrong}} · 已纠正 {{.Signals.Feedback.Corrected}}</small>
+      <a href="/activity?action=gateway_context_feedback&amp;range=30d">查看反馈活动 →</a>
+    </article>
+  </div>
+	<p class="hint dashboard-caveat">已关联反馈只计算回传 contextId 且能匹配本窗口真实选择的去重记录；反馈结果仍是主动提交样本，不等于自动上下文准确率。</p>
+</section>
+
+<section class="card collaboration-pulse" aria-labelledby="collaboration-heading">
+  <div class="section-heading">
+    <div><h2 id="collaboration-heading">近 7 天共享协作</h2><p class="hint">只统计你可读的团队/项目空间里的成功写入，按 UTC 自然日汇总。</p></div>
+    <a href="/activity?outcome=success&amp;range=7d">查看活动 →</a>
+  </div>
+  <div class="metric-grid pulse-summary">
+    <div class="metric"><span>共享写入</span><strong>{{.Signals.SharedActivity.Writes}}</strong><small>成功治理与内容写入</small></div>
+    <div class="metric"><span>活跃成员</span><strong>{{.Signals.SharedActivity.ActiveUsers}}</strong><small>去重用户账号</small></div>
+    <div class="metric"><span>活跃 Agent</span><strong>{{.Signals.SharedActivity.ActiveAgents}}</strong><small>去重接入身份</small></div>
+    <div class="metric"><span>最近贡献</span><strong class="metric-word">{{stampPtr .Signals.SharedActivity.LastWriteAt}}</strong><small>无写入时显示“从未”</small></div>
+  </div>
+  <ol class="pulse-days" aria-label="近 7 天每日共享写入">
+    {{range .Signals.SharedActivity.DailyWrites}}
+    <li><time datetime="{{.Date.Format "2006-01-02"}}">{{.Date.Format "01-02"}}</time><strong>{{.Writes}}</strong><small>次写入</small></li>
+    {{end}}
+  </ol>
+  <p class="hint">这里衡量共享知识库是否持续被使用，不含个人空间、失败操作和读取次数，也不代表知识质量。</p>
+</section>
+
 <div class="overview-panels">
   <section>
-    <div class="section-heading"><div><h2>我的 Agent</h2><p class="hint">按接入身份汇总设备与最近使用时间。</p></div><a href="/tokens">管理接入 →</a></div>
+    <div class="section-heading"><div><h2>我的 Agent</h2><p class="hint">最近使用的 6 个接入身份；完整历史在接入管理。</p></div><a href="/tokens">管理接入 →</a></div>
     <div class="card compact-list">
       {{range .Agents}}
       <article>
-        <div><strong><code>{{.ID}}</code></strong><p class="hint">{{range $i, $device := .Devices}}{{if $i}}、{{end}}{{$device}}{{end}}</p></div>
+        <div><strong><code>{{.ID}}</code></strong><p class="hint">共签发 {{.TokenCount}} 个 token</p></div>
         <p><span class="tag {{if gt .ActiveTokens 0}}team{{end}}">{{.ActiveTokens}} 个有效 token</span><br><small>最近使用 {{stampPtr .LastUsedAt}}</small></p>
       </article>
       {{else}}

@@ -22,14 +22,16 @@ func TestContinuityStoreAndServiceIntegration(t *testing.T) {
 	ownerUser, ownerAgent, writerUser, writerAgent := ids.New(), ids.New(), ids.New(), ids.New()
 
 	t.Cleanup(func() {
-		for _, stmt := range []string{
-			`DELETE FROM continuity_handoffs WHERE tenant_id = ?`,
-			`DELETE FROM continuity_position_history WHERE tenant_id = ?`,
-			`DELETE FROM continuity_positions WHERE tenant_id = ?`,
-			`DELETE FROM continuity_lines WHERE tenant_id = ?`,
-		} {
-			if _, err := db.ExecContext(context.Background(), stmt, string(tenantID)); err != nil {
-				t.Errorf("清理 Continuity 租户 %s 失败: %v", tenantID, err)
+		for _, cleanupTenant := range []platform.ID{tenantID, foreignTenant} {
+			for _, stmt := range []string{
+				`DELETE FROM continuity_handoffs WHERE tenant_id = ?`,
+				`DELETE FROM continuity_position_history WHERE tenant_id = ?`,
+				`DELETE FROM continuity_positions WHERE tenant_id = ?`,
+				`DELETE FROM continuity_lines WHERE tenant_id = ?`,
+			} {
+				if _, err := db.ExecContext(context.Background(), stmt, string(cleanupTenant)); err != nil {
+					t.Errorf("清理 Continuity 租户 %s 失败: %v", cleanupTenant, err)
+				}
 			}
 		}
 	})
@@ -71,13 +73,20 @@ func TestContinuityStoreAndServiceIntegration(t *testing.T) {
 	if err != nil || len(all) != 1 || all[0].ID != created.Line.ID {
 		t.Fatalf("allAgents 应看到同租户目录，actual=%+v err=%v", all, err)
 	}
-	for _, title := range []string{"第二条线", "第三条线"} {
+	for i, title := range []string{"第二条线", "第三条线"} {
 		pageAgent := ids.New()
+		positionStatus := []string{continuity.PositionNeedsReview, continuity.PositionStale}[i]
 		if _, err := svc.Update(ctx, continuity.UpdateInput{
-			TenantID: tenantID, UserID: ownerUser, AgentID: pageAgent, Title: title, Summary: "分页探针",
+			TenantID: tenantID, UserID: ownerUser, AgentID: pageAgent, Title: title, Summary: "分页探针", InterpretationStatus: positionStatus,
 		}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := svc.Update(ctx, continuity.UpdateInput{
+		TenantID: foreignTenant, UserID: ownerUser, AgentID: ids.New(), Title: "外租户线",
+		Summary: "不能进入当前租户统计", InterpretationStatus: continuity.PositionNeedsReview,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	firstPage, err := svc.ListPage(ctx, continuity.ListInput{TenantID: tenantID, AgentID: writerAgent, AllAgents: true, Limit: 1})
 	if err != nil || len(firstPage.Lines) != 1 || firstPage.NextCursor == "" {
@@ -86,6 +95,10 @@ func TestContinuityStoreAndServiceIntegration(t *testing.T) {
 	secondPage, err := svc.ListPage(ctx, continuity.ListInput{TenantID: tenantID, AgentID: writerAgent, AllAgents: true, Limit: 1, Cursor: firstPage.NextCursor})
 	if err != nil || len(secondPage.Lines) != 1 || secondPage.Lines[0].ID == firstPage.Lines[0].ID {
 		t.Fatalf("真实 SQL keyset 第二页应推进且不重复，first=%+v second=%+v err=%v", firstPage, secondPage, err)
+	}
+	lineStats, err := svc.Stats(ctx, tenantID)
+	if err != nil || lineStats.Active != 3 || lineStats.Archived != 0 || lineStats.NeedsReview != 1 || lineStats.Stale != 1 {
+		t.Fatalf("真实 SQL 共同线统计不符: stats=%+v err=%v", lineStats, err)
 	}
 
 	_, err = svc.Update(ctx, continuity.UpdateInput{
@@ -114,6 +127,10 @@ func TestContinuityStoreAndServiceIntegration(t *testing.T) {
 	})
 	if err != nil || archived.Line.Status != continuity.LineArchived {
 		t.Fatalf("archive failed: packet=%+v err=%v", archived, err)
+	}
+	lineStats, err = svc.Stats(ctx, tenantID)
+	if err != nil || lineStats.Active != 2 || lineStats.Archived != 1 {
+		t.Fatalf("归档后的真实 SQL 共同线统计不符: stats=%+v err=%v", lineStats, err)
 	}
 	readArchived, err := svc.Get(ctx, continuity.GetInput{TenantID: tenantID, AgentID: writerAgent, LineID: created.Line.ID})
 	if err != nil || len(readArchived.PositionHistory) != 2 || readArchived.RecentHandoff == nil {

@@ -147,6 +147,24 @@ func triggerEmbedText(t RecallTrigger) string {
 	return strings.TrimSpace(t.Text)
 }
 
+// NewPendingMemoryEmbedding builds the exact queue row used by normal Memory
+// writes. Import and other bulk paths use this instead of copying the text,
+// truncation, and hashing contract outside the knowledge domain.
+func NewPendingMemoryEmbedding(ids *platform.IDGenerator, tenantID, memoryID platform.ID, model, title, body string, at time.Time) (Embedding, bool) {
+	return newPendingEmbedding(ids, tenantID, Ref{Type: EntityMemory, ID: memoryID}, model, memoryEmbedText(Memory{Title: title, Body: body}), at)
+}
+
+// NewPendingCardEmbedding builds the canonical queue row for a Card body.
+func NewPendingCardEmbedding(ids *platform.IDGenerator, tenantID, cardID platform.ID, model, title, distilled, understanding string, at time.Time) (Embedding, bool) {
+	return newPendingEmbedding(ids, tenantID, Ref{Type: EntityCard, ID: cardID}, model, cardEmbedText(Card{Title: title, Distilled: distilled, Understanding: understanding}), at)
+}
+
+// NewPendingTriggerEmbedding builds the canonical queue row for one recall
+// trigger. Each trigger remains independently searchable.
+func NewPendingTriggerEmbedding(ids *platform.IDGenerator, tenantID, triggerID platform.ID, model, text string, at time.Time) (Embedding, bool) {
+	return newPendingEmbedding(ids, tenantID, Ref{Type: EntityCardTrigger, ID: triggerID}, model, triggerEmbedText(RecallTrigger{Text: text}), at)
+}
+
 func joinSections(parts ...string) string {
 	kept := make([]string, 0, len(parts))
 	for _, p := range parts {
@@ -174,16 +192,19 @@ func contentHash(text string) string {
 
 // newPendingEmbedding 构造一行待算的向量。第二个返回值为 false 表示
 // 这条内容没有可 embedding 的文本（比如一张只有标题的卡片），不必入队。
-func (s *Service) newPendingEmbedding(tenantID platform.ID, ref Ref, text string, at time.Time) (Embedding, bool) {
+func newPendingEmbedding(ids *platform.IDGenerator, tenantID platform.ID, ref Ref, model, text string, at time.Time) (Embedding, bool) {
+	if ids == nil || tenantID == "" || ref.ID == "" || !validEmbedTarget(ref.Type) || strings.TrimSpace(model) == "" {
+		return Embedding{}, false
+	}
 	text = truncateRunes(strings.TrimSpace(text), MaxEmbedTextLen)
 	if text == "" {
 		return Embedding{}, false
 	}
 	return Embedding{
-		ID:          s.ids.New(),
+		ID:          ids.New(),
 		TenantID:    tenantID,
 		Ref:         ref,
-		Model:       s.embedder.Model(),
+		Model:       model,
 		ContentHash: contentHash(text),
 		SourceText:  text,
 		Status:      EmbedPending,
@@ -209,7 +230,7 @@ func (s *Service) enqueueEmbedding(ctx context.Context, st Store, tenantID platf
 	if !validEmbedTarget(ref.Type) {
 		return fmt.Errorf("%w: 不可 embedding 的实体类型 %q", ErrInvalidArgument, ref.Type)
 	}
-	e, ok := s.newPendingEmbedding(tenantID, ref, text, at)
+	e, ok := newPendingEmbedding(s.ids, tenantID, ref, s.embedder.Model(), text, at)
 	if !ok {
 		return nil
 	}

@@ -139,6 +139,38 @@ func TestEmbedTextIsTruncated(t *testing.T) {
 	}
 }
 
+func TestBulkImportEmbeddingConstructorsReuseCanonicalTextAndQueueShape(t *testing.T) {
+	at := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	ids := platform.NewIDGenerator(platform.FixedClock{T: at})
+	tests := []struct {
+		name string
+		ref  Ref
+		want string
+		make func() (Embedding, bool)
+	}{
+		{name: "memory", ref: Ref{Type: EntityMemory, ID: "01MEMORYIMPORT00000000000"}, want: "标题\n\n正文", make: func() (Embedding, bool) {
+			return NewPendingMemoryEmbedding(ids, tenantA, "01MEMORYIMPORT00000000000", "bge-m3", " 标题 ", " 正文 ", at)
+		}},
+		{name: "card", ref: Ref{Type: EntityCard, ID: "01CARDIMPORT0000000000000"}, want: "卡片\n\n提炼\n\n理解", make: func() (Embedding, bool) {
+			return NewPendingCardEmbedding(ids, tenantA, "01CARDIMPORT0000000000000", "bge-m3", "卡片", "提炼", "理解", at)
+		}},
+		{name: "trigger", ref: Ref{Type: EntityCardTrigger, ID: "01TRIGGERIMPORT0000000000"}, want: "准备删除数据时", make: func() (Embedding, bool) {
+			return NewPendingTriggerEmbedding(ids, tenantA, "01TRIGGERIMPORT0000000000", "bge-m3", " 准备删除数据时 ", at)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			embedding, ok := tc.make()
+			if !ok || embedding.ID == "" || embedding.TenantID != tenantA || embedding.Ref != tc.ref || embedding.Model != "bge-m3" || embedding.SourceText != tc.want || embedding.ContentHash != contentHash(tc.want) || embedding.Status != EmbedPending || embedding.CreatedAt != at || embedding.UpdatedAt != at {
+				t.Fatalf("unexpected canonical pending embedding: ok=%v row=%+v", ok, embedding)
+			}
+		})
+	}
+	if _, ok := NewPendingMemoryEmbedding(ids, tenantA, "01EMPTYIMPORT000000000000", "", "title", "body", at); ok {
+		t.Fatal("an empty model must never create an unowned persistent queue row")
+	}
+}
+
 func utf8Valid(s string) bool {
 	for _, r := range s {
 		if r == '�' {

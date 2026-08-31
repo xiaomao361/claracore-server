@@ -108,6 +108,13 @@ func (s *Service) ListPage(ctx context.Context, in ListInput) (ListPage, error) 
 	return page, nil
 }
 
+func (s *Service) Stats(ctx context.Context, tenantID platform.ID) (LineStats, error) {
+	if tenantID == "" {
+		return LineStats{}, fmt.Errorf("%w: 缺少租户", ErrInvalidArgument)
+	}
+	return s.store.CountLineStats(ctx, tenantID)
+}
+
 func encodeListCursor(updatedAt time.Time, id platform.ID) string {
 	raw := strconv.FormatInt(updatedAt.UTC().UnixMilli(), 10) + ":" + string(id)
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))

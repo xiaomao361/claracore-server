@@ -282,6 +282,87 @@ func TestUpdateCardDetectsStaleVersion(t *testing.T) {
 	}
 }
 
+func TestDeprecateDraftCardsIsBoundedAtomicAndVersioned(t *testing.T) {
+	t.Run("deprecates selected drafts", func(t *testing.T) {
+		svc, store := newTestService(t)
+		first := seedCard(t, svc, spacePriv, func(in *CreateCardInput) {
+			in.Status, in.Title = CardDraft, "待审一"
+		})
+		second := seedCard(t, svc, spacePriv, func(in *CreateCardInput) {
+			in.Status, in.Title = CardDraft, "待审二"
+		})
+		got, err := svc.DeprecateDraftCards(context.Background(), DeprecateDraftCardsInput{
+			TenantID: tenantA, WritableSpaces: mySpaces(),
+			Cards: []DraftCardVersion{{ID: first.ID, Version: first.Version}, {ID: second.ID, Version: second.Version}},
+		})
+		if err != nil || len(got) != 2 {
+			t.Fatalf("批量标记失败: got=%+v err=%v", got, err)
+		}
+		for _, card := range []Card{store.cards[first.ID], store.cards[second.ID]} {
+			if card.Status != CardDeprecated || card.Version != 2 {
+				t.Fatalf("应统一变为 deprecated 并递增版本: %+v", card)
+			}
+		}
+	})
+
+	t.Run("non draft rolls back earlier updates", func(t *testing.T) {
+		svc, store := newTestService(t)
+		draft := seedCard(t, svc, spacePriv, func(in *CreateCardInput) {
+			in.Status, in.Title = CardDraft, "仍待审"
+		})
+		active := seedCard(t, svc, spacePriv, func(in *CreateCardInput) { in.Title = "已发布" })
+		_, err := svc.DeprecateDraftCards(context.Background(), DeprecateDraftCardsInput{
+			TenantID: tenantA, WritableSpaces: mySpaces(),
+			Cards: []DraftCardVersion{{ID: draft.ID, Version: draft.Version}, {ID: active.ID, Version: active.Version}},
+		})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("混入非草稿必须拒绝: %v", err)
+		}
+		if got := store.cards[draft.ID]; got.Status != CardDraft || got.Version != draft.Version {
+			t.Fatalf("整批失败必须回滚先前更新: %+v", got)
+		}
+	})
+
+	t.Run("stale version rolls back", func(t *testing.T) {
+		svc, store := newTestService(t)
+		first := seedCard(t, svc, spacePriv, func(in *CreateCardInput) { in.Status = CardDraft })
+		second := seedCard(t, svc, spacePriv, func(in *CreateCardInput) {
+			in.Status, in.Title = CardDraft, "并发改过"
+		})
+		_, err := svc.DeprecateDraftCards(context.Background(), DeprecateDraftCardsInput{
+			TenantID: tenantA, WritableSpaces: mySpaces(),
+			Cards: []DraftCardVersion{{ID: first.ID, Version: first.Version}, {ID: second.ID, Version: second.Version + 1}},
+		})
+		if !errors.Is(err, ErrVersionConflict) {
+			t.Fatalf("旧版本必须触发冲突: %v", err)
+		}
+		if got := store.cards[first.ID]; got.Status != CardDraft || got.Version != first.Version {
+			t.Fatalf("冲突必须回滚整批: %+v", got)
+		}
+	})
+
+	t.Run("rejects duplicates and over limit", func(t *testing.T) {
+		svc, _ := newTestService(t)
+		id := platform.ID("01CARDAAAAAAAAAAAAAAAAAAAA")
+		_, err := svc.DeprecateDraftCards(context.Background(), DeprecateDraftCardsInput{
+			TenantID: tenantA, WritableSpaces: mySpaces(), Cards: []DraftCardVersion{{ID: id, Version: 1}, {ID: id, Version: 1}},
+		})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("重复 ID 必须拒绝: %v", err)
+		}
+		tooMany := make([]DraftCardVersion, MaxBatchReviewCards+1)
+		for i := range tooMany {
+			tooMany[i] = DraftCardVersion{ID: platform.ID("x" + string(rune(i+1))), Version: 1}
+		}
+		_, err = svc.DeprecateDraftCards(context.Background(), DeprecateDraftCardsInput{
+			TenantID: tenantA, WritableSpaces: mySpaces(), Cards: tooMany,
+		})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("超过上限必须拒绝: %v", err)
+		}
+	})
+}
+
 func TestGetCardFiltersBySpace(t *testing.T) {
 	svc, _ := newTestService(t)
 	hidden := seedCard(t, svc, spaceHid)

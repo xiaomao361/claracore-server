@@ -1,13 +1,23 @@
 package mcp
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"claracore-server/internal/domain/activity"
+	"claracore-server/internal/domain/external"
+	"claracore-server/internal/ports"
 )
 
 // serverName 是 MCP initialize 响应里的服务端标识。
@@ -18,29 +28,51 @@ const serverName = "claracore-server"
 // 它持有领域服务与日志，不持有数据库连接——存储对这一层不可见
 // （test/arch_test.go 会拦住 internal/mcp → internal/adapters 的 import）。
 type Host struct {
-	gov        governanceService
-	know       knowledgeService
-	continuity continuityService
-	activity   activityService
-	logger     *slog.Logger
-	version    string
+	gov                governanceService
+	know               knowledgeService
+	continuity         continuityService
+	activity           activityService
+	external           externalSearchService
+	externalConfigured bool
+	logger             *slog.Logger
+	version            string
 
 	// semanticSearch 只用于 server_status 的自述，不影响任何行为。
 	// 检索该不该用向量由 knowledge.Service 自己知道（它持有 Embedder），
 	// Host 在这里放一个副本纯粹是为了能对外说清楚这个部署是什么形态。
 	semanticSearch      bool
 	embeddingCacheStats func() (hits, misses uint64, enabled bool)
+	maxRequestBodyBytes int64
+	requestLimiter      ports.RateLimiter
+	requestRateLimit    int
+	tenantRateLimit     int
+	requestRateWindow   time.Duration
 
 	srv *sdk.Server
 }
 
 type HostOptions struct {
 	Version string
+	// MaxRequestBodyBytes is enforced by the SDK for Content-Length, chunked,
+	// and HTTP/2 requests. Zero keeps the SDK's safe 4 MiB default.
+	MaxRequestBodyBytes int64
 	// SemanticSearch 表示这个部署接了 embedding 服务。
 	SemanticSearch bool
-	// EmbeddingCacheStats returns process-local query/content cache counters.
-	// Nil means this deployment has no cache decorator.
+	// EmbeddingCacheStats returns this process's counters for the effective
+	// local + optional shared query/content cache. Nil means no decorator.
 	EmbeddingCacheStats func() (hits, misses uint64, enabled bool)
+	// RequestLimiter applies authenticated per-agent and per-tenant budgets.
+	// Limiter keys are one-way digests and never contain token, user, tenant, or
+	// agent text. TenantRequestRateLimit must be no smaller than the agent limit.
+	RequestLimiter         ports.RateLimiter
+	RequestRateLimit       int
+	TenantRequestRateLimit int
+	RequestRateWindow      time.Duration
+	// ExternalSearch may remain available from the persisted mirror while the
+	// upstream connector is disabled; ExternalConfigured distinguishes that
+	// mirror-only state from an actively refreshable source.
+	ExternalSearch     externalSearchService
+	ExternalConfigured bool
 }
 
 func NewHost(gov governanceService, know knowledgeService, continuity continuityService, activities activityService, logger *slog.Logger, opts HostOptions) *Host {
@@ -50,14 +82,35 @@ func NewHost(gov governanceService, know knowledgeService, continuity continuity
 	if activities == nil {
 		panic("mcp: activityService 不能为空")
 	}
+	if opts.RequestLimiter != nil {
+		if opts.RequestRateLimit <= 0 {
+			opts.RequestRateLimit = 300
+		}
+		if opts.TenantRequestRateLimit < opts.RequestRateLimit {
+			opts.TenantRequestRateLimit = opts.RequestRateLimit * 10
+		}
+		if opts.RequestRateWindow <= 0 {
+			opts.RequestRateWindow = time.Minute
+		}
+	}
 	h := &Host{
-		gov: gov, know: know, continuity: continuity, activity: activities, logger: logger,
+		gov: gov, know: know, continuity: continuity, activity: activities, external: opts.ExternalSearch, logger: logger,
 		version:             opts.Version,
 		semanticSearch:      opts.SemanticSearch,
 		embeddingCacheStats: opts.EmbeddingCacheStats,
+		maxRequestBodyBytes: opts.MaxRequestBodyBytes,
+		requestLimiter:      opts.RequestLimiter,
+		requestRateLimit:    opts.RequestRateLimit,
+		tenantRateLimit:     opts.TenantRequestRateLimit,
+		requestRateWindow:   opts.RequestRateWindow,
 	}
+	h.externalConfigured = opts.ExternalConfigured
 	h.srv = h.newServer()
 	return h
+}
+
+type externalSearchService interface {
+	Search(context.Context, external.SearchInput) (external.SearchResult, error)
 }
 
 // newServer 注册工具集。
@@ -88,15 +141,15 @@ func (h *Host) newServer() *sdk.Server {
 	}, activity.KindTrace, activity.AccessRead, auditServerStatus, h.handleServerStatus)
 	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "gateway_auto_context",
-		Description: "对当前情境做保守的知识卡自动召回。最多交付一张；低相关、歧义、模型不可用时 abstain。selected 只表示选中，调用方实际放入上下文后才算 delivered/used。",
+		Description: "对当前情境做保守的单证据自动召回：显式 lineId 精确返回 Shared Line；否则 Memory 与 Card 各自过门禁并竞争唯一位置。低相关、域内或跨域歧义、模型不可用时 abstain；deliver_one 会返回供反馈关联的匿名 contextId。",
 	}, activity.KindTrace, activity.AccessRead, auditGatewayAutoContext, h.handleGatewayAutoContext)
 	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "gateway_context_feedback",
-		Description: "记录自动上下文是否被交付、使用、忽略或判错。只写治理活动，不修改知识卡正文。",
+		Description: "记录 Memory、Card 或 Shared Line 自动上下文是否被交付、使用、忽略或判错。回传 deliver_one 的 contextId 可计入选择覆盖；只写治理活动，不修改实体正文，旧 cardId 调用继续兼容。",
 	}, activity.KindGovernance, activity.AccessWrite, auditGatewayContextFeedback, h.handleGatewayContextFeedback)
 	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "context_quality_status",
-		Description: "汇总当前租户近 30 天已提交的自动上下文反馈。只返回 outcome 计数，不暴露内容或 actor；这是反馈覆盖情况，不等同于准确率。",
+		Description: "汇总当前租户近 30 天的选择、固定分类放弃原因、已关联反馈选择和已提交 outcome。只返回计数，不暴露内容或 actor；原因、反馈覆盖与 outcome 都不等同于准确率。",
 	}, activity.KindTrace, activity.AccessRead, auditContextQualityStatus, h.handleContextQualityStatus)
 
 	// --- Memory ---
@@ -106,8 +159,8 @@ func (h *Host) newServer() *sdk.Server {
 	}, activity.KindTrace, activity.AccessWrite, auditMemoriaCreate, h.handleMemoriaCreate)
 	addAuditedTool(h, s, &sdk.Tool{
 		Name: "memoria_search",
-		Description: "跨空间检索记忆。结果按语义命中在前、字面命中在后分组，每条标注 semantic 与来源空间；" +
-			"命中偏少时还会告诉你「另有 N 条卡片命中」——知识卡片是这里的核心载体，别只搜记忆就下结论。",
+		Description: "统一检索团队知识。兼容字段 hits 仍只含 Memory；matches 将 Memory、Card 与只读外部镜像的语义命中统一排序，" +
+			"字面降级结果按 memory_text/card_text 分组。每条标注空间、来源和 semantic；外部项只给来源链接与同步新鲜度，不返回本地正文。",
 	}, activity.KindTrace, activity.AccessRead, auditMemoriaSearch, h.handleMemoriaSearch)
 	addAuditedTool(h, s, &sdk.Tool{
 		Name:        "memoria_get",
@@ -207,15 +260,178 @@ func (h *Host) Handler() http.Handler {
 	mcpHandler := sdk.NewStreamableHTTPHandler(
 		func(*http.Request) *sdk.Server { return h.srv },
 		&sdk.StreamableHTTPOptions{
-			Stateless: true,
-			Logger:    h.logger,
+			Stateless:                    true,
+			Logger:                       h.logger,
+			MaxRequestBodyBytes:          h.maxRequestBodyBytes,
+			PropagateRequestCancellation: true,
 		},
 	)
 
-	return auth.RequireBearerToken(h.verifyToken, &auth.RequireBearerTokenOptions{
+	authenticated := auth.RequireBearerToken(h.verifyToken, &auth.RequireBearerTokenOptions{
 		// token 允许不过期（一个 agent 多 token 并存是平滑轮换的前提，
 		// 而长期驻留的机器 token 未必需要 TTL）。过期判断在领域层，
 		// 见 verifyToken 的注释。
 		AllowMissingExpiration: true,
-	})(h.injectIdentity(mcpHandler))
+	})(h.injectIdentity(h.limitRequests(mcpHandler)))
+	return mcpResponseHeaders(h.limitSource(authenticated))
+}
+
+// limitSource bounds unauthenticated database lookups as well as authenticated
+// calls. It trusts X-Real-IP only from the supported loopback reverse proxy;
+// direct peers cannot choose their bucket. The source budget is deliberately
+// wider than the per-agent budget so offices behind one NAT do not contend
+// before their individual identities are known.
+func (h *Host) limitSource(next http.Handler) http.Handler {
+	if h.requestLimiter == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		result, err := h.requestLimiter.Allow(
+			r.Context(), mcpRateKey("source", mcpClientIP(r)),
+			h.requestRateLimit*6, h.requestRateWindow,
+		)
+		if !h.handleRateResult(w, result, err) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// limitRequests protects the expensive authenticated path without trusting
+// X-Forwarded-For or any other caller-controlled identity. Authentication runs
+// first; all tokens for the same agent therefore share one budget, so rotating
+// or minting another token cannot bypass the limit. A second tenant-wide budget
+// prevents creating more agents from bypassing the aggregate capacity boundary.
+// Agent is checked first so a single abusive agent stops consuming the tenant
+// budget once its narrower allowance is exhausted. Invalid tokens never create
+// persistent limiter keys.
+func (h *Host) limitRequests(next http.Handler) http.Handler {
+	if h.requestLimiter == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, ok := identityFrom(r.Context())
+		if !ok {
+			h.logger.Error("MCP 限流中间件缺少已认证身份")
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		result, err := h.requestLimiter.Allow(r.Context(), mcpRateKey("agent", string(id.AgentID)), h.requestRateLimit, h.requestRateWindow)
+		if !h.handleRateResult(w, result, err) {
+			return
+		}
+		result, err = h.requestLimiter.Allow(r.Context(), mcpRateKey("tenant", string(id.TenantID)), h.tenantRateLimit, h.requestRateWindow)
+		if !h.handleRateResult(w, result, err) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Host) handleRateResult(w http.ResponseWriter, result ports.RateLimitResult, err error) bool {
+	if err != nil {
+		h.logger.Warn("MCP 限流器不可用")
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+		return false
+	}
+	if !result.Allowed {
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds(result.RetryAfter), 10))
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return false
+	}
+	return true
+}
+
+func mcpClientIP(r *http.Request) string {
+	peer := parseRequestIP(r.RemoteAddr)
+	if peer != nil && peer.IsLoopback() {
+		if forwarded := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); forwarded != nil {
+			return forwarded.String()
+		}
+	}
+	if peer != nil {
+		return peer.String()
+	}
+	return "unknown"
+}
+
+func parseRequestIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(remoteAddr), "[]")
+	}
+	return net.ParseIP(host)
+}
+
+func mcpRateKey(scope, value string) string {
+	sum := sha256.Sum256([]byte(scope + "\x00" + value))
+	return "rate:mcp:" + scope + ":" + hex.EncodeToString(sum[:])
+}
+
+func retryAfterSeconds(value time.Duration) int64 {
+	seconds := int64((value + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+// mcpResponseHeaders prevents agents, forward proxies, and browser tooling
+// from retaining responses that may contain tenant knowledge. It wraps auth so
+// the policy also covers 401/403 and malformed-protocol responses.
+func mcpResponseHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secured := &mcpResponseWriter{ResponseWriter: w}
+		secured.applyHeaders()
+		next.ServeHTTP(secured, r)
+	})
+}
+
+// mcpResponseWriter reapplies the policy at commit time because the MCP SDK
+// intentionally sets its own no-cache/no-transform directive after middleware
+// entry. no-cache alone still permits storage; no-store is the required
+// boundary for tenant knowledge.
+type mcpResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *mcpResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *mcpResponseWriter) applyHeaders() {
+	hdr := w.Header()
+	hdr.Set("Cache-Control", "no-store, no-transform")
+	hdr.Set("Pragma", "no-cache")
+	hdr.Set("X-Content-Type-Options", "nosniff")
+	hdr.Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+}
+
+func (w *mcpResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
+	w.applyHeaders()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *mcpResponseWriter) Write(body []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *mcpResponseWriter) ReadFrom(src io.Reader) (int64, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return io.Copy(w.ResponseWriter, src)
+}
+
+func (w *mcpResponseWriter) Flush() {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
 }

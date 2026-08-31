@@ -73,6 +73,59 @@ func TestVerifyUsesEmbeddedParams(t *testing.T) {
 	}
 }
 
+func TestNeedsRehashUpgradesOnlyWithoutDowngrading(t *testing.T) {
+	password := "parameter-upgrade-password"
+	weak := NewArgon2id(Argon2idParams{Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32})
+	current := NewArgon2id(Argon2idParams{Memory: 16 * 1024, Iterations: 2, Parallelism: 2, SaltLength: 16, KeyLength: 32})
+	stronger := NewArgon2id(Argon2idParams{Memory: 32 * 1024, Iterations: 3, Parallelism: 2, SaltLength: 24, KeyLength: 48})
+	incomparable := NewArgon2id(Argon2idParams{Memory: 32 * 1024, Iterations: 1, Parallelism: 2, SaltLength: 16, KeyLength: 32})
+
+	weakHash, err := weak.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentHash, err := current.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strongHash, err := stronger.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incomparableHash, err := incomparable.Hash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, tc := range map[string]struct {
+		hash string
+		want bool
+	}{
+		"weaker":       {weakHash, true},
+		"current":      {currentHash, false},
+		"stronger":     {strongHash, false},
+		"incomparable": {incomparableHash, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := current.NeedsRehash(tc.hash)
+			if err != nil || got != tc.want {
+				t.Fatalf("NeedsRehash = %v, want %v, err=%v", got, tc.want, err)
+			}
+		})
+	}
+}
+
+func TestVerifyRejectsEncodedResourceAbuseBeforeArgon2(t *testing.T) {
+	h := NewArgon2id(testParams())
+	abusive := "$argon2id$v=19$m=1048577,t=1,p=1$c2FsdA$a2V5"
+	if _, err := h.Verify("password", abusive); !errors.Is(err, ErrMalformedHash) {
+		t.Fatalf("oversized stored parameters must fail before allocation: %v", err)
+	}
+	if _, err := h.NeedsRehash(abusive); !errors.Is(err, ErrMalformedHash) {
+		t.Fatalf("NeedsRehash must share the same bounded parser: %v", err)
+	}
+}
+
 func TestHashEncodesParams(t *testing.T) {
 	h := NewArgon2id(Argon2idParams{Memory: 19456, Iterations: 2, Parallelism: 1, SaltLength: 16, KeyLength: 32})
 	hash, err := h.Hash("x")

@@ -80,6 +80,15 @@ type LineSummary struct {
 	UpdatedAt            time.Time
 }
 
+// LineStats is the tenant-wide dashboard view of Shared Line lifecycle state.
+// NeedsReview and Stale are active-line subsets, not additional lines.
+type LineStats struct {
+	Active      int
+	Archived    int
+	NeedsReview int
+	Stale       int
+}
+
 type ResumePacket struct {
 	Line            Line
 	RecentHandoff   *Handoff
