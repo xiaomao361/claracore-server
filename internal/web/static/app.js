@@ -46,7 +46,11 @@ document.addEventListener("click", async function (event) {
   }
 
   button.textContent = copied ? "已复制" : "请手动复制";
+  button.dataset.copyState = copied ? "success" : "error";
   var status = document.getElementById("ui-status");
   if (status) status.textContent = copied ? "内容已复制到剪贴板" : "自动复制失败，请手动选择内容复制";
-  window.setTimeout(function () { button.textContent = original; }, 1800);
+  window.setTimeout(function () {
+    button.textContent = original;
+    delete button.dataset.copyState;
+  }, 1800);
 });

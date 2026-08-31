@@ -88,7 +88,7 @@ code { font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, m
 }
 .nav-label:first-child { margin-top: 0; }
 .sidebar nav a {
-  position: relative; display: flex; align-items: center; min-height: 40px; padding: 8px 11px 8px 14px; border-radius: 9px;
+  position: relative; display: flex; align-items: center; min-height: 40px; padding: 8px 11px 8px 14px; border-radius: var(--radius-sm);
   color: #c7d2cc; font-size: var(--text-ui); font-weight: 520; text-decoration: none;
 }
 .sidebar nav a:hover { background: rgb(255 255 255 / .065); color: #fff; }
@@ -217,9 +217,9 @@ button {
   background: var(--accent); color: #fff; font-size: var(--text-ui); font-weight: 650; cursor: pointer;
   box-shadow: 0 1px 1px rgb(23 33 28 / .08);
 }
-button:hover { border-color: var(--accent-strong); background: var(--accent-strong); }
+button:not(:disabled):hover { border-color: var(--accent-strong); background: var(--accent-strong); }
 button.danger { border-color: #d8b7b3; background: var(--surface); color: var(--danger); }
-button.danger:hover { border-color: var(--danger); background: var(--danger-soft); }
+button.danger:not(:disabled):hover { border-color: var(--danger); background: var(--danger-soft); }
 button.linkish { min-height: 32px; padding: 4px; border: 0; background: transparent; color: var(--accent); font-weight: 500; }
 button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .55; }
 
@@ -241,6 +241,8 @@ pre.token { font-size: 14px; letter-spacing: .025em; }
 .code-heading h2, .code-heading h3 { margin: 0; }
 .copy-button { min-height: 34px; padding: 5px 10px; border-color: var(--line-strong); background: var(--surface); color: var(--accent); box-shadow: none; }
 .copy-button:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+.copy-button[data-copy-state="success"] { border-color: #a9cbb9; background: var(--accent-soft); color: var(--accent-strong); }
+.copy-button[data-copy-state="error"] { border-color: #e6beba; background: var(--danger-soft); color: var(--danger); }
 
 .table-scroll { position: relative; width: 100%; min-width: 0; max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface); box-shadow: var(--shadow-sm); scrollbar-gutter: stable; }
 .table-scroll:focus-visible { outline-offset: 4px; }
@@ -297,6 +299,9 @@ pre.activity-meta { margin: 9px 0 0; padding: 10px 12px; background: var(--surfa
 .ingest-summary strong { display: block; margin-top: 2px; color: var(--ink); font-size: 21px; font-variant-numeric: tabular-nums; }
 .index-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .space-admin h2 { display: flex; align-items: center; gap: 8px; }
+.collaboration-pulse .pulse-summary .metric {
+  border-color: transparent; border-radius: var(--radius-sm); background: var(--surface-soft); box-shadow: none;
+}
 
 .continuity-list { display: grid; gap: 14px; }
 .continuity-item { margin-bottom: 0; }
@@ -354,7 +359,7 @@ ul.triggers li { margin-bottom: 5px; }
   .environment code { display: none; }
   main { padding: 20px 16px 36px; }
   footer { display: none; }
-  .card, .review-original, .review-edit { padding: 17px; border-radius: 11px; }
+  .card, .review-original, .review-edit { padding: 17px; border-radius: var(--radius-md); }
   .metric-grid { gap: 9px; margin-bottom: 28px; }
   .metric { padding: 15px; }
   .metric strong { font-size: 24px; }
@@ -388,8 +393,9 @@ ul.triggers li { margin-bottom: 5px; }
 
 @media (prefers-reduced-motion: no-preference) {
   .sidebar nav a { transition: background-color 120ms, color 120ms; }
+  .compact-list > a, .range-switch a { transition: background-color 120ms, color 120ms, box-shadow 120ms; }
   input, select, textarea { transition: border-color 120ms, box-shadow 120ms, background-color 120ms; }
   button { transition: background-color 120ms, border-color 120ms, color 120ms, box-shadow 120ms, transform 120ms; }
   .continuity-item { transition: border-color 140ms, box-shadow 140ms; }
-  button:active { transform: scale(.96); }
+  button:not(:disabled):active { transform: scale(.96); }
 }
