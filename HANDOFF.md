@@ -7,7 +7,9 @@
 
 ## 一句话状态
 
-**团队测试实例已部署**：`http://192.168.3.200:51891` 由 `/home/gbjk/nginx` 的独立端口反代到 Supervisor 管理的 ClaraCore Server，应用目录是 `/home/gbjk/zhouwei/claracore-server`。管理员能在浏览器里管理账号、项目空间与权限、摄取源、索引和 token；agent 通过 24 个 MCP 工具管理 Memory、Card、自动上下文与 Shared Line。当前运行版本见本文「当前最远证据」。自动部署探针已从服务器内外通过；尚未完成的是登录后的人工视觉与完整业务验收。
+**内部团队实例已部署 `0.2.0-rc1`**：`http://192.168.3.200:51891` 由 `/home/gbjk/nginx` 的独立端口反代到 Supervisor 管理的 ClaraCore Server，应用目录是 `/home/gbjk/zhouwei/claracore-server`。当前 release、源码摘要、二进制摘要、schema、Web/MCP 边界、备份/隔离恢复/完整性回执与每日 timer 均已在目标主机验证；agent 的真实部署入口返回 24 个工具，临时验证 token 已精确清理。尚未完成的是用户用真实身份进行登录后的主观视觉与完整业务验收。
+
+**当前产品边界是受信局域网内的单实例内部服务**，不是公网 SaaS。实例因此显式使用 `env=development`、内网 HTTP 与非 Secure Cookie；公网 HTTPS/私有 CA、多实例负载均衡、跨主机可复现构建和公共发行不属于当前完成标准。若未来开放公网或把 MySQL/Redis/Embedding/Atlas 移到不可信网络，必须重新启用 `production` 约束并完成相应 TLS 与部署验收，不能沿用本轮内部回执。
 
 首次部署使用 `claracore-server -bootstrap -bootstrap-password-file <0600绝对路径>` 原子创建首个租户、管理员、团队空间和管理员个人空间；非空部署单元会明确拒绝重复初始化，管理员首次登录必须改密。
 
@@ -725,6 +727,8 @@ requireAdmin        ↑ 且角色是 admin
 
 **2026-08-31 P2 签名制品与目标主机离线预检**：当前仓库与 `origin/main` 都为 `ec52af0809dab584984f64ac35a56a64ff7e32a3`，尚无本地/远端 tag；在 `/secure/offline`、ClaraCore 配置/受控候选目录和仓库范围内未发现生产 Ed25519 私钥，因此没有冒充生产信任根。使用一次性 0600 Ed25519 测试密钥对精确当前源码生成 `p2-preflight-ec52af0` Linux amd64 包，正式打包链通过双编译有界复现、实时漏洞扫描、许可证、CycloneDX SBOM、22 条 Prometheus 规则、8 份 provenance byproduct、确定性归档、外层 SHA 与 64-byte detached signature；归档 SHA-256 为 `fd663682999fedf514613554b61c296c85d01ba930bcd782639745dd3d783ee3`，大小 14,909,293 bytes。包在目标主机临时目录重新通过签名认证、99 文件 inner manifest、provenance 与 `-version`：sourceDigest=`560af249a529120038b43e66f5a1dac326c04b5c0222d24f406e9d279d3b832f`，binaryDigest/provenance subject=`b721cc76e67e0f927ee26f28a950b878a0a6edd7dee861965857ba43fc66ce87`，Go 1.26.6、linux/amd64。随后重新构建并逐字节得到同一 binaryDigest，把该精确二进制放入目标主机临时目录、加载目标现有 `.env` 做切换前只读检查：`-check-upgrade` 为 `0013/13`、pending=0 / `binary_only`，`-check` 为 ready，`-check-integrity` 在不发布状态文件的 repeatable-read 快照上通过 29 条规则且 `violations=0`。两轮预检前后 `current` 均为旧 `dev-20260828-ui-completion-v1` release，Supervisor PID 均为 2810349 且 RUNNING；没有切换、重启或部署，临时私钥、制品、二进制和目标目录均已删除。目标主机有 220,029,832 KiB 可用空间及 openssl/sha256/tar/gzip/curl/systemctl，缺少 jq 但现有验证脚本不依赖它；当前 `51891/healthz=200`、`livez=404`、`readyz=404`，继续证明运行实例仍是旧版本。维护者随后授权正式版本 `0.2.0-rc1`、提交本交接文档并在部署前备份、保留旧 release 回滚入口后部署到 `192.168.3.200:51891`；但签名私钥仍填写为占位符 `<绝对路径>`，该路径不存在，也没有授权生成生产密钥，因此正式签名与部署继续停在密钥边界。本预检不是生产签名、发布、部署或业务验收。
 
+**2026-08-31 内部单实例 `0.2.0-rc1` 部署收口**：用户明确把目标收缩为受信局域网内的内部服务器，不以公网、多实例或公共发行作为本阶段门禁。精确 `eece800` 源码的 `make check`、未过滤 `make itest`、`go test -race ./...` 与 `git diff --check` 全绿；新建未签名内部包的 SHA-256 为 `754d08ebe0576d557af16a99857f0d6ce335ffd3b5c787ba452db0fd6711f405`，99 文件 inner manifest、provenance、双缓存有界复现、漏洞、许可证、SBOM 和 22 条 Prometheus 规则回执均通过。目标机运行身份为 version `0.2.0-rc1`、sourceDigest `560af249a529120038b43e66f5a1dac326c04b5c0222d24f406e9d279d3b832f`、binaryDigest `3d72d96b57024024458a5b95146b754586c2b5fd53ee3c258452d3b633c79423`、schema `0013/13`；`/livez`、`/readyz`、兼容 `/healthz`、Web 登录页、MCP 401 及内外部署探针通过。部署前备份 `claracore-server_claracore_server_20260831T080231Z.sql.gz` 的 SHA-256 为 `8c5c8b77493e77ee2bebf79724ef7220ab104f311864e8a521ea4f575b2c6528`，在无宿主端口的隔离 MySQL 8 中恢复 23 张表并核对 13 条迁移，报告 SHA-256 为 `227b1911e3a2672f1c97c80f9ae4215458e95a183c259bcd1e5fc64d4e4a120f`，临时库/容器/network 均已清理。目标机已安装并启用每日备份与完整性 timer；metrics 显示 backup/restore/integrity receipt 都存在且新鲜、`violations=0`。真实部署入口用一次性 15 分钟 token 验证 `tools/list=24`、`whoami` 与 3 个可见空间，随后精确删除 token；旧 `dev-20260828-ui-completion-v1` release 与旧 Supervisor 配置备份继续作为回滚入口。本轮没有操作浏览器，真实身份的视觉和业务意义仍待用户验收；内部包没有 Ed25519 发布者签名，不能冒充公共或跨维护者发行制品。
+
 ### 这一层还缺的东西
 
 - **审核队列的安全批量能力已完成**。只支持把用户逐项勾选的 1–50 张 draft 原子标记为 deprecated；逐项校验租户、可写空间、draft 状态和版本，任何冲突整批回滚。没有批量发布，理解与召回条件仍需逐张补齐。
@@ -751,14 +755,14 @@ requireAdmin        ↑ 且角色是 admin
 
 | 缺口 | 影响 | 在哪一段 |
 |---|---|---|
-| **多实例尚未部署侧验收** | 代码侧已有唯一实例标签、正式发布源码摘要、实际二进制摘要、逐实例版本/源码/制品/环境/schema 校验和公开入口覆盖采样；双 worker + 真实 MySQL 门禁覆盖 Redis 租约、故障 fail-open 与幂等写回，单进程 SIGTERM 摘流已实测。仍需两台 Linux、真实负载均衡摘流、网络分区和滚动发布验证 | §检索层、`07-deployment.md` |
+| **多实例部署侧验收** | 当前目标明确为内部单实例，因此不是阻塞项；代码与模拟门禁保留，只有未来改成多实例时才需要两台 Linux、真实负载均衡摘流、网络分区和滚动发布验证 | §检索层、`07-deployment.md` |
 | **Shared Line 不做语义猜测** | 自动上下文已覆盖 Memory / Card 单证据竞争；Shared Line 需调用方明确 `lineId`，避免多线 scope 猜错 | `08-usage-guide.md` §4、§8 |
 | **外部源连接（odoc 等）** | 第二版。`01` §8.1.3 定的是「活系统连接、死文档纳入」 | `01` §8 |
 | **反馈覆盖可验证，质量仍是主动样本** | `context_quality_status` 已有 30 天选择分母与去重关联覆盖，但 outcome 由调用方主动提交，仍不能解释成独立准确率 | `08-usage-guide.md` §8 |
 | **自动质量样本仍需扩充** | 真实 embedding + Stage B 已有正负与延迟门禁，但样本量仍小，需结合 wrong/ignored 反馈演进 | `08-usage-guide.md` §8 |
 | **开源分发材料已自动化** | 项目采用 Apache License 2.0；Linux 双架构 CycloneDX 1.6 SBOM、依赖许可证检查、第三方报告、许可证/NOTICE 与 MPL-2.0 MySQL 驱动源码进入发布清单。SBOM 和自动分类不替代漏洞扫描、发布者认证或新 reciprocal/restricted/native 依赖人工复核 | 根目录 README / LICENSE、`07-deployment.md` |
-| **公开生产与依赖 TLS 尚未验收** | 公网模板已安全默认 HTTPS，非 loopback MySQL/Redis/Embedding/Atlas 也会 fail-closed；但当前团队实例仍是内网 HTTP，且尚未用目标私有 CA/mTLS 与真实远程依赖验证证书、轮换和失败行为 | `07-deployment.md` |
-| **目标侧备份调度与真实恢复尚未验收** | 原子产物、定时/补跑模板、新鲜度/篡改门禁、技术恢复回执、系统页/指标/告警与发布包已自动验证；仍需目标侧安装 timer、生成一次备份，在独立 MySQL 生成真实回执/报告，并人工抽查 Memory / Card / Shared Line | `07-deployment.md` §3 |
+| **公网与远程依赖 TLS** | 当前目标明确为受信局域网内单实例，因此公网 HTTPS 不是阻塞项；未来开放公网或跨不可信网络连接依赖时，必须切回 `production` 并完成证书、轮换和失败行为验收 | `07-deployment.md` |
+| **目标侧备份调度与真实恢复** | 每日备份/完整性 timer、目标数据备份、隔离 MySQL 恢复、技术回执和指标已验证；只剩用户对代表性 Memory / Card / Shared Line 的业务语义抽查 | `07-deployment.md` §3 |
 
 ---
 
@@ -772,7 +776,7 @@ requireAdmin        ↑ 且角色是 admin
 
 ## 下一步
 
-**0. 当前工作流：P2 可信签名制品与目标实例部署。** P0 发布候选已固化并推送，P1 开发数据完整性基线已清零，`0.2.0-rc1` 的正式签名和目标实例部署也已获授权；唯一未决权限是生产 Ed25519 私钥的真实绝对路径，或在明确受控目录生成新密钥的授权。拿到该边界后，先生成并验证 Linux amd64 包的签名、checksum、inner manifest、SBOM、许可证、漏洞、provenance 与有界可复现构建回执，再于切换前生成新的数据库备份、保留旧 release 回滚入口并使 `192.168.3.200:51891` 与仓库候选一致。部署后只把 live/ready/health、MCP、版本/source/binary/schema、metrics、备份/恢复与完整性回执记为运行证据；真实身份页面、1440/390px、键盘、高风险确认和完整业务链仍由用户验收。在生产密钥边界明确前不签名或部署，也不把本地或开发库验证写成生产/业务验收。
+**0. 当前工作流：用户拥有的内部业务验收。** `0.2.0-rc1` 已部署到 `192.168.3.200:51891`，代码、制品、备份恢复、timer、运行探针和 MCP 协议层均已收口。下一步只由用户用真实身份检查登录、概览、内容审核、共同线、活动/审计、管理页与一次高风险确认，并抽查代表性的 Memory / Card / Shared Line；390px 只有团队确实会用手机访问时才需要。回执回来前不新增宽泛加固项，也不把自动化证据写成主观体验或业务验收。
 
 Continuity、项目空间权限、Web 摄取、删除检测、embedding backfill/失败观测、部署包、Supervisor 与 Nginx 代理均已完成。使用与验收方法统一见 `docs/08-usage-guide.md`；下一轮只按人工验收回执或缺口总览中的真实需求继续，不再根据旧文档重复建设已完成能力。
 
