@@ -14,7 +14,7 @@ Desktop 的 35 张表在单一 `schema.sql` 中随功能逐步堆积，没有整
 |---|---|---|
 | **治理域** (governance) | 谁是谁、谁能干什么 | tenant, user, agent, token, space, space_permission, audit_log |
 | **核心域** (core) | 知识本身 | memory, card, card_recall_trigger, label, link, shared_line |
-| **运行时域** (runtime) | 系统自身的运转痕迹 | embedding, trace, job, rate_counter |
+| **运行时域** (runtime) | 系统自身的运转痕迹 | embedding, trace, job；登录限流计数只在 Redis 或进程内短暂保存，不进入业务数据库 |
 
 **原则**：核心域的实体不感知租户以外的治理细节，只持有 `space_id`；权限判断在领域层完成后，以「可读空间集合」的形式传入查询。
 
@@ -193,10 +193,10 @@ Desktop 的教训：全表扫 + 单线程算余弦。Server 版拆成两段：
 `embeddings` 表持有 `content_hash`：
 
 - 内容未变则不重算，直接复用
-- 可作为未来 Redis 查询向量缓存的 key（`hash(text + model)`）；当前尚未实现该缓存端口
+- 查询向量缓存使用 `hash(model + text)`；进程内 LRU 与可选 Redis 共享层使用同一稳定 key，换模型不会误命中
 - 换 embedding 模型时按 `model` 列区分，新旧共存，可灰度重建
 
-自动上下文复用 Desktop 的确定性 Stage B：只接收已通过权限过滤且带语义分数的 Card，按可配置的最低分与 top-2 差值门槛筛选，弱相关、歧义或无向量时均 fail closed，最多返回 top-1 只读证据块。Server 不再调用第二个大模型；终端 Agent 配置的大模型负责最终语境判断。它不参与显式 `card_recall`，也不生成或改写知识。
+自动上下文复用 Desktop 的确定性 Stage B：Memory 与 Card 分别只接收已通过权限过滤且带语义分数的候选，按同一组可配置最低分与 top-2 差值门槛筛选。任一域内歧义、两域同时高置信、弱相关或无向量时均 fail closed；调用方明确传入 `lineId` 时则精确返回该条 active Shared Line 的当前位置，不从多条线中猜测。每次最多返回一个只读证据块。Server 不再调用第二个大模型；终端 Agent 配置的大模型负责最终语境判断。自动门禁不改变显式 `memoria_search` / `card_recall`，也不生成或改写内容。
 
 ---
 
@@ -213,7 +213,7 @@ WHERE id = ? AND version = ?
 
 影响行数为 0 即冲突，向调用方返回明确的冲突错误（而非静默覆盖），由 agent 决定重试或合并。
 
-**分布式锁**（`Locker` 端口）仅用于跨实体的复合操作（如批量提升、合并），单实体更新一律走乐观锁。
+**分布式锁**（`Locker` 端口）只用于基础设施租约与将来的跨实体复合操作，不替代单实体乐观锁。当前索引 worker 用 Redis token+TTL 短租约避免多实例重复领取；向量计算期间不持有数据库事务，Redis 故障时按幂等写回 fail-open。
 
 ---
 
@@ -245,6 +245,7 @@ CREATE TABLE users (
   tenant_id     CHAR(26)     NOT NULL,       -- 无默认值
   username      VARCHAR(64)  NOT NULL,
   password_hash VARCHAR(255) NOT NULL,       -- argon2id
+  auth_version BIGINT UNSIGNED NOT NULL DEFAULT 1, -- 改密/重置/停用时推进，吊销并发旧会话
   display_name  VARCHAR(128) NOT NULL,
   role          VARCHAR(16)  NOT NULL,       -- admin | member
   must_change_pw TINYINT(1)  NOT NULL,       -- 首次登录强制改密
@@ -481,6 +482,33 @@ CREATE TABLE audit_logs (
 - `continuity_handoffs`：里程碑交接，保存目标、已完成、待办、下一步与 writer。
 
 所有定位 SQL 同时带 `tenant_id` 与 `line_id`。跨 agent 显式更新只改变 position/handoff 的 writer，不改变 line owner；不传 `lineId` 且当前 agent 有多条 active line 时拒绝写入。Shared Line 是可恢复工作位置，不是第二套事实库，`facts_used` 仅保存事实 ID。
+
+### 7.2 外部活源镜像（0009）
+
+`0009_external_sources.sql` 把 Atlas 这类持续维护的来源与 Card/Memory 明确分开：
+
+- `external_sources`：租户、目标空间、来源类型/系统及最后一次同步状态；服务 token 不入库。
+- `external_sync_runs`：每轮完整快照的 seen/indexed/unchanged/missing 与失败原因，供治理面追溯。
+- `external_documents`：稳定外部 ID、标题、来源链接、revision 和 last-seen run；**没有正文列**。
+- `external_document_vectors`：按模型保存 revision、实际 embedding 输入的 SHA-256 与 float32 向量；**没有 `source_text`**。
+
+内部 `embeddings` 继续保存 `source_text`，因为它同时是 Memory/Card 的异步队列与可审计输入；
+外部正文权威仍在来源端，不能套用这张表。外部同步在内存中按页取正文并立即算向量，
+元数据与对应向量同事务发布。完整快照成功后才把未见文档软标记 `missing`；失败快照不做
+删除检测。来源行上的 `sync_run_id + sync_lease_until` 串行化多实例完整快照，旧 owner 即使
+晚返回也无法提交收尾，租约过期后新实例可接管并把遗留 run 标为失败。
+
+`0010_external_sync_requests.sql` 在来源行增加两段式手动请求状态：`sync_request_*`
+保存至多一轮等待请求，`sync_request_claim_*` 保存当前领取者与有期限租约。领取时在
+同一行锁事务中把 pending 移到 claim；正在处理期间可以再保留一轮 follow-up。成功或
+真实上游失败会完成 claim，未取得完整快照租约或实例退出则释放或等待 claim 租约过期，
+由任一实例重新领取。进程内 channel 只负责低延迟唤醒，不是请求事实来源。
+
+检索只 JOIN 当前 document revision 对应的同模型向量，并在 SQL 中同时限定 `tenant_id`、
+可读 `space_id IN (...)`、document/source active 状态。候选集以标题字面命中和镜像更新时间
+排序后截断，再在领域层计算余弦；正文既不参与查询返回，也没有可被 SELECT 的列。来源当前
+同步失败不删除候选，结果携带 `last_sync_status + last_succeeded_at`，让调用方知道自己看到的
+是保留下来的上一成功镜像，而不是把“仍可用”误写成“刚刷新成功”。
 
 ---
 

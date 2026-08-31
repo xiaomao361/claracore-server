@@ -38,24 +38,28 @@
 ```
 claracore-server/
 ├── cmd/
-│   └── server/main.go          # 唯一入口：装配 + 优雅关闭 + -migrate + 两类后台 worker
+│   └── server/                 # 唯一入口装配、探针、优雅关闭、-migrate 与后台 worker
 ├── internal/                   # Go 编译期强制封装，外部无法 import
 │   ├── config/                 # 唯一读环境变量的地方
 │   ├── domain/                 # 领域层：不依赖任何基础设施
 │   │   ├── governance/         # 身份、token、空间权限、登录会话
 │   │   ├── knowledge/          # memory / card / 检索 / 索引队列 / 摄取 / 列表
 │   │   ├── activity/           # 活动分类、记录、可见性分页、trace 清理契约
-│   │   └── continuity/         # Shared Line owner / position / history / handoff
-│   ├── ports/                  # 纯基础设施接口（embedder / hasher / sessionstore）
-│   ├── adapters/               # mysql/（含 activity Store）+ embedding/ + crypto/
+│   │   ├── continuity/         # Shared Line owner / position / history / handoff
+│   │   └── external/           # 活源枚举/同步/无正文语义检索；镜像不是 Card/Memory
+│   ├── ports/                  # 纯基础设施接口（embedder / hasher / sessionstore / tenant exporter）
+│   ├── adapters/               # mysql/（含一致性可移植导出）+ redis/ + embedding/ + crypto/ + verified TLS loader
 │   ├── mcp/                    # Host A：24 个工具 + 统一活动装饰器
 │   ├── web/                    # Host B：治理、内容、活动流与完整审计
 │   ├── ingest/                 # Markdown 目录源（不提炼）
+│   ├── portableexport/         # 版本化团队导出契约与无外部依赖的有界离线校验器
+│   ├── teamimport/             # 无数据库语义预检、关系完整性与管理员接管计划
 │   └── platform/               # 横切：ID / 时钟
 ├── migrations/                 # 0001 治理 / 0002 核心 / 0003 运行时
-│                               # 0004 会话 / 0005 摄取 / 0006 活动 / 0007 来源 / 0008 Continuity
+│                               # 0004 会话 / 0005 摄取 / 0006 活动 / 0007 来源 / 0008 Continuity / 0009 外部镜像
 ├── docs/                       # 01–05 设计文档
 ├── test/                       # 架构测试、schema 测试、端到端集成测试
+├── scripts/                    # 发布、解包完整性校验、部署探针、原子备份与隔离恢复演练
 ├── Makefile
 └── go.mod
 ```
@@ -159,9 +163,9 @@ internal/ports/
 ├── embedder.go       # ✅ Model() + Embed([]string) [][]float32
 ├── hasher.go         # ✅ Hash / Verify（Verify 必须同在，见文件注释）
 ├── sessionstore.go   # ✅ Web 会话，签名里只有 string/time
-├── cache.go          # 待做，做向量缓存时（01 §6.2 里价值最高的一项）
-├── locker.go         # 待做，多实例部署时必须
-├── ratelimiter.go    # 待做
+├── cache.go          # ✅ 共享缓存端口；embedding 两级 decorator 使用
+├── locker.go         # token+TTL 短租约；多实例索引协调，故障时 fail-open
+├── ratelimiter.go    # ✅ 匿名固定窗口限流，不认识账号或 HTTP
 └── eventstore.go     # MCP resumability，第一版不实现
 ```
 
@@ -174,7 +178,8 @@ internal/ports/
 ```
 internal/domain/governance/store.go   → type Store interface { ... }
 internal/domain/knowledge/store.go    → type Store interface { ... }
-internal/domain/knowledge/source.go   → type ExternalSource interface { ... }
+internal/domain/external/source.go    → type Source interface { ... }
+internal/domain/external/store.go     → type Store interface { ... }
 internal/domain/activity/activity.go  → type Store interface { ... }
 ```
 
@@ -183,6 +188,7 @@ internal/domain/activity/activity.go  → type Store interface { ... }
 ```
 adapters/mysql ──implements──▶ domain/governance.Store
                                domain/knowledge.Store
+                               domain/external.Store
                                domain/activity.Store
 ```
 
@@ -196,15 +202,18 @@ adapters/mysql ──implements──▶ domain/governance.Store
 internal/adapters/
 ├── mysql/            # 主实现
 ├── sqlite/           # 本地开发 / 轻量部署
-├── redis/            # Cache/Locker/RateLimiter/SessionStore 的 Redis 实现
-├── inmem/            # 降级实现：无 Redis 时的默认
+├── redis/            # 共享 Cache、token+TTL Locker 与原子固定窗口 RateLimiter
+├── ratelimit/        # 有界进程内 RateLimiter + Redis/本地故障降级
+├── tlsclient/        # 有界读取私有 CA/mTLS 材料，只构造验证身份的 TLS 1.2+
 ├── embedding/
+│   ├── cache.go      # 进程内 LRU + 可选共享 Cache 的两级 decorator
 │   ├── ollama.go
 │   └── openaicompat.go
-└── mcpsource/        # 外部 MCP 源连接器（第二版）
+└── external/
+    └── atlas/        # Atlas MCP 只读连接器；正文只在派生索引时瞬时读取
 ```
 
-**降级是默认路径不是异常路径**（`01-architecture.md` §6.1）：未配置 Redis 时装配 `inmem` 实现，系统功能完整。这一点在装配处（`cmd/server/main.go`）体现，领域层完全无感。
+**降级是默认路径不是异常路径**（`01-architecture.md` §6.1）：未配置或暂时无法访问 Redis 时，embedding decorator 继续使用进程内 LRU 与模型服务，系统功能完整。这一点在装配处（`cmd/server/main.go`）体现，领域层完全无感。
 
 ### 3.3 SQL 写在哪
 
@@ -249,6 +258,8 @@ Host 层的职责严格限定为四件事：
 4. 在已认证的传输边界生成活动事件（MCP 统一装饰器 / Web 写中间件），只把安全的 ID、计数和结果分类交给 `domain/activity`
 
 任何 `if` 业务判断出现在 Host 层，都是应该下沉到 domain 的信号。活动埋点是边界事实而非知识/治理业务规则：只有 Host 同时知道认证主体、协议动作与最终结果；因此不把 MCP 工具名或 HTTP 路由反向塞进 knowledge/governance。
+
+进程入口在两个 Host 外还有一层纯传输中间件 `cmd/server/http_observability.go`。它生成不可由客户端覆盖的 request ID、记录最终状态/耗时/响应字节并隔离 panic；不读取业务身份，也不记录 query、header、cookie、request body 或 panic 值。它不是第三个 Host，更不能写领域活动。
 
 ---
 
@@ -336,6 +347,9 @@ cmd → mcp/web/ingest → domain → ports
 
 - 单一 `config.Config` 结构体，启动时一次性加载并校验
 - **启动时校验失败直接 fatal**，不允许运行期发现配置缺失
+- 非空整数、布尔值与小数严格解析；非法语法、持续时间溢出和危险范围不能静默退回默认值
+- `.env` 的 malformed/重复行带行号失败；`production` 强制 Secure Cookie 与 HTTPS `CCS_PUBLIC_MCP_URL`
+- 业务 listener 的 read-header/read/write/idle timeout、最大 header、Web 表单、MCP 请求体与认证后调用预算均由 `config.HTTP` 类型化配置；独立 metrics listener 复用相同传输边界，但 `config.Metrics` 只允许数字 loopback 与不同端口
 - 环境变量只在 `config/` 包读取，其他任何地方禁止 `os.Getenv`
 
 ### 6.4 测试组织
@@ -344,10 +358,11 @@ cmd → mcp/web/ingest → domain → ports
 |---|---|---|
 | 领域单测 | 与被测代码同目录 `_test.go` | 无外部依赖，必须快 |
 | 适配器测试 | `adapters/*/*_integration_test.go`（`//go:build integration`） | 真实 MySQL，`make itest` |
+| 多实例装配测试 | `cmd/server/*_integration_test.go` | 真实 MySQL + 两个独立 Redis client；租约互斥与 Redis 故障幂等写回 |
 | 集成测试 | `test/` | 完整装配 |
 | 架构测试 | `test/arch_test.go` | 见 §5.1 |
 
-**适配器测试打 `integration` tag，不进 `make check`**（2026-08-06 落地时定）。原考虑的 testcontainers 需要本地 Docker，SQLite 则要维护第二套方言——两者都是为了"测试能脱离真库跑"而付出的真实成本，而这套系统本来就有一台常驻的开发库。代价是 CI 没库时这层测不到，所以：**改完 SQL 必须手跑一次 `make itest`**。
+**真实装配测试打 `integration` tag，不进 `make check`**（2026-08-06 落地时定）。原考虑的 testcontainers 需要本地 Docker，SQLite 则要维护第二套方言——两者都是为了“测试能脱离真库跑”而付出的真实成本，而这套系统本来就有一台常驻的开发库。`make itest` 会跑 schema、MySQL Store、MCP E2E、两个 indexer 共用真实 MySQL 队列和独立 Redis client 的协调门禁，以及两个独立 Redis client 对同一租户调用预算的共享计数。代价是没有开发库或 Redis 时对应层测不到，所以：**改完 SQL、迁移或多实例装配必须手跑一次 `make itest`**。
 
 **适配器测试的基准是领域层的 fake store**：同一个接口两个实现，行为必须一致，否则领域单测全绿而线上行为不同。写法上，绝大多数用例跑在一个最终 rollback 的事务里（不留痕迹），真实提交路径单独一个用例、自己清理。
 
@@ -374,12 +389,14 @@ cmd/server -migrate                    入口（make migrate），保持单一�
 |---|---|
 | 顺序应用 | 按 `NNNN` 前缀排序，已应用的跳过 |
 | 已发布迁移不可修改 | 记 SHA-256 校验和，不匹配即拒绝启动并提示新增迁移文件 |
-| 多实例安全 | `GET_LOCK('ccs:schema_migrate', 30)`，滚动发布时不会两个实例同时改表 |
+| 并发运维安全 | `GET_LOCK('ccs:schema_migrate', 30)`，两个显式迁移命令不会同时改表；普通服务实例从不隐式迁移 |
 | 迁移不隐式发生 | 只在 `-migrate` 下执行；服务正常启动不改表结构 |
-| 版本与二进制一致 | SQL 编进二进制，不存在「二进制和 migrations/ 对不上」 |
+| 版本与二进制一致 | SQL 编进二进制；普通启动与 `/readyz` 只读核对每个版本/checksum，缺失、漂移或数据库领先都拒绝接流量 |
+| 升级计划 | `-check-upgrade` 在停服务前只读验证已应用迁移是连续可信前缀，并显式给出 pending、schema 维护窗口与回滚模式；不执行 SQL |
+| 数据完整性 | `-check-integrity` 在 repeatable-read 只读快照中执行二进制内固定的关键跨表规则，只输出规则名与违规计数；配置状态路径时以同目录临时文件、0600 权限和原子替换发布严格回执，系统页与指标只读回执而不在请求路径执行关系 SQL |
 
 **不假装有原子性**：MySQL 的 DDL 隐式提交，把整个迁移包进事务是做不到的。执行器的保证是「顺序执行 + 精确记账」——任一语句失败即中止，报错给出停在哪个文件的第几条语句，人工确认库状态后重跑。
 
 `splitStatements` 按分号拆语句时跳过注释与字符串字面量（有 12 个用例覆盖）。不用 `strings.Split(";")`：迁移里出现带分号的字面量是迟早的事，那时的报错会伪装成"语法错误"，排查代价极高。
 
-集成测试 `test/schema_integration_test.go`（`make itest`，需真实 MySQL）验证迁移在库里的**实际结果**——文本检查挡不住「MySQL 接受了但语义不是你以为的那样」。
+集成测试 `test/schema_integration_test.go`（`make itest`，需真实 MySQL）验证迁移在库里的**实际结果**，并确认真实 `schema_migrations` 与当前二进制完全一致——文本检查挡不住「MySQL 接受了但语义不是你以为的那样」。

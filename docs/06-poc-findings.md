@@ -2,7 +2,7 @@
 
 > 执行日期：2026-08-05
 > 代码：`apps/claracore-server/poc/`（丢弃型验证代码，非正式结构）
-> SDK：`github.com/modelcontextprotocol/go-sdk v1.7.0`，Go 1.26.3
+> SDK：`github.com/modelcontextprotocol/go-sdk v1.7.0`，Go 1.26.6
 
 ---
 

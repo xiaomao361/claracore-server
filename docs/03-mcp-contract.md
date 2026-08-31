@@ -1,7 +1,7 @@
 # ClaraCore Server MCP 工具契约
 
 > 创建日期：2026-08-05
-> 状态：**24/24 已落地**。Memory / Card / 空间 / Continuity / 自动上下文 / 系统工具均已接入统一认证、错误映射与活动审计；真库链路见 `test/mcp_tools_integration_test.go`。
+> 状态：**24/24 已落地**。Memory / Card / 外部只读镜像 / 空间 / Continuity / 自动上下文 / 系统工具均已接入统一认证、错误映射与活动审计；真库链路见 `test/mcp_tools_integration_test.go` 与 `internal/adapters/mysql/external_integration_test.go`。
 > 前置文档：`01-architecture.md`、`02-data-model.md`
 >
 > **本文档是两条产品线的共同基准**：Desktop（JS）与 Server（Go）各自实现，工具名称、参数、语义保持一致。
@@ -93,7 +93,7 @@ agent 据此判断权威性：`team` = 已达成共识的约定，`personal` = �
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
 | `memoria_create` | 创建记忆；可原子替代旧事实 | `title`, `body`, `labels[]`, `space?`, `supersedes?` |
-| `memoria_search` | 语义 + 标签检索；可切当前/历史视图 | `query`, `labels[]?`, `spaces[]?`, `limit?`, `timeView?` |
+| `memoria_search` | 兼容字段 `hits` 检索 Memory；统一字段 `matches` 跨 Memory / Card / 外部只读镜像检索 | `query`, `labels[]?`, `spaces[]?`, `limit?`, `timeView?` |
 | `memoria_get` | 按 id 取单条（含关联） | `id` |
 | `memoria_update` | 更新内容 / 标签 / 状态 | `id`, `version?`, 各字段 |
 | `memoria_delete` | 软删除 | `id` |
@@ -146,6 +146,17 @@ agent 据此判断权威性：`team` = 已达成共识的约定，`personal` = �
 
 另外：**检索结果不带 `labels`**。粗筛刻意不填（N+1 查询或让候选集膨胀的 JOIN），按 ID 取单条时才有。
 
+`memoria_search` 沿用既有工具名以保持 Desktop 与已接客户端兼容，原 `hits` /
+`semanticAvailable` / `cardMatches` 字段不变。新增 `matches` 是推荐读取面：
+
+- `group=semantic`：Memory、Card、外部镜像使用同一模型，余弦可跨域排序；空间 rank 只在分数接近时决胜。
+- `group=memory_text|card_text`：两个 MySQL 索引的分数不可跨查询比较，因此分组而不融合。
+- 外部项没有正文，只返回 `sourceRef`、来源系统、revision、索引时间、上游更新时间、最近成功同步时间及 `freshness`。
+- `externalStatus` 区分 `available`、`mirror_only`、`degraded`、`unconfigured`，以及因 historical/label 过滤而明确排除。外部镜像不可加 label，所以调用方传 labels 时不会绕过过滤混入外部结果。
+- `semanticAvailable` 保持表示 Memory；`cardSemanticAvailable` 与 `externalSemanticAvailable` 分别陈述其余两域，避免部分降级被一个总布尔值掩盖。
+
+自动 `gateway_auto_context` 暂不纳入外部镜像：本地没有权威正文，不能把标题和向量分数冒充为可直接交付的证据块。显式统一检索先返回来源链接，由终端 Agent 决定是否访问来源。
+
 ### 4.3 空间（3 个）
 
 | 工具 | 用途 | 关键参数 |
@@ -176,9 +187,9 @@ Shared Line 的共享边界是 tenant，不虚构 `space_id`。`owner_user_id` /
 |---|---|
 | `whoami` | 返回当前 token 解析出的身份与权限概览 |
 | `server_status` | 服务健康与版本 |
-| `gateway_auto_context` | 对当前情境做确定性 score / margin 预筛，最多交付一张只读知识卡；终端 Agent 最终判断是否使用 |
-| `gateway_context_feedback` | 记录 delivered / used / ignored / wrong / corrected，供治理评估 |
-| `context_quality_status` | 汇总当前租户近 30 天已提交的反馈 outcome；不暴露正文或 actor，也不把反馈计数冒充准确率 |
+| `gateway_auto_context` | 显式 `lineId` 精确交付 Shared Line；否则对 Memory / Card 分别做 score / margin 预筛并竞争唯一只读证据位；`deliver_one` 返回匿名 `contextId`，终端 Agent 最终判断是否使用 |
+| `gateway_context_feedback` | 用 `domain + id` 记录 delivered / used / ignored / wrong / corrected，并回传 `contextId` 关联本次选择；兼容旧 `cardId` 和不带关联 ID 的反馈 |
+| `context_quality_status` | 汇总当前租户近 30 天的选择、固定分类放弃原因、已关联反馈选择和已提交 outcome；不暴露正文或 actor，也不把原因/反馈计数冒充准确率 |
 
 `whoami` 在 Server 版是必需品：agent 需要知道自己是谁、能写哪些空间，才能正确选择 `space` 参数。
 
@@ -186,7 +197,7 @@ Shared Line 的共享边界是 tenant，不虚构 `space_id`。`owner_user_id` /
 
 **工具总数：24 个**（Memory 6 + Card 5 + 空间 3 + Continuity 5 + 系统/上下文 5），对比 Desktop 的 80+。
 
-> **2026-08-28 实现状态**：24 个工具已落地。自动上下文经确定性 Stage B 最多选择一张卡，弱相关、歧义或无语义证据时放弃；终端 Agent 决定是否实际使用，反馈进入统一治理活动流并可按租户查看近 30 天 outcome 汇总。Continuity 支持归档/恢复，恢复包带最近位置与交接历史。
+> **2026-08-29 实现状态**：24 个工具已落地。`memoria_search` 在不增加工具 schema 的前提下增加统一 `matches`；自动上下文仍只对拥有本地权威正文的 Memory / Card 做确定性 Stage B，外部镜像不冒充可交付正文。调用方明确知道当前 Shared Line 时可传 `lineId` 精确取得当前位置，系统不做隐式多线猜测。每次 `deliver_one` 生成不含内容的随机 `contextId`；调用方反馈时原样回传，Server 才把该选择计入去重覆盖。旧客户端仍可提交 outcome，但不进入关联覆盖。Continuity 支持归档/恢复，恢复包带最近位置与交接历史。
 >
 > 落地时确认的两处形态：
 >
@@ -204,7 +215,7 @@ Shared Line 的共享边界是 tenant，不虚构 `space_id`。`owner_user_id` /
 | 身份传递 | header 声明 `X-ClaraCore-Agent-ID` | token 反查，不接受身份参数 | §3.3，可伪造 |
 | 空间概念 | 无 | 三层空间 + 结果标注来源 | 团队场景必需 |
 | 内容类型 | 仅 Memory（Card 靠"文件+指针"变通） | Memory + Card 双一等公民 | Card 原生落库 |
-| 情境召回 | Memory Controller | `card_recall` + `gateway_auto_context` | 自动路径经过可放弃的确定性 Stage B，终端 Agent 最终判断 |
+| 情境召回 | Memory Controller | `memoria_search` / `card_recall` + `gateway_auto_context` | 自动路径让 Memory / Card 独立过门禁，Shared Line 只接受精确 scope，终端 Agent 最终判断 |
 | 并发 | 无（单进程） | `version` 乐观锁 + `VERSION_CONFLICT` | 多实例必需 |
 | InnerLife | 25 个工具 | **无** | 已砍，且 stateless 下无法主动推送 |
 | Records（时序） | `memoria_record_*` | **无** | 生理时序是个人版特性。团队场景若真需要「事件时间线」（部署记录、故障时间线），那是另一个需求，不拿这套表结构硬套 |
@@ -215,6 +226,6 @@ Shared Line 的共享边界是 tenant，不虚构 `space_id`。`owner_user_id` /
 ## 6. 待确认
 
 - [x] **`memoria_search` 是否同时返回 Card 命中**：**分离，但返回信号**（2026-08-06 定）。内容不混排（memory 的「相关性」与 Card 的「该不该现在想起它」不是一个量纲，通约出来的排序是假的），但 `memoria_search` 的返回里带一个「另有 N 条卡片命中，用 `card_search` 查看」的计数。解决的是真实风险：agent 搜一次 memory 没找到就以为没有，而 Card 才是产品的核心载体。与「检索为空 ≠ 无权检索」同一哲学。实现上可只在 memory 命中少于阈值时才做这次 count（ngram 索引上的 count 不算白给）。
-- [x] **`card_recall` 是否应由服务端自动注入触发**：调用方每轮把真实 prompt 交给 `gateway_auto_context`；Server 用语义候选 + 最低分/差值门槛做确定性预筛，最多返回一张只读证据块。终端 Agent 配置的大模型负责最终相关性判断；无语义、弱相关、歧义或超时时均 abstain，显式 `card_recall` 不受自动策略影响。
+- [x] **自动上下文是否应由服务端触发**：调用方每轮把真实 prompt 交给 `gateway_auto_context`；Server 让 Memory 与 Card 各自通过语义候选 + 最低分/差值门槛，跨域双命中也 abstain，最多返回一个只读证据块。已知当前 Shared Line 时调用方可附带 `lineId`，这条精确 scope 优先且不再运行语义竞争。终端 Agent 配置的大模型负责最终相关性判断；无语义、弱相关、歧义或超时时均 abstain，显式检索不受自动策略影响。
 - [x] **`promote` 的权限校验点**：**两端都校**（2026-08-06 定）——源空间可读 + 目标空间可写。见 `02-data-model.md` §9。
 - [x] **Records（时序数据）是否进 Server**：**不进**（2026-08-06 定）。Desktop 的 record 是步数/体重/用药这类生理时序，团队知识库里放它没有意义——与「InnerLife 不进团队版」是同一类判断。**但必须在本文档显式标注这个缺口**（见 §5 对照表），而不是默默没有：两边共享契约，agent 得知道缺口在哪，否则它会在 Server 上试着调 `memoria_record_*` 然后拿到一个莫名其妙的错。

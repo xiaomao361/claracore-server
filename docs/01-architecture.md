@@ -203,6 +203,7 @@ bearer token  ──▶  TokenVerifier  ──▶  (tenant, user, agent, scope) 
 
 - 身份**全部**从 token 反查
 - header 中的任何身份声明**一律不信任**
+- 一次 JOIN 只返回认证决策所需的租户、用户、Agent、Token 状态字段；`token_hash` 只用于索引谓词，认证结果类型不包含 `token_hash` 或 `password_hash`
 - 实现位置：Go SDK `auth` 包的 `RequireBearerToken` 中间件 + 自定义 `TokenVerifier`（中间件自动处理过期与 scope 校验）
 
 ### 5.2 Token 设计
@@ -226,6 +227,10 @@ bearer token  ──▶  TokenVerifier  ──▶  (tenant, user, agent, scope) 
 
 Web 会话过期不影响 agent 连接；token 吊销不影响网页登录。
 
+Web 会话在 MySQL 中只存随机令牌哈希，并携带签发时的 `auth_version`。用户改密、管理员重置密码或账号转为停用时，除删除当前已知会话外还会推进用户认证版本。每次恢复会话都回查用户行并比对版本，因此“旧密码已验过、重置先删会话、旧登录随后才插入”的并发窗口也无法复活旧凭据。
+
+密码哈希使用 Argon2id PHC 串保存当时参数。登录验证成功后，仅当存量 memory、iterations、parallelism、盐长度和输出长度都不高于当前配置且至少一项更低时才生成新哈希；数据库条件更新同时匹配旧哈希和 `auth_version`。并发改密会令更新失败并触发重新读取、重新验证，旧密码不能覆盖新密码。更强或参数互有高低的存量哈希不会被自动改写，避免运维误配造成静默降级。
+
 ### 5.4 账户体系
 
 **管理员分配账号，非自助注册。** 封闭式团队部署，因此不需要邮箱验证、密码找回、注册防刷等一整套流程。
@@ -246,13 +251,17 @@ Web 会话过期不影响 agent 连接；token 吊销不影响网页登录。
 
 | 端口 | 默认实现 | Redis 实现 | 何时需要 Redis |
 |---|---|---|---|
-| `Cache` | 进程内有界 LRU（已用于 embedding） | Redis | 多实例部署 |
-| `Embedder` 缓存 | `hash(text+model)` + TTL，默认 1024 条（已实现） | Redis | 多实例共享命中与跨重启保留 |
-| `RateLimiter` | 进程内计数 | Redis 滑动窗口 | 租户级配额、多实例 |
-| `Locker` | 数据库行锁 | Redis 分布式锁 | **多实例部署时必须** |
+| `Cache` | 进程内有界 LRU（已用于 embedding） | Redis（已用于 embedding） | 多实例部署 |
+| `Embedder` 缓存 | `hash(text+model)` + TTL，默认 1024 条 | 两级缓存已实现；Redis 在 LRU 之后共享命中 | 多实例共享命中与跨重启保留 |
+| `RateLimiter` | 有界进程内固定窗口 | Redis 原子固定窗口 | 登录防爆破与认证后按 agent、按租户聚合的 MCP 调用保护；Redis 故障时仍保留单实例保护 |
+| `Locker` | 无（索引写回幂等） | Redis token + TTL 短租约（已用于索引 worker） | 多实例避免重复 embedding 调用；故障时 fail-open |
 | `SessionStore` | 数据库 | Redis | 多实例部署 |
 | `EventStore` | 不实现 | Redis | 将来做 resumability 时 |
 | `TaskQueue` | 同步执行 | Redis 队列 | embedding 批量计算、大批量导入 |
+
+运行指标不经过两个产品 Host：启用时由独立 loopback listener 暴露常量基数的 Prometheus 0.0.4 文本，只读取进程内 HTTP 窗口、`database/sql` 连接池统计与有界备份/技术恢复回执。它不查询 MySQL/Redis，不读取恢复数据、身份、路由、审计或业务正文；公网 nginx 明确拒绝 `/metrics`。
+
+生产依赖传输采用“本机 loopback 可明文，跨主机必须验证身份”的边界。MySQL/Redis 只允许 disabled 或 verify-full，后者固定 TLS 1.2+ 并支持系统/私有 CA 与可选 mTLS；不提供 skip-verify 或明文 fallback。Embedding 与 Atlas 在非 loopback 生产拓扑必须 HTTPS，因为即使没有 token，请求体仍可能包含团队知识正文。严格配置在任何业务 listener 或依赖 worker 启动前拒绝降级。
 
 ---
 
@@ -280,7 +289,7 @@ Web 会话过期不影响 agent 连接；token 吊销不影响网页登录。
 1. **记忆的共享边界** — 已定方向：三层空间（个人 / 项目 / 团队），权限只分读写，不做复杂 RBAC
 2. **作者与可见性** — 多人场景下每条记忆需要 author 与可见范围，Desktop 的单一 `agent_id` 字段不足以表达
 3. **并发冲突** — 多 agent 同时更新同一条记忆，需要版本号 / 乐观锁
-4. **配额与限流** — Desktop 的 `maxActivePerAgent` 只防自己卡自己；团队场景需要租户级配额
+4. **租户存储配额** — MCP 已有每 agent 与每租户聚合调用硬门，新增 token 或 agent 不能绕过；但内容行、共同线历史、索引与附件没有一个可信的统一容量口径，存储/成员/计费配额仍需由真实容量数据驱动，不能把调用预算冒充成完整租户配额
 5. **冷启动** — 见 §8.1，这是团队产品的生死问题
 
 ### 8.1 冷启动：团队版的生死问题
@@ -332,7 +341,25 @@ Go SDK 同时提供 server 与 client API，因此本服务可以**一边对 age
 | 外部源宕机 | 检索直接缺一块 | 索引仍在，正常返回（标注可能过期） |
 | 前提 | 外部源有 search 即可 | **外部源必须可枚举**（list/export 类工具） |
 
-**决策：索引同步。** 可枚举这个前提是成立的——外部源（odoc/Atlas）均为自有服务，缺少枚举接口可以直接补上。
+**决策：索引同步。** 2026-08-29 对真实服务重新核对后，Atlas 已提供分页枚举
+`source_documents` 与按稳定 ID 取正文的完整契约；odoc 当前只有搜索、主题和来源列表，
+还缺稳定文档枚举/版本/正文读取，因此**暂不接入**。自有服务意味着可以补契约，
+不意味着在契约缺失时退化成实时代理或把搜索片段复制进 Card。
+
+Atlas 的只读适配器、body-free 元数据/向量表与定时同步 worker 已落地：校验稳定 ID、
+来源边界、内容哈希和来源链接，限制页大小、整轮时长、响应与正文体积，并支持服务级
+bearer 凭证。正文只在单轮同步内用于 embedding，Store 接口没有正文参数。多实例用 MySQL
+中的有期限同步所有权防止两个完整快照互相把对方标成 missing；失败或枚举中途漂移时保留
+上一版可用镜像并写失败回执。
+
+镜像向量现已接入兼容的 `memoria_search.matches` 统一视图：应用层先把 token 权限解析为
+确定的租户与可读空间，MySQL 在返回标题、来源元数据或向量之前下推这两个过滤条件；同一
+embedding 模型下的 Memory、Card 与 Atlas 语义命中按同一余弦分数融合。Memory/Card 的
+ngram 分数来自不同索引，仍用 `memory_text` / `card_text` 分组，不制造跨查询的假排名。
+外部命中只返回标题、空间、稳定来源链接、revision、上游更新时间、最近成功同步时间与
+当前同步状态。刷新失败时上一成功镜像继续可检索并标 `last_success_preserved_after_failure`；
+连接配置暂时关闭时标 `mirror_only`。系统页已有只读来源状态，独立外部来源页已支持可审计的持久手动同步请求：重复请求合并，已在处理时仍可保留一轮后续，多实例用租约领取。odoc
+仍因契约不完整保持关闭。
 
 **两条硬规则**：
 
@@ -407,11 +434,11 @@ location /mcp {
 | 治理域（tenant / user / agent / token / space / permission） | ✅ 已落地，真库跑通 |
 | 核心域写入侧（memory / card / 召回条件 / 标签 / 关联 / promote） | ✅ 已落地 |
 | 两段式检索 + 索引队列 + Embedder | ✅ 已落地，真模型验证过召回质量 |
-| MCP 工作面 | ✅ 24/24，统一 token 身份、错误映射与活动审计；自动上下文用确定性 Stage B 预筛，终端 Agent 最终判断，并有反馈治理与 30 天 outcome 汇总 |
+| MCP 工作面 | ✅ 24/24，统一 token 身份、错误映射与活动审计；自动上下文用确定性 Stage B 预筛，终端 Agent 最终判断，并用匿名 contextId 形成 30 天选择分母、反馈覆盖与 outcome 汇总 |
 | Continuity（shared_line） | ✅ 领域层、MySQL、5 个 MCP 工具、归档/恢复、位置/交接历史与 exact resume packet 已落地 |
 | Web 管理面 | ✅ 登录、成员/token、空间权限、摄取、索引、内容/审核、活动与完整审计均已落地；生产工作台视觉已同步进 SSR，待目标服务器 1440/390px 人工验收 |
 | 摄取 | ✅ CLI + Web 管理页、幂等摄取、失败清单、完整扫描下的缺失源检测已落地；缺失检测非破坏性 |
-| 外部源连接（odoc 等） | ❌ 第二版 |
+| 外部源连接 | 🟡 Atlas body-free 同步、统一检索、Web 治理与跨实例可领取的持久手动请求已落地；odoc 尚无稳定枚举/版本/按 ID 取正文契约，暂不接入 |
 
 各条决策的落地细节与偏差见 `HANDOFF.md`；本节只回答「做到哪儿了」。
 
