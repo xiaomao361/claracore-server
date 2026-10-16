@@ -10,10 +10,29 @@
 
 **已验证**：`make check`（gofmt、vet，memo、mcpserver、embedding、platform 的测试）通过；本机启动二进制冒烟通过，包括 health、带中文身份头的写入与检索、错误令牌返回 401、无令牌时拒绝监听非回环地址。冒烟中发现「怎么部署」这类带虚词的查询召回不到，已把文本门槛改为至少命中三分之一的查询单元，并补了测试。
 
-**未做 / 待办**：
-- 没有接真实向量服务测过（测试里用的是假 embedder），bge-m3 下 0.5 的余弦门槛还需要实测。
-- 没有部署。内网 `192.168.3.200:51891` 上仍运行着旧的 rc1（MySQL），停用和清理由用户决定、由用户执行。
-- 在 bosun 登记：勾选 per_caller，上游凭据填 `CLARACORE_TOKEN`，令牌的身份标识统一填写，连接时说明写一句用法。
+**当前部署**（2026-10-16，用户授权部署并登记）：
+
+| 项 | 值 |
+|---|---|
+| 主机 / 目录 | 192.168.3.200（Local200），`/home/gbjk/zhouwei/claracore`（二进制 `claracore-server`，上一版留作 `claracore-server.prev`） |
+| 进程 | 用户级 supervisord，程序名 `claracore`，配置 `~/supervisor/etc/supervisor.d/claracore.ini`（0600，内含网关凭据 `CLARACORE_TOKEN`）|
+| 监听 | `127.0.0.1:9830`，只由同机的 bosun 访问 |
+| 数据 | `data/claracore.db`（目录 0700），升级前备份到 `data/backups/claracore-pre-<提交>.db` |
+| 向量 | 同机 Ollama 0.3.3 `127.0.0.1:11434`，模型 `bge-m3:latest` |
+| bosun | 服务名 `claracore`，`per_caller=true`，缓存 0，上游请求头带 `CLARACORE_TOKEN`，写了使用提示和连接说明。登记前备份 `bosun/data/backups/bosun-pre-claracore.sqlite3` |
+
+升级：本地 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build` → scp 为 `claracore-server.new` → 服务器上 `sqlite3 data/claracore.db ".backup data/backups/claracore-pre-<提交>.db"` → 替换二进制 → `/home/gbjk/anaconda3/bin/supervisorctl -c /home/gbjk/supervisor/etc/supervisord.conf restart claracore` → `curl 127.0.0.1:9830/health`。
+
+**线上验收**：用临时令牌（身份 deploy-check-a / deploy-check-b）经 bosun 端到端测过：initialize 里出现连接说明；写入时当场建好索引；B 看不到 A 的私有条目。验收完已删除临时令牌和测试条目，线上库现在 0 条。
+
+**部署中发现并修复的两个问题**（`eaea86f`）：
+- **Ollama 批量返回乱序**：Ollama 0.3.3 的 `/api/embed` 一次传 8 条，三次里两次返回乱序。后台补向量是批量的，向量会悄悄挂到别的条目上。改为一次请求只算一段。
+- **固定余弦门槛不够**：bge-m3 上跨主题噪声能到 0.52～0.58。改成同时要求余弦 ≥ 0.5 且不低于本次最高分减 0.08。3 条文档 × 10 条查询的实测：7 条完全正确；1 条混入一个排第二的噪声（「缓存连不上」）；2 条漏召回（「代码怎么上线」「发布流程是什么」，余弦都在 0.44～0.48，与噪声分不开）。样本太小，攒了真实数据再校。
+
+**待办**：
+- 给哪些人的令牌授权 claracore，由用户决定。
+- 内网 `192.168.3.200:51891` 上仍运行着旧的 rc1（supervisor 程序 `claracore-server`，MySQL），停用和清理由用户决定。
+- bosun 的 `docs/DEPLOY.md`「已登记服务」一栏还没有写上 claracore。
 - 检索最多扫描 5000 条，超出时结果标 `scan_capped`。真到这个量级再考虑加索引。
 
 以下为精简前旧实现的接手记录，仅作历史参考，其中的命令、表和页面在本分支都已不存在。
