@@ -2,6 +2,7 @@ package embedding
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,20 +21,34 @@ func serve(t *testing.T, handler http.HandlerFunc) string {
 	return srv.URL
 }
 
-func TestOllamaEmbedsBatch(t *testing.T) {
-	url := serve(t, func(w http.ResponseWriter, r *http.Request) {
+// ollamaByInput 按请求里的文本给向量，并统计请求次数。
+func ollamaByInput(t *testing.T, vecs map[string]string, calls *int) string {
+	return serve(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/embed" {
-			t.Errorf("期望走 /api/embed（批量），实际 %s", r.URL.Path)
+			t.Errorf("期望走 /api/embed，实际 %s", r.URL.Path)
 		}
-		w.Write([]byte(`{"embeddings":[[1,0],[0,1]]}`))
+		var req struct{ Input []string }
+		json.NewDecoder(r.Body).Decode(&req)
+		*calls++
+		var parts []string
+		for _, in := range req.Input {
+			parts = append(parts, vecs[in])
+		}
+		w.Write([]byte(`{"embeddings":[` + strings.Join(parts, ",") + `]}`))
 	})
+}
+
+func TestOllamaOneTextPerRequest(t *testing.T) {
+	// Ollama 的批量返回顺序不可靠（Local200 实测乱序），所以每段单独请求，对应关系由请求本身保证。
+	calls := 0
+	url := ollamaByInput(t, map[string]string{"a": "[1,0]", "b": "[0,1]"}, &calls)
 
 	got, err := NewOllama(url, "bge-m3", "", time.Second).Embed(context.Background(), []string{"a", "b"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0][0] != 1 || got[1][1] != 1 {
-		t.Fatalf("向量解码错误: %v", got)
+	if calls != 2 || len(got) != 2 || got[0][0] != 1 || got[1][1] != 1 {
+		t.Fatalf("应逐段请求并按入参归位: calls=%d got=%v", calls, got)
 	}
 }
 
@@ -71,19 +86,18 @@ func TestOpenAICompatSendsAPIKey(t *testing.T) {
 
 func TestRejectsCountMismatch(t *testing.T) {
 	url := serve(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"embeddings":[[1,0]]}`)) // 只回一个
+		w.Write([]byte(`{"embeddings":[[1,0],[0,1]]}`)) // 一段文本回了两个
 	})
 
-	_, err := NewOllama(url, "m", "", time.Second).Embed(context.Background(), []string{"a", "b"})
+	_, err := NewOllama(url, "m", "", time.Second).Embed(context.Background(), []string{"a"})
 	if err == nil {
 		t.Fatal("数量对不上必须报错——按下标硬配会让向量错位，事后无法定位")
 	}
 }
 
 func TestRejectsInconsistentDim(t *testing.T) {
-	url := serve(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"embeddings":[[1,0,0],[0,1]]}`))
-	})
+	calls := 0
+	url := ollamaByInput(t, map[string]string{"a": "[1,0,0]", "b": "[0,1]"}, &calls)
 
 	_, err := NewOllama(url, "m", "", time.Second).Embed(context.Background(), []string{"a", "b"})
 	if err == nil {

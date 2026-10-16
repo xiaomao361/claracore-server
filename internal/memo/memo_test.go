@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -265,6 +266,24 @@ func TestReopenKeepsSchema(t *testing.T) {
 	db.Close()
 	if _, err := Open(path); err == nil {
 		t.Fatal("库版本高于程序时应拒绝打开")
+	}
+}
+
+func TestSemanticRelativeMargin(t *testing.T) {
+	q := []float32{1, 0}
+	at := func(cos float64) []float32 { return []float32{float32(cos), float32(math.Sqrt(1 - cos*cos))} }
+	cands := []candidate{
+		{Entry: Entry{ID: "best", Title: "x"}, vec: at(0.73)},
+		{Entry: Entry{ID: "noise", Title: "y"}, vec: at(0.54)}, // 过了绝对门槛，但离最高分太远
+		{Entry: Entry{ID: "close", Title: "z"}, vec: at(0.70)},
+		{Entry: Entry{ID: "low", Title: "w"}, vec: at(0.45)},
+	}
+	var ids []string
+	for _, h := range rankHybrid(cands, "无关", q) {
+		ids = append(ids, h.ID)
+	}
+	if strings.Join(ids, ",") != "best,close" {
+		t.Fatalf("应只保留最高分附近的语义命中: %v", ids)
 	}
 }
 

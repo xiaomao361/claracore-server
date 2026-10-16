@@ -19,10 +19,16 @@ const (
 	defaultLimit = 10
 	maxLimit     = 50
 
-	// semanticFloor 以下的余弦不算语义命中。bge-m3 上无关文本多在 0.3~0.45，相关的在 0.5 以上；
-	// 没有标注评估集之前先这样，命中时把 cosine 原值返回，由 agent 自己判断。
-	semanticFloor = 0.5
-	semanticTopK  = 50
+	// 语义命中要同时满足：余弦 ≥ semanticFloor，且不低于本次最高余弦减 semanticMargin。
+	//
+	// 单靠绝对门槛分不开：2026-10-16 在 Local200 的 bge-m3 上用 3 条文档 × 10 条查询实测，
+	// 无关文本多在 0.37~0.48，但跨主题噪声能到 0.52~0.58（「缓存连不上」对支付文档 0.576），
+	// 而正确命中在 0.51~0.73。加上相对门槛后 10 条里 7 条完全正确、1 条混入一个排第二的噪声、
+	// 2 条漏召回；只用 0.5 时有 4 条混入噪声。样本很小，等真实数据攒起来再校；
+	// 命中时把 cosine 原值返回，由 agent 自己判断。
+	semanticFloor  = 0.5
+	semanticMargin = 0.08
+	semanticTopK   = 50
 
 	// rrfK 是倒数排名融合的常数。融合只看名次，不看两路分数的尺度——两路分数本来就不可比。
 	rrfK = 60
@@ -234,6 +240,16 @@ func rankHybrid(cands []candidate, query string, qvec []float32) []Hit {
 	}
 	slices.SortStableFunc(text, byScore)
 	slices.SortStableFunc(sem, byScore)
+	if len(sem) > 0 {
+		cut := len(sem)
+		for k, x := range sem {
+			if x.score < sem[0].score-semanticMargin {
+				cut = k
+				break
+			}
+		}
+		sem = sem[:cut]
+	}
 	if len(sem) > semanticTopK {
 		sem = sem[:semanticTopK]
 	}

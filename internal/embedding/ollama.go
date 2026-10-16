@@ -2,15 +2,17 @@ package embedding
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
-// Ollama 通过 Ollama 的 /api/embed 接口算向量。
+// Ollama 通过 Ollama 的 /api/embed 接口算向量，**一次请求只算一段**。
 //
-// 用 /api/embed 而不是文档里最初写的 /api/embeddings：后者一次只能算一段
-// （字段是 prompt 不是 input），一批 32 条就是 32 次 HTTP 往返。
-// 代价是要求 Ollama 版本足够新——接口不存在时 postJSON 会明确报 404
-// 并提示去看版本与 BaseURL，而不是留下一句看不懂的解码错误。
+// /api/embed 虽然接受一批 input，但返回里没有 index 可以校对，而顺序并不可靠：
+// 2026-10-16 在 Local200 的 Ollama 0.3.3 + bge-m3 上实测，同一批 8 条查询
+// 三次里有两次返回乱序（批内第 0 条拿到的是第 2 条的向量）。向量安错对象
+// 不会报错，只会让检索悄悄变差，所以宁可多几次 HTTP 往返，用请求本身绑定对应关系。
+// 这个服务的量级（写入时一条，后台每轮最多 32 条）不在乎这点吞吐。
 type Ollama struct {
 	c client
 }
@@ -27,21 +29,25 @@ func (o *Ollama) Embed(ctx context.Context, texts []string) ([][]float32, error)
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	var out struct {
-		Embeddings [][]float32 `json:"embeddings"`
+	vectors := make([][]float32, len(texts))
+	for i, text := range texts {
+		var out struct {
+			Embeddings [][]float32 `json:"embeddings"`
+		}
+		req := struct {
+			Model string   `json:"model"`
+			Input []string `json:"input"`
+		}{Model: o.c.model, Input: []string{text}}
+		if err := o.c.postJSON(ctx, "/api/embed", req, &out); err != nil {
+			return nil, err
+		}
+		if len(out.Embeddings) != 1 {
+			return nil, fmt.Errorf("embedding(%s): 一段文本返回了 %d 个向量", o.c.provider, len(out.Embeddings))
+		}
+		vectors[i] = out.Embeddings[0]
 	}
-	req := struct {
-		Model string   `json:"model"`
-		Input []string `json:"input"`
-	}{Model: o.c.model, Input: texts}
-
-	if err := o.c.postJSON(ctx, "/api/embed", req, &out); err != nil {
+	if err := o.c.checkBatch(vectors, len(texts)); err != nil {
 		return nil, err
 	}
-	// Ollama 按入参顺序返回，没有 index 字段可以校对——所以这里
-	// 只能校数量与维度，顺序只能信它。这是选它的代价之一。
-	if err := o.c.checkBatch(out.Embeddings, len(texts)); err != nil {
-		return nil, err
-	}
-	return out.Embeddings, nil
+	return vectors, nil
 }
