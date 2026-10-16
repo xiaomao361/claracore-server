@@ -14,5 +14,8 @@
 .DS_Store
 .coverage.out
 
-# PoC（丢弃型验证代码，结论见 docs/06-poc-findings.md）
-/poc/claracore-poc
+
+# SQLite 数据
+*.db
+*.db-wal
+*.db-shm
