@@ -293,3 +293,62 @@ func TestTokenize(t *testing.T) {
 		t.Fatalf("tokenize: %s", got)
 	}
 }
+
+// 2026-10-20 团队知识实测漏召回的三类问法：标识符被虚词淹没、标识符权重不够、同一个东西换了叫法。
+func TestTextSearchIdentifiersAndSynonyms(t *testing.T) {
+	s := newTestService(t, nil)
+	ctx := context.Background()
+	services := mustSave(t, s, "a@x", SaveInput{Title: "后端服务清单", Body: "gb-pigeon 信鸽服务、gb-statement 对账服务"})
+	billing := mustSave(t, s, "a@x", SaveInput{Title: "云账单口径", Body: "覆盖贯柏、企康两个租户"})
+	domains := mustSave(t, s, "a@x", SaveInput{Title: "各端前端域名", Body: "管理端测试环境 gb-admin-nt；核工业221租户 hg221"})
+
+	top := func(q string) string {
+		t.Helper()
+		res, err := s.Search(ctx, "a@x", SearchInput{Query: q})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Items) == 0 {
+			return ""
+		}
+		return res.Items[0].ID
+	}
+	if got := top("gb-pigeon 是干什么的"); got != services.ID {
+		t.Fatalf("命中标识符应不受三分之一门槛限制: %q", got)
+	}
+	if got := top("hg221 是哪个租户"); got != domains.ID {
+		t.Fatalf("标识符命中应压过普通二元组（另一条只命中「租户」）: %q, 账单条目 %q", got, billing.ID)
+	}
+	if got := top("管理后台测试地址"); got != domains.ID {
+		t.Fatalf("管理后台→管理端、地址→域名 应归一后命中: %q", got)
+	}
+	res, _ := s.Search(ctx, "a@x", SearchInput{Query: "gb-order 是干什么的"})
+	if res.Total != 0 {
+		t.Fatalf("标识符没命中时仍按门槛判断，不应因虚词命中: %+v", res.Items)
+	}
+}
+
+func TestIsIdentifier(t *testing.T) {
+	for tok, want := range map[string]bool{
+		"gb-pigeon": true, "hg221": true, "k8s": true, "snake_case": true,
+		"redis": false, "v1": false, "2026": false, "1.2.3": false, "管理": false,
+	} {
+		if got := isIdentifier(tok); got != want {
+			t.Errorf("isIdentifier(%q) = %v, want %v", tok, got, want)
+		}
+	}
+}
+
+// 两路名次交叉时融合分相同，文本分高的应排前面，而不是按时间。
+func TestFusionTieBreaksOnText(t *testing.T) {
+	q := []float32{1, 0}
+	at := func(cos float64) []float32 { return []float32{float32(cos), float32(math.Sqrt(1 - cos*cos))} }
+	cands := []candidate{
+		{Entry: Entry{ID: "semantic-first", Title: "平台", Body: "部署"}, vec: at(0.62)},
+		{Entry: Entry{ID: "text-first", Title: "部署流程", Body: "部署"}, vec: at(0.60)},
+	}
+	hits := rankHybrid(cands, "部署流程", q)
+	if len(hits) != 2 || hits[0].ID != "text-first" {
+		t.Fatalf("同分时应让文本分高的在前: %+v", hits)
+	}
+}

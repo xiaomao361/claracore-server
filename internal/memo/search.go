@@ -212,7 +212,7 @@ func (s *Service) load(ctx context.Context, where string, args []any, model stri
 
 // rankHybrid 文本与语义两路各自排名，再按倒数排名融合。qvec 为 nil 时只有文本一路。
 func rankHybrid(cands []candidate, query string, qvec []float32) []Hit {
-	tokens := tokenize(query)
+	tokens := tokenize(normalizeText(query))
 	type scoredIdx struct {
 		i     int
 		score float64
@@ -257,9 +257,11 @@ func rankHybrid(cands []candidate, query string, qvec []float32) []Hit {
 	fused := map[int]float64{}
 	match := map[int]string{}
 	cos := map[int]float64{}
+	textSc := map[int]float64{}
 	for r, x := range text {
 		fused[x.i] += 1.0 / float64(rrfK+r+1)
 		match[x.i] = "text"
+		textSc[x.i] = x.score
 	}
 	for r, x := range sem {
 		fused[x.i] += 1.0 / float64(rrfK+r+1)
@@ -281,7 +283,14 @@ func rankHybrid(cands []candidate, query string, qvec []float32) []Hit {
 			}
 			return 1
 		}
-		return a - b // 同分按时间倒序
+		// 两路名次交叉（甲文本第一、乙语义第一）时融合分相同，这时让字面证据更强的在前。
+		if textSc[a] != textSc[b] {
+			if textSc[a] > textSc[b] {
+				return -1
+			}
+			return 1
+		}
+		return a - b // 仍同分按时间倒序
 	})
 	hits := make([]Hit, len(order))
 	for k, i := range order {
@@ -346,18 +355,59 @@ func isCJK(r rune) bool {
 	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul)
 }
 
-// textScore 是加权覆盖率：标题命中记 3、标签 2、正文 1，除以全部命中标题时的满分。
-// 命中不到三分之一的查询单元（两个以内则须全中）视为不相关，返回 0。
-// 门槛不能更高：自然语言查询里的虚词（「怎么部署」里的「怎么」「么部」）会把有效的那个二元组淹掉。
+// synonyms 把团队里同一个东西的不同叫法归成一种，查询和条目两边都先过一遍再匹配。
+// 只收实测漏召回过的说法：2026-10-20 用团队知识实测，「管理后台测试环境地址」找不到写着
+// 「管理端」「域名」的那条。词表宁小勿滥，每加一组都会让两边的文本同时变化。
+var synonyms = strings.NewReplacer(
+	"管理后台", "管理端",
+	"后台管理", "管理端",
+	"网址", "域名",
+	"地址", "域名",
+)
+
+func normalizeText(s string) string { return synonyms.Replace(strings.ToLower(s)) }
+
+// isIdentifier 判断查询单元是不是标识符：带数字或连接符的拉丁词，如 gb-pigeon、hg221、k8s。
+// 标识符几乎只在说它的条目里出现，命中一个比命中一串二元组更可信。
+func isIdentifier(t string) bool {
+	if utf8.RuneCountInString(t) < 3 {
+		return false
+	}
+	letter, mark := false, false
+	for _, r := range t {
+		switch {
+		case unicode.IsLetter(r) && !isCJK(r):
+			letter = true
+		case unicode.IsDigit(r) || r == '-' || r == '_' || r == '.':
+			mark = true
+		}
+	}
+	return letter && mark
+}
+
+// identifierBoost 是标识符命中的权重倍数。
+const identifierBoost = 3
+
+// textScore 是加权覆盖率：标题命中记 3、标签 2、正文 1，标识符再乘 identifierBoost，
+// 除以全部命中标题时的满分。tokens 应来自 tokenize(normalizeText(query))。
+// 命中不到三分之一的查询单元（两个以内则须全中）视为不相关，返回 0；命中任一标识符则不受此限。
+// 门槛不能更高：自然语言查询里的虚词（「怎么部署」里的「怎么」「么部」）会把有效的那个二元组淹掉，
+// 「gb-pigeon 是干什么的」这种一个标识符加四个虚词二元组的查询，靠的就是标识符豁免。
 func textScore(tokens []string, e Entry) float64 {
 	if len(tokens) == 0 {
 		return 0
 	}
-	title := strings.ToLower(e.Title)
-	tags := " " + strings.Join(e.Tags, " ") + " "
-	body := strings.ToLower(e.Body)
-	matched, sum := 0, 0.0
+	title := normalizeText(e.Title)
+	tags := normalizeText(" " + strings.Join(e.Tags, " ") + " ")
+	body := normalizeText(e.Body)
+	matched, sum, full := 0, 0.0, 0.0
+	identifierHit := false
 	for _, t := range tokens {
+		boost := 1.0
+		if isIdentifier(t) {
+			boost = identifierBoost
+		}
+		full += 3 * boost
 		w := 0.0
 		switch {
 		case strings.Contains(title, t):
@@ -369,17 +419,20 @@ func textScore(tokens []string, e Entry) float64 {
 		}
 		if w > 0 {
 			matched++
-			sum += w
+			sum += w * boost
+			if boost > 1 {
+				identifierHit = true
+			}
 		}
 	}
 	need := (len(tokens) + 2) / 3
 	if len(tokens) <= 2 {
 		need = len(tokens)
 	}
-	if matched < need {
+	if matched < need && !identifierHit {
 		return 0
 	}
-	return sum / float64(3*len(tokens))
+	return sum / full
 }
 
 func cosine(a, b []float32) float64 {
