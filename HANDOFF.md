@@ -36,7 +36,9 @@
 
 评测 `TestRecallEval` 默认跳过：条目可能含内部信息，不进仓库，用环境变量指向本地文件，说明见测试注释。19 个问题在 bge-m3 下首位命中从 15 个升到 19 个；只跑文本时是 17 个，漏掉的两问只能靠语义命中。
 
-**2026-10-21 部署 765d3dc**：备份 `data/backups/claracore-pre-765d3dc.db`（16 行，和线上库相同，integrity ok），替换二进制后重启，`/health` 返回 `slim-765d3dc`，`entries=10`、`unindexed=0`。经网关重跑这 19 问，首位命中 15 个，比本地少 4 个。原因不在代码：服务器的 Ollama 是 0.3.3，本机是 0.40.6，同一个 bge-m3、同一段文本，10 条里有 5 条余弦差了 0.13～0.25（例如「各端前端与网关域名」对「管理后台测试环境地址」，本机 0.604，服务器 0.358），过不了 0.5 的门槛，只剩文本命中。本地评测因此不能代表线上语义一路。升级服务器 Ollama 之后要重新校准阈值，再重跑这 19 问。
+**2026-10-21 部署 765d3dc**：备份 `data/backups/claracore-pre-765d3dc.db`（16 行，和线上库相同，integrity ok），替换二进制后重启，`/health` 返回 `slim-765d3dc`，`entries=10`、`unindexed=0`。经网关重跑这 19 问，首位命中 15 个，比本地少 4 个。原因不在代码：服务器的 Ollama 是 0.3.3，本机是 0.40.6，同一个 bge-m3、同一段文本，10 条里有 5 条余弦差了 0.13～0.25（例如「各端前端与网关域名」对「管理后台测试环境地址」，本机 0.604，服务器 0.358），过不了 0.5 的门槛，只剩文本命中。本地评测因此不能代表线上语义一路。
+
+**2026-10-21 服务器 Ollama 升到 0.40.6**（用户授权）：先在 11435 端口起临时实例验证，余弦与本机逐位一致，旧接口 `/api/embeddings` 可用，旧 `manifests` 目录不被改写。备份放在 `~/zhouwei/ollama-upgrade/backup/`：旧二进制 `ollama-0.3.3`、`manifests-pre-0.40.6.tgz`、odoc 的 `chroma_db`。claracore 库另外备份到 `data/backups/claracore-pre-ollama-0.40.6.db`。新版解压到 `/usr/local`，重启 systemd 的 `ollama`，三个模型都在。claracore 把 `embed_model` 置空后，后台 worker 自动重算了 10 条向量；经网关重跑 19 问，首位命中 19 个。这台 Ollama 还有两个使用方：odoc 和 Atlas（`atlas_builder/semantic.py`），升级后都要重建向量。回滚：把备份的 `ollama-0.3.3` 拷回 `/usr/local/bin/ollama`，再重启 `ollama`。注意模型名没变，换 Ollama 版本时服务不会自己发现向量需要重算，要手动置空 `embed_model`。
 
 **待办**：
 - 给哪些人的令牌授权 claracore，由用户决定。
