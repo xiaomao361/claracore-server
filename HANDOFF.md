@@ -38,12 +38,11 @@
 
 **2026-10-21 部署 765d3dc**：备份 `data/backups/claracore-pre-765d3dc.db`（16 行，和线上库相同，integrity ok），替换二进制后重启，`/health` 返回 `slim-765d3dc`，`entries=10`、`unindexed=0`。经网关重跑这 19 问，首位命中 15 个，比本地少 4 个。原因不在代码：服务器的 Ollama 是 0.3.3，本机是 0.40.6，同一个 bge-m3、同一段文本，10 条里有 5 条余弦差了 0.13～0.25（例如「各端前端与网关域名」对「管理后台测试环境地址」，本机 0.604，服务器 0.358），过不了 0.5 的门槛，只剩文本命中。本地评测因此不能代表线上语义一路。
 
-**2026-10-21 服务器 Ollama 升到 0.40.6**（用户授权）：先在 11435 端口起临时实例验证，余弦与本机逐位一致，旧接口 `/api/embeddings` 可用，旧 `manifests` 目录不被改写。备份放在 `~/zhouwei/ollama-upgrade/backup/`：旧二进制 `ollama-0.3.3`、`manifests-pre-0.40.6.tgz`、odoc 的 `chroma_db`。claracore 库另外备份到 `data/backups/claracore-pre-ollama-0.40.6.db`。新版解压到 `/usr/local`，重启 systemd 的 `ollama`，三个模型都在。claracore 把 `embed_model` 置空后，后台 worker 自动重算了 10 条向量；经网关重跑 19 问，首位命中 19 个。这台 Ollama 还有两个使用方：odoc 和 Atlas（`atlas_builder/semantic.py`），升级后都要重建向量。回滚：把备份的 `ollama-0.3.3` 拷回 `/usr/local/bin/ollama`，再重启 `ollama`。注意模型名没变，换 Ollama 版本时服务不会自己发现向量需要重算，要手动置空 `embed_model`。
+**2026-10-21 服务器 Ollama 升到 0.40.6**（用户授权）：先在 11435 端口起临时实例验证，余弦与本机逐位一致，旧接口 `/api/embeddings` 可用，旧 `manifests` 目录不被改写。备份放在 `~/zhouwei/ollama-upgrade/backup/`：旧二进制 `ollama-0.3.3`、`manifests-pre-0.40.6.tgz`、odoc 的 `chroma_db`。claracore 库另外备份到 `data/backups/claracore-pre-ollama-0.40.6.db`。新版解压到 `/usr/local`，重启 systemd 的 `ollama`，三个模型都在。claracore 把 `embed_model` 置空后，后台 worker 自动重算了 10 条向量；经网关重跑 19 问，首位命中 19 个。这台 Ollama 还有两个使用方：odoc 和 Atlas（`atlas_builder/semantic.py`），升级后都要重建向量。2026-10-22 经用户同意删除了 `~/zhouwei/ollama-upgrade/`（含旧二进制与 odoc 旧向量备份），回滚旧版已不可行，也没有必要：0.3.3 的长文本向量本身是错的。注意模型名没变，换 Ollama 版本时服务不会自己发现向量需要重算，要手动置空 `embed_model`。
 
 **待办**：
-- 给哪些人的令牌授权 claracore，由用户决定。
-- 内网 `192.168.3.200:51891` 上仍运行着旧的 rc1（supervisor 程序 `claracore-server`，MySQL），停用和清理由用户决定。
-- bosun 的 `docs/DEPLOY.md`「已登记服务」一栏还没有写上 claracore。
+- 验证共享条目跨用户可见（线上只验过私有条目互不可见）。
+- 旧 rc1：2026-10-22 已从 supervisor 移除（ini 改名为 `claracore-server.ini.disabled-20261022`，MySQL 与 `~/zhouwei/claracore-server` 目录未动）。同日经用户授权下掉了它的 nginx 站点：`/home/gbjk/nginx/conf/vhosts/claracore-server.conf` 改名为 `.disabled-20261022`，`nginx -t` 通过后 reload，51891 端口已不再监听。
 - 检索最多扫描 5000 条，超出时结果标 `scan_capped`。真到这个量级再考虑加索引。
 
 以下为精简前旧实现的接手记录，仅作历史参考，其中的命令、表和页面在本分支都已不存在。
